@@ -896,14 +896,33 @@ try:
     app.store.counterparties.remove(_ip_party)
 
     # Порядок «файл → запись» (п. 1.6): сбой реестра откатывает и запись, и файл.
-    _rb_path = os.path.join(tempfile.gettempdir(), "smoke_rollback.docx")
-    with open(_rb_path, "wb") as _fh:
-        _fh.write(b"stub")
-    _rb_rec = {"id": 987654321, "kind": storage.KIND_CONTRACT, "party_id": party_rec["id"]}
-    app.store.documents.append(_rb_rec)
-    app._rollback_document(_rb_rec, _rb_path)
-    check(_rb_rec not in app.store.documents and not os.path.exists(_rb_path),
+    # Теперь проверяется настоящая транзакция сервисного слоя (п. 9.2),
+    # а не отдельный хелпер отката.
+    _rb_dir = tempfile.mkdtemp(prefix="smoke_rollback_")
+    _orig_save = app.store.save
+
+    def _rb_failing_save():  # имитация сбоя записи реестра на диске
+        app.store.last_error = "имитация: диск недоступен"
+        return False
+
+    app.store.save = _rb_failing_save
+    try:
+        _rb_result = m.services.save_document(app.store, {
+            "kind": storage.KIND_CONTRACT,
+            "party_id": party_rec["id"],
+            "number": "RB-1",
+            "date": "12 января",
+            "data": dict(party_rec.get("fields", {})),
+            "extra": {"day": "12", "month": "января", "is_ip": False},
+            "text": "",
+        }, _rb_dir)
+    finally:
+        app.store.save = _orig_save
+        app.store.last_error = None
+    check(not _rb_result["ok"] and _rb_result["record"] is None
+          and not os.listdir(_rb_dir),
           "файл→запись: при сбое реестра документ откатывается целиком")
+    shutil.rmtree(_rb_dir, ignore_errors=True)
 
     # Регистрация импорта: документ без ИНН привязывается к подтверждённому
     # контрагенту, а не создаёт новую карточку (п. 3.3).

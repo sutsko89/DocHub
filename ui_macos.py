@@ -218,13 +218,46 @@ def refresh_taskbar(window: tk.Misc) -> None:
         pass
 
 
-def workarea() -> tuple[int, int, int, int]:
-    """Рабочая область экрана (без панели задач): x, y, ширина, высота."""
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", ctypes.c_ulong),
+    ]
+
+
+def workarea(window: tk.Misc | None = None) -> tuple[int, int, int, int]:
+    """Рабочая область (без панели задач): x, y, ширина, высота.
+
+    Если передано окно — берётся рабочая область ТОГО монитора, где окно
+    находится сейчас (п. 6.3), а не только основного монитора.
+    """
     if sys.platform == "win32":
+        if window is not None:
+            try:
+                hwnd = _main_hwnd(window)
+                hmon = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+                if hmon:
+                    info = _MONITORINFO()
+                    info.cbSize = ctypes.sizeof(info)
+                    if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                        rc = info.rcWork
+                        return rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top
+            except Exception:
+                pass
         rect = _RECT()
         try:
             if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
                 return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+        except Exception:
+            pass
+    else:
+        # Не Windows: используем размеры экрана Tk (п. 6.3 — не «только 1920×1080»).
+        try:
+            source = window or getattr(tk, "_default_root", None)
+            if source is not None:
+                return 0, 0, source.winfo_screenwidth(), source.winfo_screenheight()
         except Exception:
             pass
     return 0, 0, 1920, 1080
@@ -251,7 +284,7 @@ def maximize_window(window: tk.Misc) -> None:
     """
     if sys.platform == "win32":
         try:
-            x, y, width, height = workarea()
+            x, y, width, height = workarea(window)
             window.geometry(f"{width}x{height}+{x}+{y}")
             return
         except Exception:
@@ -1171,6 +1204,7 @@ class _ComboPopup(tk.Toplevel):
 
     ROW_H = 26
     MAX_VISIBLE = 8
+    MAX_ITEMS = 100  # выше — список обрезается с подсказкой (п. 5.4)
 
     def __init__(self, combo: "ComboField", values: Sequence[str], on_pick: Callable[[str], None]):
         super().__init__(combo)
@@ -1178,11 +1212,13 @@ class _ComboPopup(tk.Toplevel):
         self.overrideredirect(True)
         self._combo = combo
         self._values = [str(v) for v in values]
+        self._shown = self._values[:self.MAX_ITEMS]
+        self._truncated = len(self._values) > len(self._shown)
         self._on_pick = on_pick
         self._index = -1
 
         selected = combo.get()
-        self._selected_index = self._values.index(selected) if selected in self._values else -1
+        self._selected_index = self._shown.index(selected) if selected in self._shown else -1
 
         self._frame = tk.Frame(
             self, bg=resolve(COLORS["card"]),
@@ -1207,10 +1243,11 @@ class _ComboPopup(tk.Toplevel):
         )
 
         self._rows: list[tk.Label] = []
-        for index, value in enumerate(self._values):
+        for index, value in enumerate(self._shown):
             row = tk.Label(
                 self._inner, text=value, anchor="w", justify="left",
                 padx=px(11), pady=px(4), font=font(12),
+                bg=resolve(COLORS["card"]), fg=resolve(COLORS["text"]),
             )
             row.pack(fill="x")
             row.bind("<Enter>", lambda _e, i=index: self._set_index(i))
@@ -1220,6 +1257,16 @@ class _ComboPopup(tk.Toplevel):
                 lambda _e, i=index: self._confirm(i),
             )
             self._rows.append(row)
+
+        if self._truncated:
+            tk.Label(
+                self._inner,
+                text=f"Показаны первые {len(self._shown)} из {len(self._values)}. "
+                     "Используйте поиск по ИНН или реестр.",
+                anchor="w", justify="left", padx=px(11), pady=px(6),
+                font=font(11), fg=resolve(COLORS["text_tertiary"]),
+                bg=resolve(COLORS["card"]), wraplength=px(300),
+            ).pack(fill="x")
 
         # Колесо мыши и клавиатура
         for widget in (self, self._frame, self._canvas, self._inner, *self._rows):
@@ -1236,18 +1283,28 @@ class _ComboPopup(tk.Toplevel):
 
     # -- внешний вид ------------------------------------------------------ #
     def _set_index(self, index: int) -> None:
+        """Подсвечивает только прежнюю и новую строку — O(1) на движение (п. 5.4)."""
+        previous = self._index
         self._index = index
-        for i, row in enumerate(self._rows):
-            if i == index:
-                row.configure(
-                    bg=resolve(COLORS["accent"]), fg=resolve(COLORS["on_accent"]),
-                    font=font(12, "bold"),
-                )
-            else:
-                row.configure(
-                    bg=resolve(COLORS["card"]), fg=resolve(COLORS["text"]),
-                    font=font(12, "bold" if i == self._selected_index else "normal"),
-                )
+        if previous == index:
+            return
+        if 0 <= previous < len(self._rows):
+            self._style_row(previous)
+        if 0 <= index < len(self._rows):
+            self._style_row(index)
+
+    def _style_row(self, index: int) -> None:
+        row = self._rows[index]
+        if index == self._index:
+            row.configure(
+                bg=resolve(COLORS["accent"]), fg=resolve(COLORS["on_accent"]),
+                font=font(12, "bold"),
+            )
+        else:
+            row.configure(
+                bg=resolve(COLORS["card"]), fg=resolve(COLORS["text"]),
+                font=font(12, "bold" if index == self._selected_index else "normal"),
+            )
 
     # -- события ---------------------------------------------------------- #
     def _on_wheel(self, event) -> None:
@@ -1279,8 +1336,8 @@ class _ComboPopup(tk.Toplevel):
         return "break"
 
     def _confirm(self, index: int) -> None:
-        if 0 <= index < len(self._values):
-            self._on_pick(self._values[index])
+        if 0 <= index < len(self._shown):
+            self._on_pick(self._shown[index])
         self.close()
 
     def _ensure_visible(self, index: int) -> None:
@@ -1316,8 +1373,8 @@ class _ComboPopup(tk.Toplevel):
         import tkinter.font as tkfont
 
         text_font = tkfont.Font(font=font(12))
-        text_w = max((text_font.measure(v) for v in self._values), default=0)
-        wa = workarea()
+        text_w = max((text_font.measure(v) for v in self._shown), default=0)
+        wa = workarea(combo)
         width = min(max(combo.winfo_width(), text_w + px(34)), px(520), wa[2])
 
         x = combo.winfo_rootx()

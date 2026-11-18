@@ -44,7 +44,7 @@ import single_instance
 import storage
 import ui_macos as ui
 
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 MAX_PATH_LENGTH = 240
@@ -72,10 +72,66 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
+# ---------- Кэш шаблонов печатных форм (п. 5.5 этапа 5) ----------
+# Шаблон .docx разбирается один раз; на каждый рендер отдаётся deepcopy.
+# Раньше предпросмотр при каждом вводе заново читал и разбирал ZIP шаблона.
+# Кэш инвалидируется по mtime — правка шаблона подхватывается без перезапуска.
+_TEMPLATE_CACHE: dict = {}
+
+
+def load_template_cached(template_path: str):
+    """Возвращает копию разобранного шаблона .docx (кэш по пути + mtime)."""
+    try:
+        mtime = os.path.getmtime(template_path)
+    except OSError:
+        mtime = 0.0
+    cached = _TEMPLATE_CACHE.get(template_path)
+    if cached is None or cached[0] != mtime:
+        _TEMPLATE_CACHE[template_path] = (mtime, Document(template_path))
+    return copy.deepcopy(_TEMPLATE_CACHE[template_path][1])
+
+
 # ---------- Сохранение настроек между запусками ----------
 SETTINGS_DIR_NAME = "DogovorGenerator"
 MIN_WINDOW_WIDTH = 1120  # логические пиксели
 MIN_WINDOW_HEIGHT = 620
+
+
+def _user_documents_dir() -> str:
+    """Папка «Документы» пользователя (п. 6.2): видимое место вместо скрытого %APPDATA%."""
+    if sys.platform == "win32":
+        try:
+            import uuid as _uuid
+
+            class _GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", ctypes.c_ulong),
+                    ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort),
+                    ("Data4", ctypes.c_ubyte * 8),
+                ]
+
+            guid = _GUID()
+            known = _uuid.UUID("FDD39AD0-238F-46AF-ADB4-6C85480369C7")  # FOLDERID_Documents
+            guid.Data1, guid.Data2, guid.Data3 = (
+                known.time_low, known.time_mid, known.time_hi_version,
+            )
+            guid.Data4[:] = known.bytes[8:]
+            out = ctypes.c_void_p()
+            hr = ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(guid), 0, None, ctypes.byref(out)
+            )
+            if hr == 0 and out.value:
+                documents = ctypes.wstring_at(out.value)
+                ctypes.windll.ole32.CoTaskMemFree(out)
+                return documents
+            if out.value:
+                ctypes.windll.ole32.CoTaskMemFree(out)
+        except Exception:
+            pass
+        profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        return os.path.join(profile, "Documents")
+    return os.path.join(os.path.expanduser("~"), "Documents")
 
 
 def settings_path() -> str:
@@ -682,20 +738,41 @@ def amount_in_words_ru(value) -> str:
 
 
 # ---------- Открытие файла в зависимости от ОС ----------
-def open_file(file_path):
+def open_file(file_path) -> bool:
+    """Открывает файл системным приложением и возвращает успех (п. 6.2).
+
+    Раньше результат не возвращался: тост «сохранён и открыт» показывался
+    даже когда открытие не удалось. Теперь вызывающий код честно сообщает
+    «сохранён» без ложного «открыт». Отсутствующий файл — сразу отказ
+    (xdg-open возвращает 0 даже для несуществующего пути).
+    """
+    if not file_path or not os.path.exists(file_path):
+        applog.get_logger("files").warning(
+            "Открытие отменено: файла нет на диске (%s)",
+            os.path.splitext(str(file_path or ""))[1].lower(),
+        )
+        ui.alert(
+            ROOT_HOLDER.get(), "Файл не найден",
+            f"Файл не найден на диске:\n{file_path or '—'}", "error",
+        )
+        return False
     try:
         if platform.system() == "Windows":
             os.startfile(file_path)  # noqa: S606
         elif platform.system() == "Darwin":
-            subprocess.run(["open", file_path], check=False)
+            if subprocess.run(["open", file_path], check=False).returncode != 0:
+                return False
         else:
-            subprocess.run(["xdg-open", file_path], check=False)
+            if subprocess.run(["xdg-open", file_path], check=False).returncode != 0:
+                return False
+        return True
     except Exception as e:
         applog.get_logger("files").warning(
             "Не удалось открыть файл (%s): %s",
             os.path.splitext(str(file_path))[1].lower(), type(e).__name__,
         )
         ui.alert(ROOT_HOLDER.get(), "Не удалось открыть файл", str(e), "error")
+        return False
 
 
 def show_in_folder(file_path: str) -> None:
@@ -765,32 +842,44 @@ def copy_with_zone_identifier(src: str, dest: str) -> None:
 
 # ---------- DOCX: замена плейсхолдеров (в т.ч. если разбиты на runs) ----------
 def replace_in_paragraph(paragraph, replacements: dict):
+    """Заменяет плейсхолдеры за один проход по параграфу (п. 5.6).
+
+    Тексты runs зеркалируются в обычные строки: поиск и замены идут по
+    обычному тексту, а в runs результат записывается один раз в конце.
+    Раньше после каждой одиночной замены текст параграфа полностью
+    пересобирался из runs (каждое обращение к run.text — обход lxml-дерева),
+    что давало O(n²) на больших шаблонах.
+    """
     runs = paragraph.runs
     if not runs:
         return
 
-    def rebuild_full_text():
-        return "".join(r.text for r in runs)
+    texts = [r.text or "" for r in runs]
+    full_text = "".join(texts)
+    changed: set[int] = set()
 
-    full_text = rebuild_full_text()
+    for raw_key, raw_value in replacements.items():
+        key = str(raw_key)
+        value = "" if raw_value is None else str(raw_value)
+        if not key:
+            continue
 
-    for key, value in replacements.items():
-        key = str(key)
-        value = "" if value is None else str(value)
-
-        while key and (key in full_text):
-            start = full_text.find(key)
+        search_from = 0
+        while True:
+            start = full_text.find(key, search_from)
+            if start < 0:
+                break
             end = start + len(key)
 
+            # Границы runs — то же правило, что раньше: run выбирается,
+            # если позиция попадает в его диапазон (пустые runs пропускаются).
             cur = 0
             start_run = None
             start_offset = 0
             end_run = None
             end_offset = 0
-
-            for i, r in enumerate(runs):
-                rt = r.text or ""
-                next_cur = cur + len(rt)
+            for i, text in enumerate(texts):
+                next_cur = cur + len(text)
                 if start_run is None and start < next_cur:
                     start_run = i
                     start_offset = start - cur
@@ -803,18 +892,25 @@ def replace_in_paragraph(paragraph, replacements: dict):
             if start_run is None or end_run is None:
                 break
 
-            start_text = runs[start_run].text or ""
-            end_text = runs[end_run].text or ""
+            prefix = texts[start_run][:start_offset]
+            suffix = texts[end_run][end_offset:]
 
-            prefix = start_text[:start_offset]
-            suffix = end_text[end_offset:]
+            texts[start_run] = prefix + value + suffix
+            if end_run != start_run:
+                for j in range(start_run + 1, end_run + 1):
+                    texts[j] = ""
+            changed.add(start_run)
+            if end_run != start_run:
+                changed.update(range(start_run + 1, end_run + 1))
 
-            runs[start_run].text = prefix + value + suffix
+            full_text = full_text[:start] + value + full_text[end:]
+            # Продолжаем поиск ПОСЛЕ вставленного значения: подстановка не
+            # обрабатывает собственный результат (защита от зацикливания,
+            # если в подстановке снова встречается этот же плейсхолдер).
+            search_from = start + len(value)
 
-            for j in range(start_run + 1, end_run + 1):
-                runs[j].text = ""
-
-            full_text = rebuild_full_text()
+    for index in sorted(changed):
+        runs[index].text = texts[index]
 
 
 def replace_in_doc(doc, replacements: dict):
@@ -1274,8 +1370,12 @@ class SpecTable(ctk.CTkFrame):
             row["cells"][key] = entry
 
         self._rows.append(row)
-        self._apply_theme()
-        self._schedule_height_update()
+        # П. 5.4: стилизуем только новую строку. Раньше _apply_theme()
+        # перестилизовывала ВСЕ строки на каждое добавление — задание
+        # 500 строк было O(n²) и блокировало интерфейс.
+        if not self._batch:
+            self._style_row(index)
+            self._schedule_height_update()
         return row
 
     # -- Высота тела таблицы ------------------------------------------------ #
@@ -1316,9 +1416,13 @@ class SpecTable(ctk.CTkFrame):
         """Одинарный клик: выделить строку (правка — только по двойному клику)."""
         if event is not None:
             index = self._row_of_widget(event.widget)
-            if index is not None:
+            if index is not None and index != self._selected_row:
+                previous = self._selected_row
                 self._selected_row = index
-                self._apply_theme()
+                # Стилизуем только прежнюю и новую строку, а не всю таблицу (п. 5.4).
+                if previous is not None:
+                    self._style_row(previous)
+                self._style_row(index)
         return None
 
     def _begin_edit(self, event):
@@ -1394,6 +1498,8 @@ class SpecTable(ctk.CTkFrame):
                 self._destroy_row(len(self._rows) - 1)
         finally:
             self._batch = False
+        self._apply_theme()
+        self._schedule_height_update()
         self._selected_row = None
         self._renumber()
         self._count_var.set(str(count))
@@ -1464,6 +1570,8 @@ class SpecTable(ctk.CTkFrame):
             self._batch = False
         self._selected_row = None
         self._renumber()
+        self._apply_theme()
+        self._schedule_height_update()
         self._notify()
         return True
 
@@ -1500,6 +1608,8 @@ class SpecTable(ctk.CTkFrame):
             self._destroy_row(len(self._rows) - 1)
         for _ in range(self.MIN_ROWS):
             self._add_row()
+        self._apply_theme()
+        self._schedule_height_update()
 
     # -- Данные ------------------------------------------------------------ #
     def get_items(self) -> list[dict]:
@@ -1687,12 +1797,36 @@ class SpecTable(ctk.CTkFrame):
             except Exception:
                 pass
 
-    def _apply_theme(self):
-        header_bg = ui.resolve(ui.COLORS["chrome"])
+    def _style_row(self, index: int) -> None:
+        """Стилизует одну строку (фон, рамки, цвета) с учётом выделения."""
         border = ui.resolve(ui.COLORS["entry_border"])
         accent = ui.resolve(ui.COLORS["accent"])
         base_bg = ui.resolve(ui.COLORS["entry_bg"])
         selected_bg = ui.resolve(ui.COLORS["sidebar_active"])
+        bg = selected_bg if index == self._selected_row else base_bg
+        row = self._rows[index]
+        try:
+            row["num"].configure(
+                bg=bg,
+                fg=ui.resolve(ui.COLORS["text_tertiary"]),
+            )
+        except Exception:
+            pass
+        for entry in row["cells"].values():
+            try:
+                entry.configure(
+                    bg=bg,
+                    readonlybackground=bg,
+                    fg=ui.resolve(ui.COLORS["text"]),
+                    insertbackground=ui.resolve(ui.COLORS["text"]),
+                    highlightbackground=border,
+                    highlightcolor=accent,
+                )
+            except Exception:
+                pass
+
+    def _apply_theme(self):
+        header_bg = ui.resolve(ui.COLORS["chrome"])
         for cell in self._header_cells:
             try:
                 cell.configure(bg=header_bg)
@@ -1703,27 +1837,8 @@ class SpecTable(ctk.CTkFrame):
                 label.configure(bg=header_bg, fg=ui.resolve(ui.COLORS["text_secondary"]))
             except Exception:
                 pass
-        for i, row in enumerate(self._rows):
-            bg = selected_bg if i == self._selected_row else base_bg
-            try:
-                row["num"].configure(
-                    bg=bg,
-                    fg=ui.resolve(ui.COLORS["text_tertiary"]),
-                )
-            except Exception:
-                pass
-            for entry in row["cells"].values():
-                try:
-                    entry.configure(
-                        bg=bg,
-                        readonlybackground=bg,
-                        fg=ui.resolve(ui.COLORS["text"]),
-                        insertbackground=ui.resolve(ui.COLORS["text"]),
-                        highlightbackground=border,
-                        highlightcolor=accent,
-                    )
-                except Exception:
-                    pass
+        for index in range(len(self._rows)):
+            self._style_row(index)
 
 
 class ContractApp:
@@ -1842,7 +1957,15 @@ class ContractApp:
     # ------------------------------------------------------------------ #
     def _place_window(self):
         self.root.update_idletasks()
-        area_x, area_y, area_w, area_h = ui.workarea()
+        area_x, area_y, area_w, area_h = ui.workarea(self.root)
+        # Минимальный размер не должен превышать рабочую область: иначе
+        # на экране 1366×768 с масштабом 150 % окно нельзя сузить (п. 6.3).
+        self._min_width = min(self._min_width, max(320, area_w))
+        self._min_height = min(self._min_height, max(240, area_h))
+        try:
+            self.root.minsize(self._min_width, self._min_height)
+        except Exception:
+            pass
         saved = self._settings.get("window") or {}
         try:
             width = int(saved.get("width", 0))
@@ -2003,7 +2126,12 @@ class ContractApp:
         )
         self._resize_handles = []
         for edge, cursor, color_key, place_kwargs, parent in specs:
-            handle = tk.Frame(parent, bg=ui.resolve(ui.COLORS[color_key]), cursor=cursor)
+            try:
+                handle = tk.Frame(parent, bg=ui.resolve(ui.COLORS[color_key]), cursor=cursor)
+            except tk.TclError:
+                # Минимальные X-серверы могут не иметь системных курсоров —
+                # окно остаётся работоспособным без курсоров растяжения.
+                handle = tk.Frame(parent, bg=ui.resolve(ui.COLORS[color_key]))
             handle.place(**place_kwargs)
             handle.bind("<ButtonPress-1>", lambda event, e=edge: self._resize_press(event, e))
             handle.bind("<B1-Motion>", lambda event, e=edge: self._resize_drag(event, e))
@@ -2996,8 +3124,12 @@ class ContractApp:
         self.scrollers.append(self.registry_list)
 
         self._registry_selected_id = None
+        self._registry_rows: dict = {}
+        self._registry_docs_row = 1
         self._registry_docs_frame = None
-        self.refresh_registry()
+        # Ленивый рендер (п. 9 этапа 5): при старте список не рисуется —
+        # реестр отрисуется при первом открытии страницы или при изменениях.
+        self._registry_rendered = False
 
     # -- Реестр: список контрагентов и документы выбранного -------------- #
     def _registry_parties(self) -> list[dict]:
@@ -3049,17 +3181,79 @@ class ContractApp:
         self._registry_apply_filter()
 
     def _select_registry_party(self, rec: dict):
-        """Клик по контрагенту: показать/скрыть его документы."""
+        """Клик по контрагенту: показать/скрыть его документы.
+
+        Частичное обновление (п. 5.1): строки контрагентов не пересоздаются,
+        перерисовываются только подсветка выбора и секция документов.
+        """
         if self._registry_selected_id == rec.get("id"):
             self._registry_selected_id = None
         else:
             self._registry_selected_id = rec.get("id")
             # Выбор из реестра переносится на страницы документов (п. 4.2).
             self._set_current_party(rec)
-        self.refresh_registry()
+        if not self._registry_rows:
+            # Страница ещё не отрисована (ленивый рендер) — рисуем целиком.
+            self.refresh_registry()
+            return
+        self._refresh_registry_selection()
+
+    @staticmethod
+    def _party_row_text(rec: dict, selected: bool) -> str:
+        """Текст строки контрагента в реестре (название, тип, ИНН, ID, адрес)."""
+        kind = "ИП" if rec.get("type") == "ip" else "Юр. лицо"
+        inn = str(rec.get("fields", {}).get(F.INN, "")).strip() or "—"
+        address = str(rec.get("fields", {}).get(F.LEGAL_ADDRESS, "")).strip()
+        if len(address) > 48:
+            address = address[:47].rstrip() + "…"
+        text = f"{storage.display_name(rec)}   ·   {kind}   ·   ИНН {inn}   ·   ID {rec.get('id')}"
+        if address:
+            text += f"   ·   {address}"
+        if selected:
+            text = "●  " + text
+        return text
+
+    def _refresh_registry_selection(self):
+        """Частичное обновление реестра при смене выбора (п. 5.1).
+
+        Строки контрагентов остаются теми же виджетами (меняется только
+        подсветка), секция документов выбранного пересобирается на своём
+        месте. Полная перерисовка нужна только при изменении состава списка
+        (поиск, добавление, удаление).
+        """
+        for party_id, entry in self._registry_rows.items():
+            selected = self._registry_selected_id == party_id
+            btn = entry["btn"]
+            try:
+                btn.configure(
+                    text=self._party_row_text(entry["rec"], selected),
+                    font=ui.font(12, "bold" if selected else "normal"),
+                    text_color=(ui.COLORS["text"] if selected
+                                else ui.COLORS["text_secondary"]),
+                )
+            except Exception:
+                pass
+        if self._registry_docs_frame is not None:
+            try:
+                self._registry_docs_frame.destroy()
+            except Exception:
+                pass
+            self._registry_docs_frame = None
+        self._render_registry_documents(self._registry_docs_row)
+        self.root.after(60, self._refresh_scrollbars)
 
     def refresh_registry(self):
-        """Перерисовывает реестр: контрагенты + документы выбранного."""
+        """Перерисовывает реестр целиком (поиск, изменения состава).
+
+        Длительные перерисовки (более 500 мс на больших объёмах) попадают
+        в журнал (п. 10 этапа 5); клик по контрагенту перерисовывает только
+        подсветку и секцию документов (_refresh_registry_selection, п. 5.1).
+        """
+        with applog.timed("Перерисовка реестра", 500, "ui"):
+            self._refresh_registry_full()
+        self._registry_rendered = True
+
+    def _refresh_registry_full(self):
         for child in self.registry_list.winfo_children():
             try:
                 child.destroy()
@@ -3079,6 +3273,7 @@ class ContractApp:
         ).grid(row=0, column=0, sticky="ew", pady=(0, int(6 * self.scale)))
 
         row_index = 1
+        self._registry_rows: dict = {}
         if self._orphans:
             banner = ctk.CTkFrame(
                 self.registry_list, fg_color=ui.COLORS["sidebar_hover"], corner_radius=8,
@@ -3113,17 +3308,8 @@ class ContractApp:
             row_index += 1
 
         for rec in parties:
-            kind = "ИП" if rec.get("type") == "ip" else "Юр. лицо"
-            inn = str(rec.get("fields", {}).get(F.INN, "")).strip() or "—"
-            address = str(rec.get("fields", {}).get(F.LEGAL_ADDRESS, "")).strip()
-            if len(address) > 48:
-                address = address[:47].rstrip() + "…"
             selected = self._registry_selected_id == rec.get("id")
-            text = f"{storage.display_name(rec)}   ·   {kind}   ·   ИНН {inn}   ·   ID {rec.get('id')}"
-            if address:
-                text += f"   ·   {address}"
-            if selected:
-                text = "●  " + text
+            text = self._party_row_text(rec, selected)
             row = ctk.CTkFrame(self.registry_list, fg_color="transparent")
             row.grid(row=row_index, column=0, sticky="ew", pady=1)
             row.grid_columnconfigure(0, weight=1)
@@ -3148,8 +3334,10 @@ class ContractApp:
                 row, "Удалить", lambda r=rec: self._delete_counterparty(r),
                 width=int(92 * self.scale), height=int(26 * self.scale),
             ).grid(row=0, column=2, padx=(int(6 * self.scale), 0))
+            self._registry_rows[rec.get("id")] = {"rec": rec, "frame": row, "btn": btn}
             row_index += 1
 
+        self._registry_docs_row = row_index
         row_index = self._render_registry_documents(row_index)
         row_index = self._render_registry_unknown(row_index)
         self._render_registry_trash(row_index)
@@ -3666,13 +3854,18 @@ class ContractApp:
 
     # -- Печатная форма: сборка .docx напрямую из шаблонов ---------------- #
     def _default_documents_dir(self, interactive: bool = True) -> str:
-        """Папка документов по умолчанию (внутри профиля пользователя)."""
-        base = os.path.join(
-            os.environ.get("APPDATA") or os.path.expanduser("~"),
-            SETTINGS_DIR_NAME, "documents",
-        )
+        """Папка документов по умолчанию: «Документы/EW.DocHub» (п. 6.2).
+
+        Раньше по умолчанию использовался скрытый %APPDATA%\\DogovorGenerator\\documents:
+        пользователь не видел, где лежат его файлы. Теперь — видимая папка
+        «Документы», которая не исчезает при переустановке системы и попадает
+        в обычные резервные копии. Если «Документы» недоступны — возврат
+        к прежнему месту в профиле пользователя.
+        """
+        base = os.path.join(_user_documents_dir(), "EW.DocHub")
         try:
             os.makedirs(base, exist_ok=True)
+            return base
         except OSError as exc:
             self._log.error(
                 "Папка документов по умолчанию недоступна: %s", type(exc).__name__,
@@ -3685,6 +3878,14 @@ class ContractApp:
                     "Выберите другую папку в «Настройках» или проверьте права доступа.",
                     "error",
                 )
+        base = os.path.join(
+            os.environ.get("APPDATA") or os.path.expanduser("~"),
+            SETTINGS_DIR_NAME, "documents",
+        )
+        try:
+            os.makedirs(base, exist_ok=True)
+        except OSError:
+            pass
         return base
 
     def _resolve_unavailable_documents_dir(self, custom: str, exc: OSError) -> str:
@@ -3839,7 +4040,7 @@ class ContractApp:
     def _render_contract_docx(self, data: dict, is_ip: bool) -> "Document":
         """Договор из шаблона: печатная форма сохраняется без искажений."""
         template_path = resource_path("dogovor_template_ip.docx" if is_ip else "dogovor_template.docx")
-        doc = Document(template_path)
+        doc = load_template_cached(template_path)
         replace_in_doc(doc, build_replacements(data, is_ip))
         return doc
 
@@ -3847,7 +4048,7 @@ class ContractApp:
                                 limit_display: str, term: str) -> "Document":
         """Доп. соглашение из шаблона с подстановкой лимита и отсрочки."""
         template_path = resource_path("additional_agreement_ip.docx" if is_ip else "additional_agreement.docx")
-        doc = Document(template_path)
+        doc = load_template_cached(template_path)
         replacements = build_replacements(data, is_ip)
         replacements[PH.AGREEMENT_NUMBER] = number or "б/н"
         limit = digits_only(limit_display)
@@ -3874,7 +4075,7 @@ class ContractApp:
         template_path = resource_path(
             "spec_template_ip.docx" if is_ip else "spec_template.docx"
         )
-        doc = Document(template_path)
+        doc = load_template_cached(template_path)
         data = dict(rec.get("data") or {})
         extra = rec.get("extra") or {}
         replacements = build_replacements(data, is_ip)
@@ -4005,6 +4206,33 @@ class ContractApp:
         )
 
     def _regenerate_spec(self, *_args):
+        """Откладывает пересборку предпросмотра спецификации (п. 5.6).
+
+        Раньше предпросмотр пересобирался на каждый символ в любом из шести
+        полей и в каждой ячейке таблицы позиций. Теперь, как и у договора
+        и доп. соглашения, пересборка откладывается на 120 мс.
+        """
+        pending = getattr(self, "_spec_preview_after", None)
+        if pending:
+            try:
+                self.root.after_cancel(pending)
+            except Exception:
+                pass
+        self._spec_preview_after = self.root.after(120, self._render_spec_preview)
+
+    def _flush_spec_preview(self):
+        """Синхронно дособирает отложенный предпросмотр (перед чтением текста)."""
+        pending = getattr(self, "_spec_preview_after", None)
+        if pending:
+            try:
+                self.root.after_cancel(pending)
+            except Exception:
+                pass
+            self._spec_preview_after = None
+        self._render_spec_preview()
+
+    def _render_spec_preview(self):
+        self._spec_preview_after = None
         party = self._party_from_var(self.spec_party_var)
         if party is None:
             self._set_text(self.spec_text, "Выберите контрагента и договор-основание слева.")
@@ -4155,9 +4383,11 @@ class ContractApp:
             self._reset_form_baseline("contract")
             self.refresh_registry()
             self._update_status()
+            opened = open_file(path)
             self._notify(
                 f"Договор № {data[F.NUMBER]} от {date_text} для "
-                f"{storage.display_name(rec)} сохранён и открыт.",
+                f"{storage.display_name(rec)} сохранён"
+                + (" и открыт." if opened else "."),
                 path,
             )
         except Exception as exc:
@@ -4236,9 +4466,11 @@ class ContractApp:
             self._reset_form_baseline("additional")
             self.refresh_registry()
             self._update_status()
+            opened = open_file(path)
             self._notify(
                 f"Доп. соглашение № {number} к договору № {contract_number or 'б/н'} "
-                "сохранено и открыто.",
+                "сохранено"
+                + (" и открыто." if opened else "."),
                 path,
             )
         except Exception as exc:
@@ -4281,6 +4513,9 @@ class ContractApp:
                              f"У позиции «{item['name']}» должна быть цена больше нуля.", "error")
                     return
 
+            # Предпросмотр собирается с задержкой — перед сохранением
+            # дособираем его синхронно, чтобы текст записи был актуальным.
+            self._flush_spec_preview()
             text = self.spec_text.get("1.0", "end").strip()
             date_text = f"{self.spec_day_var.get().strip()} {self.spec_month_var.get().strip()}".strip()
             contract_number = contract.get("number") or ""
@@ -4330,9 +4565,11 @@ class ContractApp:
             self._reset_form_baseline("spec")
             self.refresh_registry()
             self._update_status()
+            opened = open_file(path)
             self._notify(
                 f"Спецификация № {number} к договору № {contract_number or 'б/н'} "
-                "сохранена и открыта.",
+                "сохранена"
+                + (" и открыта." if opened else "."),
                 path,
             )
         except Exception as exc:
@@ -5069,6 +5306,8 @@ class ContractApp:
         self._import_queue = queue.Queue()
         self._import_results: list[dict] = []
         self._import_total = max(1, len(files))
+        self._import_cancelled = False
+        self._import_cancelled_count = 0
 
         win = ctk.CTkToplevel(self.root)
         win.title("Загрузка документов")
@@ -5098,11 +5337,16 @@ class ContractApp:
             font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
             anchor="w", justify="left", wraplength=int(360 * self.scale),
         ).pack(anchor="w", pady=(int(10 * self.scale), 0))
+        self._import_cancel_btn = ui.ghost_button(
+            frame, "Отменить", self._cancel_import,
+            width=int(120 * self.scale), height=int(28 * self.scale),
+        )
+        self._import_cancel_btn.pack(anchor="e", pady=(int(8 * self.scale), 0))
 
         # Окно по центру родительского, поверх остальных.
         win.update_idletasks()
         width = int(430 * self.scale)
-        height = int(210 * self.scale)
+        height = int(240 * self.scale)
         x = self.root.winfo_x() + (self.root.winfo_width() - width) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - height) // 2
         win.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
@@ -5114,9 +5358,25 @@ class ContractApp:
         threading.Thread(target=self._import_worker, args=(files,), daemon=True).start()
         self.root.after(80, self._import_tick)
 
+    def _cancel_import(self):
+        """Отменяет импорт: остаток пакета не анализируется и не регистрируется (п. 5.3)."""
+        if not getattr(self, "_import_running", False):
+            return
+        self._import_cancelled = True
+        try:
+            self._import_status_var.set("Отмена…")
+            self._import_cancel_btn.configure(state="disabled")
+        except Exception:
+            pass
+
     def _import_worker(self, files: list[str]):
-        """Фоновый поток: анализ каждого файла и копирование в папку контрагента."""
+        """Фоновый поток: анализ каждого файла и копирование в папку контрагента.
+
+        После нажатия «Отменить» остаток пакета не анализируется (п. 5.3).
+        """
         for index, path in enumerate(files):
+            if self._import_cancelled:
+                break
             name = os.path.basename(path)
             self._import_queue.put(
                 ("status", f"Анализ файла {index + 1} из {len(files)}:\n{name}")
@@ -5214,6 +5474,10 @@ class ContractApp:
                     self._import_win = None
                     self._import_progress = None
                     self._import_running = False
+                    # Часть пакета могла быть пропущена по «Отмене» (п. 5.3).
+                    self._import_cancelled_count = max(
+                        0, self._import_total - len(results)
+                    )
                     try:
                         win.grab_release()
                         win.destroy()
@@ -5235,111 +5499,36 @@ class ContractApp:
           * без ИНН — диалог «привязать к существующему / создать / пропустить»;
           * документ, который уже есть в реестре, повторно не добавляется;
           * по каждому файлу в отчёте видны тип, результат и причина.
+
+        Пакетная запись (п. 5.2): все изменения пакета пишутся на диск ОДНИМ
+        ``save()`` в конце. Раньше каждое «добавить» полностью перезаписывало
+        JSON с fsync и ротацией копий — импорт 200 файлов давал 200 полных
+        записей реестра.
         """
-        added = 0
-        new_parties = 0
-        skipped = 0
-        duplicates = 0
+        stats = {
+            "added": 0,
+            "new_parties": 0,
+            "skipped": 0,
+            "duplicates": 0,
+            "cancelled": max(0, int(getattr(self, "_import_cancelled_count", 0))),
+        }
         save_errors: list[str] = []
         entries: list[dict] = []
+        store_dirty = False
 
         for result in results:
-            entry = {
-                "name": result.get("name") or "файл",
-                "kind": result.get("kind") or storage.KIND_UNKNOWN,
-                "status": "skip",
-                "detail": "",
-                "warning": "",
-            }
+            entry = self._new_import_entry(result)
             entries.append(entry)
-            copied = result.get("copied") or ""
-            party = result.get("party") or {}
+            if self._register_import_result(result, entry, stats):
+                store_dirty = True
 
-            if not result.get("ok") or not party:
-                skipped += 1
-                entry["detail"] = result.get("error") or "документ не распознан"
-                result["copied"] = self._move_import_to_unknown(copied)
-                continue
+        if store_dirty:
+            with applog.timed("Запись реестра (импорт)", 500, "storage"):
+                if not self.store.save():
+                    save_errors.append(self.store.last_error or "реестр не записан")
+            self._log.info("Пакет импорта записан одним save() (п. 5.2)")
 
-            fields = dict(party.get("fields") or {})
-            inn = str(fields.get(F.INN, "")).strip()
-            rec = None
-            action = ""
-            if result.get("recognized") and inn:
-                rec = self.store.find_by_inn(inn)
-                if rec is not None:
-                    action = "attach"
-                else:
-                    # ИНН новый, но карточка с таким названием уже может быть
-                    # (например, заведена вручную без ИНН) — не плодим дубль.
-                    same_name = self.store.find_by_name(party.get("display"))
-                    if same_name is not None:
-                        attach = ui.confirm(
-                            self.root, "Похожее название уже есть",
-                            f"Файл: {result.get('name')}\n"
-                            f"Распознано: {party.get('display')}\n\n"
-                            f"В реестре есть «{storage.display_name(same_name)}» "
-                            "с другим ИНН.\n\n"
-                            "Привязать документ к этой карточке?",
-                            "Привязать", "Создать новую",
-                        )
-                        if attach:
-                            rec, action = same_name, "attach"
-                    if action != "attach":
-                        action = "create"
-            else:
-                rec, action = self._ask_import_party(result)
-
-            if action == "create":
-                rec = self.store.add_counterparty(party.get("type") or "ooo", fields)
-                if self.store.last_error:
-                    save_errors.append(self.store.last_error)
-                new_parties += 1
-                entry["detail"] = "создана новая карточка"
-            elif action == "attach" and rec is not None:
-                entry["detail"] = f"привязан к «{storage.display_name(rec)}»"
-
-            if action == "skip" or rec is None:
-                skipped += 1
-                entry["detail"] = entry["detail"] or "контрагент не выбран"
-                result["copied"] = self._move_import_to_unknown(copied)
-                continue
-
-            if not copied:
-                skipped += 1
-                entry["detail"] = result.get("error") or "файл не скопирован"
-                continue
-
-            if self._import_document_is_duplicate(rec["id"], result):
-                duplicates += 1
-                entry["status"] = "duplicate"
-                entry["detail"] = "такой документ уже есть в реестре"
-                result["copied"] = self._move_import_to_unknown(copied)
-                continue
-
-            self.store.add_document(
-                result.get("kind") or storage.KIND_UNKNOWN,
-                rec["id"],
-                result.get("number") or "",
-                result.get("date") or "",
-                data=dict(rec.get("fields") or {}),
-                extra={
-                    "imported": True,
-                    "source_file": copied,
-                    "is_ip": rec.get("type") == "ip",
-                },
-                text=result.get("text") or "",
-            )
-            if self.store.last_error:
-                save_errors.append(self.store.last_error)
-            added += 1
-            entry["status"] = "added"
-            if not result.get("recognized"):
-                entry["warning"] = (
-                    result.get("warning") or "карточка создана без ИНН"
-                )
-
-        if added:
+        if stats["added"]:
             self._refresh_party_combo_values()
             self._preview_contract()
             self._preview_additional()
@@ -5348,11 +5537,13 @@ class ContractApp:
 
         message = (
             "Загрузка завершена.\n"
-            f"Добавлено документов: {added} (новых контрагентов: {new_parties})\n"
-            f"Пропущено: {skipped}"
+            f"Добавлено документов: {stats['added']} (новых контрагентов: {stats['new_parties']})\n"
+            f"Пропущено: {stats['skipped']}"
         )
-        if duplicates:
-            message += f", уже были в реестре: {duplicates}"
+        if stats["duplicates"]:
+            message += f", уже были в реестре: {stats['duplicates']}"
+        if stats["cancelled"]:
+            message += f"\nОтменено пользователем: {stats['cancelled']}"
         if save_errors:
             message += (
                 "\n\nВНИМАНИЕ: часть записей не попала на диск:\n"
@@ -5361,9 +5552,113 @@ class ContractApp:
         self._log.info(
             "Импорт завершён: добавлено=%d, новых контрагентов=%d, "
             "пропущено=%d, дубликатов=%d, ошибок записи=%d",
-            added, new_parties, skipped, duplicates, len(save_errors),
+            stats["added"], stats["new_parties"], stats["skipped"],
+            stats["duplicates"], len(save_errors),
         )
         self._show_import_report(entries, message)
+        self._import_cancelled_count = 0
+
+    @staticmethod
+    def _new_import_entry(result: dict) -> dict:
+        """Заготовка строки отчёта импорта для одного файла."""
+        return {
+            "name": result.get("name") or "файл",
+            "kind": result.get("kind") or storage.KIND_UNKNOWN,
+            "status": "skip",
+            "detail": "",
+            "warning": "",
+        }
+
+    def _register_import_result(self, result: dict, entry: dict, stats: dict) -> bool:
+        """Регистрирует один результат разбора. Возвращает True, если реестр менялся.
+
+        Изменения остаются в памяти: сохранение на диск делает вызывающий код
+        одним ``save()`` на весь пакет (п. 5.2).
+        """
+        copied = result.get("copied") or ""
+        party = result.get("party") or {}
+
+        if not result.get("ok") or not party:
+            stats["skipped"] += 1
+            entry["detail"] = result.get("error") or "документ не распознан"
+            result["copied"] = self._move_import_to_unknown(copied)
+            return False
+
+        fields = dict(party.get("fields") or {})
+        inn = str(fields.get(F.INN, "")).strip()
+        rec = None
+        action = ""
+        if result.get("recognized") and inn:
+            rec = self.store.find_by_inn(inn)
+            if rec is not None:
+                action = "attach"
+            else:
+                # ИНН новый, но карточка с таким названием уже может быть
+                # (например, заведена вручную без ИНН) — не плодим дубль.
+                same_name = self.store.find_by_name(party.get("display"))
+                if same_name is not None:
+                    attach = ui.confirm(
+                        self.root, "Похожее название уже есть",
+                        f"Файл: {result.get('name')}\n"
+                        f"Распознано: {party.get('display')}\n\n"
+                        f"В реестре есть «{storage.display_name(same_name)}» "
+                        "с другим ИНН.\n\n"
+                        "Привязать документ к этой карточке?",
+                        "Привязать", "Создать новую",
+                    )
+                    if attach:
+                        rec, action = same_name, "attach"
+                if action != "attach":
+                    action = "create"
+        else:
+            rec, action = self._ask_import_party(result)
+
+        if action == "create":
+            rec = self.store.add_counterparty(party.get("type") or "ooo", fields, save=False)
+            stats["new_parties"] += 1
+            entry["detail"] = "создана новая карточка"
+        elif action == "attach" and rec is not None:
+            entry["detail"] = f"привязан к «{storage.display_name(rec)}»"
+
+        if action == "skip" or rec is None:
+            stats["skipped"] += 1
+            entry["detail"] = entry["detail"] or "контрагент не выбран"
+            result["copied"] = self._move_import_to_unknown(copied)
+            return False
+
+        if not copied:
+            stats["skipped"] += 1
+            entry["detail"] = result.get("error") or "файл не скопирован"
+            return False
+
+        if self._import_document_is_duplicate(rec["id"], result):
+            stats["duplicates"] += 1
+            entry["status"] = "duplicate"
+            entry["detail"] = "такой документ уже есть в реестре"
+            result["copied"] = self._move_import_to_unknown(copied)
+            return False
+
+        self.store.add_document(
+            result.get("kind") or storage.KIND_UNKNOWN,
+            rec["id"],
+            result.get("number") or "",
+            result.get("date") or "",
+            data=dict(rec.get("fields") or {}),
+            extra={
+                "imported": True,
+                "source_file": copied,
+                "is_ip": rec.get("type") == "ip",
+            },
+            text=result.get("text") or "",
+            save=False,
+        )
+        stats["added"] += 1
+        entry["status"] = "added"
+        if not result.get("recognized"):
+            entry["warning"] = (
+                result.get("warning") or "карточка создана без ИНН"
+            )
+        return True
 
     def _ask_import_party(self, result: dict) -> tuple[dict | None, str]:
         """Спрашивает, к какому контрагенту отнести документ без ИНН (п. 3.3).

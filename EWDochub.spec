@@ -6,6 +6,48 @@
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
+# VersionInfo для exe — версия видна в свойствах файла (п. 6.1 плана).
+# Синхронизируется с APP_VERSION в main.py и MyAppVersion в installer.iss.
+APP_VERSION = "1.5.0"
+try:
+    from PyInstaller.utils.win32.versioninfo import (
+        VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,
+        VarFileInfo, StringStruct, VarStruct,
+    )
+
+    exe_version = VSVersionInfo(
+        ffi=FixedFileInfo(
+            filevers=(1, 5, 0, 0),
+            prodvers=(1, 5, 0, 0),
+            mask=0x3F,
+            flags=0x0,
+            OS=0x40004,
+            fileType=0x1,
+            subtype=0x0,
+            date=(0, 0),
+        ),
+        kids=[
+            StringFileInfo([
+                StringTable(
+                    "041904B0",
+                    [
+                        StringStruct("CompanyName", "EW.DocHub"),
+                        StringStruct("FileDescription", "EW.DocHub — контрагенты и документы"),
+                        StringStruct("FileVersion", APP_VERSION),
+                        StringStruct("InternalName", "EW.DocHub"),
+                        StringStruct("LegalCopyright", "© EW.DocHub"),
+                        StringStruct("OriginalFilename", "EW.DocHub.exe"),
+                        StringStruct("ProductName", "EW.DocHub"),
+                        StringStruct("ProductVersion", APP_VERSION),
+                    ],
+                )
+            ]),
+            VarFileInfo([VarStruct("Translation", [1049, 1200, 1033, 1200])]),
+        ],
+    )
+except Exception:  # сборка не на Windows — exe без VersionInfo
+    exe_version = None
+
 customtkinter_datas = collect_data_files("customtkinter")
 customtkinter_imports = collect_submodules("customtkinter")
 
@@ -52,6 +94,7 @@ exe = EXE(
     a.scripts,
     exclude_binaries=True,
     name='EW.DocHub',
+    version=exe_version,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

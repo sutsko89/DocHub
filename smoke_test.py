@@ -37,6 +37,7 @@ m.ui.alert = lambda *args, **kwargs: ALERTS.append(args)
 m.ui.confirm = lambda *args, **kwargs: True
 # В тесте не открываем Word и не запускаем файлы.
 OPENED: list[str] = []
+_real_open_file = m.open_file  # реальная функция до стаба ниже (нужна п. 6.2)
 m.open_file = lambda path: OPENED.append(path)
 
 
@@ -71,6 +72,37 @@ check(m.validate_party_fields({
     "Полное название компании (Покупь)": "ООО", "Сокращенное название компании": "ООО",
     "ФИО директора": "Иванов И.И.",
 }, is_ip=False) == {}, "валидация контрагента: валидные данные")
+
+# ---------- 5.6: один проход замены плейсхолдеров ----------
+def _para(*runs_text):
+    from docx import Document as _Doc
+    document = _Doc()
+    paragraph = document.add_paragraph()
+    for chunk in runs_text:
+        paragraph.add_run(chunk)
+    return paragraph
+
+_p = _para("Привет, {{NAME}}!", " И {{NAME}} снова.")
+m.replace_in_paragraph(_p, {"{{NAME}}": "ООО Ромашка"})
+check(_p.runs[0].text == "Привет, ООО Ромашка!" and _p.runs[1].text == " И ООО Ромашка снова.",
+      "5.6: плейсхолдер в двух runs заменён, остальные тексты не тронуты")
+
+_p = _para("Поставщик: {{", "PARTY", "}} и {{PARTY}} в конце.")
+m.replace_in_paragraph(_p, {"{{PARTY}}": "ИП Иванов"})
+check(_p.text == "Поставщик: ИП Иванов и ИП Иванов в конце.",
+      "5.6: плейсхолдер, разорванный по runs, собирается и заменяется")
+
+_p = _para("{{A}}{{A}}{{A}}")
+m.replace_in_paragraph(_p, {"{{A}}": "X"})
+check(_p.text == "XXX", "5.6: три одинаковых плейсхолдера подряд")
+
+_p = _para("до {{A}} после")
+m.replace_in_paragraph(_p, {"{{A}}": "Y{{A}}Z"})
+check(_p.text == "до Y{{A}}Z после", "5.6: подстановка, содержащая сам плейсхолдер, не зацикливает замену")
+
+_p = _para("А{{X}}Б{{Y}}В")
+m.replace_in_paragraph(_p, {"{{X}}": "1", "{{Y}}": "2"})
+check(_p.text == "А1Б2В", "5.6: два разных плейсхолдера в одной строке")
 
 # ---------- DaData: ключ только через настройки (п. 1.3) ----------
 # Ключ мог остаться в песочнице от прошлого прогона — чистим для детерминизма.
@@ -640,10 +672,43 @@ check(store.find_by_name("ООО «Ромашка»") is not None,
 check(store.find_by_name("нет такого") is None,
       "хранилище: поиск по названию не находит лишнего")
 
+# ---------- п.10/5.1: производительность реестра на 600 контрагентах ----------
+_perf_dir = tempfile.mkdtemp(prefix="smoke_perf_")
+_appdata_perf_backup = os.environ["APPDATA"]
+os.environ["APPDATA"] = _perf_dir
+try:
+    _t0 = time.perf_counter()
+    _perf_store = storage.DataStore()
+    for _i in range(600):
+        _perf_store.add_counterparty("ooo", {
+            "ИНН": f"7701{_i:06d}",
+            "Сокращенное название компании": f"ООО Нагрузка-{_i}",
+        }, save=False)
+    _perf_store.save()
+    _t1 = time.perf_counter()
+    _perf_store = storage.DataStore()
+    _t2 = time.perf_counter()
+    check(len(_perf_store.counterparties) == 600,
+          "п.10: реестр на 600 контрагентов загружается целиком")
+    check((_t1 - _t0) < 5.0,
+          f"п.10: запись 600 контрагентов одним save() заняла {(_t1 - _t0):.2f} с (<5 с)")
+    check((_t2 - _t1) < 5.0,
+          f"п.10: загрузка 600 контрагентов заняла {(_t2 - _t1):.2f} с (<5 с)")
+finally:
+    os.environ["APPDATA"] = _appdata_perf_backup
+    shutil.rmtree(_perf_dir, ignore_errors=True)
+
 # ---------- Интерфейс ----------
 app = m.ContractApp()
 try:
     app.root.update_idletasks()
+
+    # п.9: при старте реестр не отрисовывается — ленивый рендер.
+    check(getattr(app, "_registry_rendered", True) is False,
+          "п.9: при старте реестр не отрисовывается (ленивый рендер)")
+    # 6.2: открытие файла подменяем детерминированным стабом (без xdg-open).
+    _orig_open_file = m.open_file
+    m.open_file = lambda path: True
 
     check(hasattr(app, "nav_holder") and len(app.nav_items) == 6,
           "кнопки разделов в шапке, включая «Настройки»")
@@ -678,6 +743,15 @@ try:
     check("Ромашка" in contract_text and "5" in contract_text,
           "печатная форма договора: номер подставлен")
     check(len(doc.tables) == 1, "печатная форма договора: таблица реквизитов на месте")
+
+    # 5.5: шаблон разбирается один раз и кэшируется, рендер получает копию.
+    check(bool(m._TEMPLATE_CACHE), "5.5: шаблоны печатных форм кэшируются")
+    _cached = m._TEMPLATE_CACHE.get(m.resource_path("dogovor_template.docx"))
+    check(_cached is not None and _cached[0] > 0,
+          "5.5: в кэше шаблона хранятся mtime и разобранный Document")
+    _doc_again = app._render_contract_docx(data, is_ip=False)
+    check("{{" not in "\n".join(p.text for p in _doc_again.paragraphs),
+          "5.5: повторный рендер из кэша даёт чистый документ без {{...}}")
 
     app.save_contract()
     check(len(app.store.documents) == 1 and app.store.documents[0]["kind"] == storage.KIND_CONTRACT,
@@ -740,11 +814,25 @@ try:
     row["unit"].set("шт.")
     row["price"].set("100")
     app.root.update()
+    # 5.6: предпросмотр спецификации отложен — дособираем его синхронно.
+    app._flush_spec_preview()
     spec_text = app.spec_text.get("1.0", "end")
     check("СПЕЦИФИКАЦИЯ № 1" in spec_text, "заголовок спецификации")
     check("1 000" in spec_text, "итог спецификации посчитан")
     check("одна тысяча" in spec_text.lower(), "итог прописью")
     check("шт." in spec_text, "ед. изм. видна в предпросмотре")
+
+    # 5.6: пересборка откладывается, а не идёт на каждый символ.
+    app._spec_preview_after = None
+    app.spec_delivery_term_var.set("45")
+    check(getattr(app, "_spec_preview_after", None) is not None,
+          "5.6: изменение поля планирует отложенную пересборку предпросмотра")
+    app._flush_spec_preview()
+    check("отсрочка" in app.spec_text.get("1.0", "end").lower()
+          or "45" in app.spec_text.get("1.0", "end"),
+          "5.6: flush дособирает предпросмотр актуальным текстом")
+    app.spec_delivery_term_var.set("")
+    app._flush_spec_preview()
     app.save_spec()
     check(sum(1 for d in app.store.documents if d["kind"] == storage.KIND_SPEC) == 1,
           "спецификация сохранена в реестре")
@@ -881,7 +969,7 @@ try:
     items = app._spec_items()
     check(len(items) == 2 and items[0]["name"] == "Болт М8" and items[1]["qty"] == 12,
           "таблица: строки из буфера попали в позиции")
-    app.root.update()
+    app._flush_spec_preview()
     check("1 600" in app.spec_text.get("1.0", "end"), "таблица: итог пересчитан после вставки")
     check(len(app._spec_rows) == 10, "таблица: стартовое количество строк — 10")
 
@@ -902,6 +990,39 @@ try:
     inner.event_generate("<Return>")
     app.root.update()
     check(len(app._spec_rows) == 6, "таблица: количество строк применяется по Enter")
+
+    # 5.4: массовое задание строк больше не O(n²) — 500 строк создаются быстро.
+    _t0 = time.perf_counter()
+    app.spec_table.set_row_count(500)
+    _elapsed = time.perf_counter() - _t0
+    check(len(app._spec_rows) == 500, "5.4: таблица задаёт 500 строк")
+    check(_elapsed < 10.0,
+          f"5.4: 500 строк создаются без O(n²) за {_elapsed:.1f} с (<10 с)")
+    check(str(app._spec_rows[0]["cells"]["name"].cget("readonlybackground")) != "",
+          "5.4: после массового задания строк все строки стилизованы")
+
+    # 5.4: комбобокс ограничивает число пунктов, подсветка движется точечно.
+    _combo = m.ui.ComboField(app.root, values=["— выберите —"])
+    _many = [f"Вариант {_i:03d}" for _i in range(300)]
+    _popup = m.ui._ComboPopup(_combo, _many, _combo._pick)
+    check(len(_popup._rows) == m.ui._ComboPopup.MAX_ITEMS,
+          "5.4: в выпадающем списке не больше 100 пунктов")
+    check(_popup._truncated, "5.4: длинный список помечен как обрезанный")
+    _popup._set_index(0)
+    _hover_bg = _popup._rows[0].cget("bg")
+    _normal_bg = _popup._rows[7].cget("bg")
+    check(_hover_bg != _normal_bg, "5.4: активная строка подсвечивается")
+    _popup._set_index(5)
+    check(_popup._rows[0].cget("bg") == _normal_bg
+          and _popup._rows[5].cget("bg") == _hover_bg,
+          "5.4: подсветка переставляется точечно, не перескрашивая список")
+    _popup._confirm(5)
+    check(_combo.get() == _many[5], "5.4: выбор из обрезанного списка работает")
+    try:
+        _popup.close()
+    except Exception:
+        pass
+    _combo.destroy()
 
     # Выделение строки и удаление по Delete.
     app.spec_table.set_row_count(4)
@@ -1030,6 +1151,57 @@ try:
         except OSError:
             pass
 
+    # 5.2/5.3: пакет импорта пишется на диск ОДНИМ save(), разбор отменяется.
+    _batch_dir = tempfile.mkdtemp(prefix="smoke_batch_")
+    _batch_results = []
+    _batch_fields = {"ИНН": "2540999887", "Сокращенное название компании": "ООО «Батч»"}
+    for _i in range(1, 31):
+        _fpath = os.path.join(_batch_dir, f"Док {_i}.docx")
+        _docx = m.Document()
+        _docx.add_paragraph(f"Спецификация № {_i} от 01.01.2026 ООО «Батч» ИНН 2540999887")
+        _docx.save(_fpath)
+        _batch_results.append({
+            "name": f"Док {_i}.docx", "kind": storage.KIND_SPEC,
+            "number": str(_i), "date": "01.01.2026",
+            "party": {"recognized": True, "type": "ooo", "display": "ООО «Батч»",
+                      "fields": dict(_batch_fields), "missing": ""},
+            "text": "", "ok": True, "recognized": True,
+            "copied": _fpath, "error": "", "warning": "",
+        })
+    _save_calls = [0]
+    _orig_store_save = app.store.save
+
+    def _counting_save():
+        _save_calls[0] += 1
+        return bool(_orig_store_save())
+
+    app.store.save = _counting_save
+    _orig_report2 = app._show_import_report
+    app._show_import_report = lambda entries, summary: None
+    try:
+        _docs_before = len(app.store.documents)
+        app._finish_documents_import(_batch_results)
+        check(_save_calls == [1],
+              f"5.2: пакет из 30 файлов записан одним save() (раньше — 30 записей): {_save_calls}")
+        check(len(app.store.documents) == _docs_before + 30,
+              "5.2: все 30 документов пакета добавлены в реестр")
+        check(app.store.find_by_inn("2540999887") is not None,
+              "5.2: карточка контрагента из пакета создана")
+        check("_cancel_import" in _main_src and "_import_cancelled" in _main_src,
+              "5.3: у импорта есть отмена «Отменить» (кнопка в окне загрузки)")
+        app._import_running = True
+        app._cancel_import()
+        check(app._import_cancelled, "5.3: после «Отменить» разбор остатка пакета прекращается")
+        app._import_running = False
+        app._import_cancelled = False
+    finally:
+        app.store.save = _orig_store_save
+        app._show_import_report = _orig_report2
+        _batch_party_rec = app.store.find_by_inn("2540999887")
+        if _batch_party_rec is not None:
+            app.store.purge_counterparty(_batch_party_rec["id"])
+        shutil.rmtree(_batch_dir, ignore_errors=True)
+
     # 4.1: дубликаты контрагентов по ИНН и номеров документов.
     # Создание карточки с чужим ИНН gated диалогом _cp_save (find_by_inn).
     _dup_party = app.store.add_counterparty("ooo", {
@@ -1109,9 +1281,57 @@ try:
     check("Email" not in _contact_errors and "Телефон" not in _contact_errors,
           "4.5: email и телефон необязательны")
 
+    # 6.1/6.5: установщик — директивы, версия, вопрос деинсталлятора.
+    with open("installer.iss", "r", encoding="utf-8") as _iss_f:
+        _iss_src = _iss_f.read()
+    for _directive in ("AppMutex=Local\\EWDocHub_SingleInstance", "MinVersion=10.0",
+                       "ArchitecturesAllowed=x64compatible", "CloseApplications=yes",
+                       "PrivilegesRequiredOverridesAllowed=dialog",
+                       "LicenseFile=license.txt",
+                       "EW.DocHub-{#MyAppVersion}-setup"):
+        check(_directive in _iss_src, f"6.1: в установщике есть {_directive}")
+    check("DelTree" in _iss_src and "DogovorGenerator" in _iss_src,
+          "6.5: деинсталлятор спрашивает про данные и ключ DaData")
+    with open("EWDochub.spec", "r", encoding="utf-8") as _spec_f:
+        _spec_src = _spec_f.read()
+    check("VSVersionInfo" in _spec_src and "version=exe_version" in _spec_src,
+          "6.1: у exe есть VersionInfo в сборке")
+    check(os.path.exists("license.txt"), "6.1: файл лицензии и уведомлений существует")
+
+    # 6.2: сообщение соответствует действительности — открытие проверяется.
+    app._set_current_party(party_rec)
+    m.open_file = lambda path: False
+    try:
+        app.contract_number_var.set("9")
+        app.save_contract()
+    finally:
+        m.open_file = lambda path: True  # возвращаем стаб успешного открытия
+    app.root.update()
+    _toast_text = str(app.toast_label.cget("text"))
+    check(_toast_text.rstrip(".").endswith("сохранён") and "и открыт" not in _toast_text,
+          f"6.2: при неудачном открытии не обещается «открыт»: {_toast_text!r}")
+    try:
+        app.contract_number_var.set("10")
+        app.save_contract()
+    finally:
+        m.open_file = _real_open_file
+    app.root.update()
+    check(str(app.toast_label.cget("text")).endswith("сохранён и открыт."),
+          f"6.2: при успешном открытии тост говорит «сохранён и открыт»: "
+          f"{app.toast_label.cget('text')!r}")
+
+    # 6.2: папка документов по умолчанию — видимые «Документы», а не скрытый %APPDATA%.
+    _def_dir = app._default_documents_dir(interactive=False)
+    check("Documents" in _def_dir and os.path.basename(_def_dir) == "EW.DocHub",
+          f"6.2: папка документов по умолчанию в «Документах»: {_def_dir}")
+    check(m.open_file(os.path.join(tempfile.gettempdir(), "smoke_missing_6_2.docx")) is False,
+          "6.2: open_file возвращает False при неудаче открытия (файла нет на диске)")
+
     # Реестр.
     app._select_page("registry")
     app.root.update()
+    check(app._registry_rendered is True,
+          "п.9: реестр отрисован при первом открытии страницы")
     check(app.current_page == "registry" and not app.save_button.winfo_manager(),
           "кнопка сохранения скрыта на реестре")
     texts = []
@@ -1150,6 +1370,33 @@ try:
     app.registry_search_var.set("")
     app._registry_apply_filter()
 
+    # 5.1: клик по контрагенту не пересоздаёт строки других контрагентов.
+    _party_2 = app.store.add_counterparty("ooo", {
+        "ИНН": "7709990000",
+        "Сокращенное название компании": "ООО Стрелка",
+        "Юридический адрес": "г. Владивосток, ул. Светланская, д. 1",
+    }, save=False)
+    app.refresh_registry()
+    _frames_before = {pid: entry["frame"] for pid, entry in app._registry_rows.items()}
+    check(len(_frames_before) == 2, "5.1: в реестре два контрагента для проверки")
+    app._select_registry_party(party_rec)
+    check(all(app._registry_rows[pid]["frame"] is _frames_before[pid]
+              for pid in _frames_before if pid in app._registry_rows),
+          "5.1: выбор контрагента не пересоздаёт строки реестра")
+    check(app._registry_selected_id == party_rec["id"], "5.1: выбор контрагента запомнен")
+    _docs_texts = []
+    for _child in app._registry_docs_frame.winfo_children():
+        try:
+            _docs_texts.append(_child.cget("text"))
+        except Exception:
+            pass
+    check(any("Документы" in str(_t) for _t in _docs_texts),
+          "5.1: секция документов выбранного видна после частичного обновления")
+    app._select_registry_party(party_rec)  # снять выбор
+    check(app._registry_selected_id is None, "5.1: повторный клик снимает выбор")
+    app.store.counterparties.remove(_party_2)
+    app.refresh_registry()
+
     check(app.store.delete_document(app.store.documents[0]["id"]),
           "хранилище: окончательное удаление записи документа")
 
@@ -1178,6 +1425,10 @@ try:
 
     app.store.save()
 finally:
+    try:
+        m.open_file = _real_open_file
+    except Exception:
+        pass
     try:
         app.root.destroy()
     except Exception:

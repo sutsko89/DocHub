@@ -1255,6 +1255,33 @@ try:
     app.registry_search_var.set("")
     app._registry_apply_filter()
 
+    # 5.1: клик по контрагенту не пересоздаёт строки других контрагентов.
+    _party_2 = app.store.add_counterparty("ooo", {
+        "ИНН": "7709990000",
+        "Сокращенное название компании": "ООО Стрелка",
+        "Юридический адрес": "г. Владивосток, ул. Светланская, д. 1",
+    }, save=False)
+    app.refresh_registry()
+    _frames_before = {pid: entry["frame"] for pid, entry in app._registry_rows.items()}
+    check(len(_frames_before) == 2, "5.1: в реестре два контрагента для проверки")
+    app._select_registry_party(party_rec)
+    check(all(app._registry_rows[pid]["frame"] is _frames_before[pid]
+              for pid in _frames_before if pid in app._registry_rows),
+          "5.1: выбор контрагента не пересоздаёт строки реестра")
+    check(app._registry_selected_id == party_rec["id"], "5.1: выбор контрагента запомнен")
+    _docs_texts = []
+    for _child in app._registry_docs_frame.winfo_children():
+        try:
+            _docs_texts.append(_child.cget("text"))
+        except Exception:
+            pass
+    check(any("Документы" in str(_t) for _t in _docs_texts),
+          "5.1: секция документов выбранного видна после частичного обновления")
+    app._select_registry_party(party_rec)  # снять выбор
+    check(app._registry_selected_id is None, "5.1: повторный клик снимает выбор")
+    app.store.counterparties.remove(_party_2)
+    app.refresh_registry()
+
     check(app.store.delete_document(app.store.documents[0]["id"]),
           "хранилище: окончательное удаление записи документа")
 

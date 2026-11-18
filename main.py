@@ -3034,6 +3034,8 @@ class ContractApp:
         self.scrollers.append(self.registry_list)
 
         self._registry_selected_id = None
+        self._registry_rows: dict = {}
+        self._registry_docs_row = 1
         self._registry_docs_frame = None
         self.refresh_registry()
 
@@ -3087,21 +3089,73 @@ class ContractApp:
         self._registry_apply_filter()
 
     def _select_registry_party(self, rec: dict):
-        """Клик по контрагенту: показать/скрыть его документы."""
+        """Клик по контрагенту: показать/скрыть его документы.
+
+        Частичное обновление (п. 5.1): строки контрагентов не пересоздаются,
+        перерисовываются только подсветка выбора и секция документов.
+        """
         if self._registry_selected_id == rec.get("id"):
             self._registry_selected_id = None
         else:
             self._registry_selected_id = rec.get("id")
             # Выбор из реестра переносится на страницы документов (п. 4.2).
             self._set_current_party(rec)
-        self.refresh_registry()
+        if not self._registry_rows:
+            # Страница ещё не отрисована (ленивый рендер) — рисуем целиком.
+            self.refresh_registry()
+            return
+        self._refresh_registry_selection()
+
+    @staticmethod
+    def _party_row_text(rec: dict, selected: bool) -> str:
+        """Текст строки контрагента в реестре (название, тип, ИНН, ID, адрес)."""
+        kind = "ИП" if rec.get("type") == "ip" else "Юр. лицо"
+        inn = str(rec.get("fields", {}).get(F.INN, "")).strip() or "—"
+        address = str(rec.get("fields", {}).get(F.LEGAL_ADDRESS, "")).strip()
+        if len(address) > 48:
+            address = address[:47].rstrip() + "…"
+        text = f"{storage.display_name(rec)}   ·   {kind}   ·   ИНН {inn}   ·   ID {rec.get('id')}"
+        if address:
+            text += f"   ·   {address}"
+        if selected:
+            text = "●  " + text
+        return text
+
+    def _refresh_registry_selection(self):
+        """Частичное обновление реестра при смене выбора (п. 5.1).
+
+        Строки контрагентов остаются теми же виджетами (меняется только
+        подсветка), секция документов выбранного пересобирается на своём
+        месте. Полная перерисовка нужна только при изменении состава списка
+        (поиск, добавление, удаление).
+        """
+        for party_id, entry in self._registry_rows.items():
+            selected = self._registry_selected_id == party_id
+            btn = entry["btn"]
+            try:
+                btn.configure(
+                    text=self._party_row_text(entry["rec"], selected),
+                    font=ui.font(12, "bold" if selected else "normal"),
+                    text_color=(ui.COLORS["text"] if selected
+                                else ui.COLORS["text_secondary"]),
+                )
+            except Exception:
+                pass
+        if self._registry_docs_frame is not None:
+            try:
+                self._registry_docs_frame.destroy()
+            except Exception:
+                pass
+            self._registry_docs_frame = None
+        self._render_registry_documents(self._registry_docs_row)
+        self.root.after(60, self._refresh_scrollbars)
 
     def refresh_registry(self):
-        """Перерисовывает реестр: контрагенты + документы выбранного.
+        """Перерисовывает реестр целиком (поиск, изменения состава).
 
         Длительные перерисовки (более 500 мс на больших объёмах) попадают
         в журнал (п. 10 этапа 5); клик по контрагенту перерисовывает только
-        секцию документов (_refresh_registry_selection, п. 5.1).
+        подсветку и секцию документов (_refresh_registry_selection, п. 5.1).
         """
         with applog.timed("Перерисовка реестра", 500, "ui"):
             self._refresh_registry_full()
@@ -3126,6 +3180,7 @@ class ContractApp:
         ).grid(row=0, column=0, sticky="ew", pady=(0, int(6 * self.scale)))
 
         row_index = 1
+        self._registry_rows: dict = {}
         if self._orphans:
             banner = ctk.CTkFrame(
                 self.registry_list, fg_color=ui.COLORS["sidebar_hover"], corner_radius=8,
@@ -3160,17 +3215,8 @@ class ContractApp:
             row_index += 1
 
         for rec in parties:
-            kind = "ИП" if rec.get("type") == "ip" else "Юр. лицо"
-            inn = str(rec.get("fields", {}).get(F.INN, "")).strip() or "—"
-            address = str(rec.get("fields", {}).get(F.LEGAL_ADDRESS, "")).strip()
-            if len(address) > 48:
-                address = address[:47].rstrip() + "…"
             selected = self._registry_selected_id == rec.get("id")
-            text = f"{storage.display_name(rec)}   ·   {kind}   ·   ИНН {inn}   ·   ID {rec.get('id')}"
-            if address:
-                text += f"   ·   {address}"
-            if selected:
-                text = "●  " + text
+            text = self._party_row_text(rec, selected)
             row = ctk.CTkFrame(self.registry_list, fg_color="transparent")
             row.grid(row=row_index, column=0, sticky="ew", pady=1)
             row.grid_columnconfigure(0, weight=1)
@@ -3195,8 +3241,10 @@ class ContractApp:
                 row, "Удалить", lambda r=rec: self._delete_counterparty(r),
                 width=int(92 * self.scale), height=int(26 * self.scale),
             ).grid(row=0, column=2, padx=(int(6 * self.scale), 0))
+            self._registry_rows[rec.get("id")] = {"rec": rec, "frame": row, "btn": btn}
             row_index += 1
 
+        self._registry_docs_row = row_index
         row_index = self._render_registry_documents(row_index)
         row_index = self._render_registry_unknown(row_index)
         self._render_registry_trash(row_index)

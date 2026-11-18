@@ -1,0 +1,32 @@
+# Окружение Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Результаты сборки
+build/
+dist/
+installer/*.exe
+
+# Локальные данные и секреты
+.env
+.env.*
+!.env.example
+dadata_key.txt
+database.json
+database.json.*
+settings.json
+
+# Диагностика
+*.log
+
+# Локальная конфигурация AI-инструментов
+.codeassistant/
+
+# Скриншоты — пока не проверены на реальные данные
+preview/
+
+# Результат локального прогона тестов
+smoke_out.txt

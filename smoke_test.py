@@ -1277,6 +1277,23 @@ try:
     check("Email" not in _contact_errors and "Телефон" not in _contact_errors,
           "4.5: email и телефон необязательны")
 
+    # 6.1/6.5: установщик — директивы, версия, вопрос деинсталлятора.
+    with open("installer.iss", "r", encoding="utf-8") as _iss_f:
+        _iss_src = _iss_f.read()
+    for _directive in ("AppMutex=Local\\EWDocHub_SingleInstance", "MinVersion=10.0",
+                       "ArchitecturesAllowed=x64compatible", "CloseApplications=yes",
+                       "PrivilegesRequiredOverridesAllowed=dialog",
+                       "LicenseFile=license.txt",
+                       "EW.DocHub-{#MyAppVersion}-setup"):
+        check(_directive in _iss_src, f"6.1: в установщике есть {_directive}")
+    check("DelTree" in _iss_src and "DogovorGenerator" in _iss_src,
+          "6.5: деинсталлятор спрашивает про данные и ключ DaData")
+    with open("EWDochub.spec", "r", encoding="utf-8") as _spec_f:
+        _spec_src = _spec_f.read()
+    check("VSVersionInfo" in _spec_src and "version=exe_version" in _spec_src,
+          "6.1: у exe есть VersionInfo в сборке")
+    check(os.path.exists("license.txt"), "6.1: файл лицензии и уведомлений существует")
+
     # Реестр.
     app._select_page("registry")
     app.root.update()

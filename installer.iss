@@ -7,7 +7,7 @@
 #define MyAppName "EW.DocHub"
 #define MyAppExeName "EW.DocHub.exe"
 ; Версия релиза: синхронизирована с APP_VERSION (main.py) и EWDochub.spec.
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "2.0.1"
 
 [Setup]
 AppId={{7B4E6F2A-91C4-4A3E-9B5D-2C8A1D6E4F10}

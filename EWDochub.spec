@@ -8,7 +8,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 # VersionInfo для exe — версия видна в свойствах файла (п. 6.1 плана).
 # Синхронизируется с APP_VERSION в main.py и MyAppVersion в installer.iss.
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 try:
     from PyInstaller.utils.win32.versioninfo import (
         VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,

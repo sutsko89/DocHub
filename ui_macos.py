@@ -1363,7 +1363,7 @@ class ComboField(ctk.CTkFrame):
 
 
 def segmented(master, values: Sequence[str], command=None, width: int = 230, height: int = 30,
-              font_size: int = 13) -> ctk.CTkSegmentedButton:
+              font_size: int = 13, variable: tk.Variable | None = None) -> ctk.CTkSegmentedButton:
     return ctk.CTkSegmentedButton(
         master,
         values=list(values),
@@ -1379,6 +1379,7 @@ def segmented(master, values: Sequence[str], command=None, width: int = 230, hei
         text_color=COLORS["text"],
         font=font(font_size),
         command=command,
+        variable=variable,
         dynamic_resizing=False,
     )
 

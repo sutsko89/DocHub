@@ -78,7 +78,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.0.1"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -4354,12 +4354,15 @@ class ContractApp:
         ).pack(anchor="w", pady=(int(2 * self.scale), 0))
 
         self._cp_type_var = tk.StringVar(value="Юр. лицо")
-        segmented = ui.segmented(
+        # variable обязателен: без привязки виджет не обновляет _cp_type_var,
+        # и «Заполнить по ИНН»/сохранение всегда считали тип «Юр. лицо» —
+        # поиск по ИНН у ИП не работал (читалось пустое поле юрлица).
+        self._cp_type_segmented = ui.segmented(
             header, ["Юр. лицо", "ИП"], command=self._on_cp_type_change,
-            width=int(240 * self.scale),
+            width=int(240 * self.scale), variable=self._cp_type_var,
         )
-        segmented.set("Юр. лицо")
-        segmented.pack(anchor="w", pady=(int(8 * self.scale), 0))
+        self._cp_type_segmented.set("Юр. лицо")
+        self._cp_type_segmented.pack(anchor="w", pady=(int(8 * self.scale), 0))
 
         ctk.CTkLabel(
             header, textvariable=self._cp_status_var, font=ui.font(12),

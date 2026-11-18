@@ -711,6 +711,88 @@ try:
     check(hasattr(app, "status_label"), "строка статуса в футере")
     check(app.save_button.cget("text") == "Сохранить договор", "кнопка футера: договор")
 
+    # Регрессия: переключатель «Юр. лицо / ИП» должен обновлять _cp_type_var.
+    # Раньше переменная не была привязана к сегменту (variable=), тип оставался
+    # «Юр. лицо»: «Заполнить по ИНН» у ИП читала пустое скрытое поле юрлица и
+    # требовала 10 цифр — поиск по ИНН для ИП не работал.
+    _seg = getattr(app, "_cp_type_segmented", None)
+    check(_seg is not None and app._cp_type_var.get() == "Юр. лицо",
+          "контрагент: сегмент типа найден, по умолчанию «Юр. лицо»")
+    if _seg is not None:
+        _ip_button = getattr(_seg, "_buttons_dict", {}).get("ИП")
+        if _ip_button is not None:
+            # Имитируем реальный клик по сегменту «ИП».
+            _ip_button.invoke()
+            app.root.update()
+            check(app._cp_type_var.get() == "ИП",
+                  "контрагент: клик по сегменту «ИП» обновляет тип карточки")
+
+            # «Заполнить по ИНН» в режиме ИП: подменяем DaData и проверяем
+            # подстановку карточки ЕГРИП в поля ИП.
+            #
+            # Поток подменяем синхронным исполнителем: в smoke-среде нет
+            # mainloop(), и root.after() из рабочего потока падает с
+            # RuntimeError — в работающем приложении поток реален.
+            _orig_key, _orig_fetch = m.dadata.get_api_key, m.dadata.fetch_party
+            _orig_thread = m.threading.Thread
+
+            class _SyncThread:
+                def __init__(self, target=None, args=(), daemon=None, **_kw):
+                    self._target, self._args = target, args
+
+                def start(self):
+                    self._target(*self._args)
+
+            m.dadata.get_api_key = lambda: "test-key"
+            m.threading.Thread = _SyncThread
+            _ip_card = {
+                "full_name": "ИП Петров Пётр Петрович",
+                "short_name": "ИП Петров",
+                "director": "Петров Пётр Петрович",
+                "legal_address": "г. Москва, ул. Тестовая, д. 1, оф. 2",
+                "inn": "312301234567", "kpp": "", "ogrn": "304500100000340",
+                "bank_name": "Тест-Банк", "bik": "044525000",
+                "correspondent_account": "30101810000000000225",
+            }
+            m.dadata.fetch_party = lambda inn, key: _ip_card
+            try:
+                _inn_widget = app._cp_entries["ip"][m.F.INN]
+                _inn_widget.delete(0, "end")
+                _inn_widget.insert(0, "312301234567")
+                ALERTS.clear()
+                app._cp_fill_from_inn()
+                for _ in range(60):
+                    app.root.update()
+                    time.sleep(0.02)
+                check(not any("ИНН должен содержать" in str(a) for a in ALERTS),
+                      "контрагент ИП: «Заполнить по ИНН» не требует 10 цифр")
+                check(app._cp_entries["ip"][m.F.IP_NAME].get().strip() == "Петров Пётр Петрович"
+                      and app._cp_entries["ip"][m.F.OGRNIP].get().strip() == "304500100000340"
+                      and app._cp_entries["ip"][m.F.LEGAL_ADDRESS].get().strip() != "",
+                      "контрагент ИП: реквизиты ЕГРИП подставлены в поля ИП")
+                check(app._cp_status_var.get() == "Реквизиты заполнены из ЕГРЮЛ/ЕГРИП",
+                      "контрагент ИП: статус подтверждает заполнение")
+            finally:
+                m.dadata.get_api_key, m.dadata.fetch_party = _orig_key, _orig_fetch
+                m.threading.Thread = _orig_thread
+                ALERTS.clear()
+                # Очищаем поля ИП и статус, чтобы форма осталась «чистой»
+                # для последующих проверок несохранённых данных.
+                for _key in (m.F.INN, m.F.IP_NAME, m.F.OGRNIP, m.F.LEGAL_ADDRESS,
+                             m.F.BANK, m.F.BIK, m.F.CORR_ACCOUNT):
+                    _widget = app._cp_entries["ip"].get(_key)
+                    if _widget is not None:
+                        _widget.delete(0, "end")
+                app._cp_status_var.set("")
+                app.root.update()
+
+            # Обратно на «Юр. лицо»: тип снова «Юр. лицо» (режим ooo как раньше).
+            _seg._buttons_dict["Юр. лицо"].invoke()
+            app.root.update()
+            check(app._cp_type_var.get() == "Юр. лицо",
+                  "контрагент: возврат на «Юр. лицо» обновляет тип")
+
+
     # Контрагент появляется в списке страницы договора.
     app._refresh_party_combo_values()
     app.root.update()

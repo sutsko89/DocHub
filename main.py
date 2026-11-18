@@ -784,32 +784,44 @@ def copy_with_zone_identifier(src: str, dest: str) -> None:
 
 # ---------- DOCX: замена плейсхолдеров (в т.ч. если разбиты на runs) ----------
 def replace_in_paragraph(paragraph, replacements: dict):
+    """Заменяет плейсхолдеры за один проход по параграфу (п. 5.6).
+
+    Тексты runs зеркалируются в обычные строки: поиск и замены идут по
+    обычному тексту, а в runs результат записывается один раз в конце.
+    Раньше после каждой одиночной замены текст параграфа полностью
+    пересобирался из runs (каждое обращение к run.text — обход lxml-дерева),
+    что давало O(n²) на больших шаблонах.
+    """
     runs = paragraph.runs
     if not runs:
         return
 
-    def rebuild_full_text():
-        return "".join(r.text for r in runs)
+    texts = [r.text or "" for r in runs]
+    full_text = "".join(texts)
+    changed: set[int] = set()
 
-    full_text = rebuild_full_text()
+    for raw_key, raw_value in replacements.items():
+        key = str(raw_key)
+        value = "" if raw_value is None else str(raw_value)
+        if not key:
+            continue
 
-    for key, value in replacements.items():
-        key = str(key)
-        value = "" if value is None else str(value)
-
-        while key and (key in full_text):
-            start = full_text.find(key)
+        search_from = 0
+        while True:
+            start = full_text.find(key, search_from)
+            if start < 0:
+                break
             end = start + len(key)
 
+            # Границы runs — то же правило, что раньше: run выбирается,
+            # если позиция попадает в его диапазон (пустые runs пропускаются).
             cur = 0
             start_run = None
             start_offset = 0
             end_run = None
             end_offset = 0
-
-            for i, r in enumerate(runs):
-                rt = r.text or ""
-                next_cur = cur + len(rt)
+            for i, text in enumerate(texts):
+                next_cur = cur + len(text)
                 if start_run is None and start < next_cur:
                     start_run = i
                     start_offset = start - cur
@@ -822,18 +834,25 @@ def replace_in_paragraph(paragraph, replacements: dict):
             if start_run is None or end_run is None:
                 break
 
-            start_text = runs[start_run].text or ""
-            end_text = runs[end_run].text or ""
+            prefix = texts[start_run][:start_offset]
+            suffix = texts[end_run][end_offset:]
 
-            prefix = start_text[:start_offset]
-            suffix = end_text[end_offset:]
+            texts[start_run] = prefix + value + suffix
+            if end_run != start_run:
+                for j in range(start_run + 1, end_run + 1):
+                    texts[j] = ""
+            changed.add(start_run)
+            if end_run != start_run:
+                changed.update(range(start_run + 1, end_run + 1))
 
-            runs[start_run].text = prefix + value + suffix
+            full_text = full_text[:start] + value + full_text[end:]
+            # Продолжаем поиск ПОСЛЕ вставленного значения: подстановка не
+            # обрабатывает собственный результат (защита от зацикливания,
+            # если в подстановке снова встречается этот же плейсхолдер).
+            search_from = start + len(value)
 
-            for j in range(start_run + 1, end_run + 1):
-                runs[j].text = ""
-
-            full_text = rebuild_full_text()
+    for index in sorted(changed):
+        runs[index].text = texts[index]
 
 
 def replace_in_doc(doc, replacements: dict):
@@ -4033,6 +4052,33 @@ class ContractApp:
         )
 
     def _regenerate_spec(self, *_args):
+        """Откладывает пересборку предпросмотра спецификации (п. 5.6).
+
+        Раньше предпросмотр пересобирался на каждый символ в любом из шести
+        полей и в каждой ячейке таблицы позиций. Теперь, как и у договора
+        и доп. соглашения, пересборка откладывается на 120 мс.
+        """
+        pending = getattr(self, "_spec_preview_after", None)
+        if pending:
+            try:
+                self.root.after_cancel(pending)
+            except Exception:
+                pass
+        self._spec_preview_after = self.root.after(120, self._render_spec_preview)
+
+    def _flush_spec_preview(self):
+        """Синхронно дособирает отложенный предпросмотр (перед чтением текста)."""
+        pending = getattr(self, "_spec_preview_after", None)
+        if pending:
+            try:
+                self.root.after_cancel(pending)
+            except Exception:
+                pass
+            self._spec_preview_after = None
+        self._render_spec_preview()
+
+    def _render_spec_preview(self):
+        self._spec_preview_after = None
         party = self._party_from_var(self.spec_party_var)
         if party is None:
             self._set_text(self.spec_text, "Выберите контрагента и договор-основание слева.")
@@ -4309,6 +4355,9 @@ class ContractApp:
                              f"У позиции «{item['name']}» должна быть цена больше нуля.", "error")
                     return
 
+            # Предпросмотр собирается с задержкой — перед сохранением
+            # дособираем его синхронно, чтобы текст записи был актуальным.
+            self._flush_spec_preview()
             text = self.spec_text.get("1.0", "end").strip()
             date_text = f"{self.spec_day_var.get().strip()} {self.spec_month_var.get().strip()}".strip()
             contract_number = contract.get("number") or ""

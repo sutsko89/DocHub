@@ -72,6 +72,37 @@ check(m.validate_party_fields({
     "ФИО директора": "Иванов И.И.",
 }, is_ip=False) == {}, "валидация контрагента: валидные данные")
 
+# ---------- 5.6: один проход замены плейсхолдеров ----------
+def _para(*runs_text):
+    from docx import Document as _Doc
+    document = _Doc()
+    paragraph = document.add_paragraph()
+    for chunk in runs_text:
+        paragraph.add_run(chunk)
+    return paragraph
+
+_p = _para("Привет, {{NAME}}!", " И {{NAME}} снова.")
+m.replace_in_paragraph(_p, {"{{NAME}}": "ООО Ромашка"})
+check(_p.runs[0].text == "Привет, ООО Ромашка!" and _p.runs[1].text == " И ООО Ромашка снова.",
+      "5.6: плейсхолдер в двух runs заменён, остальные тексты не тронуты")
+
+_p = _para("Поставщик: {{", "PARTY", "}} и {{PARTY}} в конце.")
+m.replace_in_paragraph(_p, {"{{PARTY}}": "ИП Иванов"})
+check(_p.text == "Поставщик: ИП Иванов и ИП Иванов в конце.",
+      "5.6: плейсхолдер, разорванный по runs, собирается и заменяется")
+
+_p = _para("{{A}}{{A}}{{A}}")
+m.replace_in_paragraph(_p, {"{{A}}": "X"})
+check(_p.text == "XXX", "5.6: три одинаковых плейсхолдера подряд")
+
+_p = _para("до {{A}} после")
+m.replace_in_paragraph(_p, {"{{A}}": "Y{{A}}Z"})
+check(_p.text == "до Y{{A}}Z после", "5.6: подстановка, содержащая сам плейсхолдер, не зацикливает замену")
+
+_p = _para("А{{X}}Б{{Y}}В")
+m.replace_in_paragraph(_p, {"{{X}}": "1", "{{Y}}": "2"})
+check(_p.text == "А1Б2В", "5.6: два разных плейсхолдера в одной строке")
+
 # ---------- DaData: ключ только через настройки (п. 1.3) ----------
 # Ключ мог остаться в песочнице от прошлого прогона — чистим для детерминизма.
 for _stale_key in (dadata.key_storage_path(), dadata.legacy_key_storage_path()):
@@ -749,11 +780,25 @@ try:
     row["unit"].set("шт.")
     row["price"].set("100")
     app.root.update()
+    # 5.6: предпросмотр спецификации отложен — дособираем его синхронно.
+    app._flush_spec_preview()
     spec_text = app.spec_text.get("1.0", "end")
     check("СПЕЦИФИКАЦИЯ № 1" in spec_text, "заголовок спецификации")
     check("1 000" in spec_text, "итог спецификации посчитан")
     check("одна тысяча" in spec_text.lower(), "итог прописью")
     check("шт." in spec_text, "ед. изм. видна в предпросмотре")
+
+    # 5.6: пересборка откладывается, а не идёт на каждый символ.
+    app._spec_preview_after = None
+    app.spec_delivery_term_var.set("45")
+    check(getattr(app, "_spec_preview_after", None) is not None,
+          "5.6: изменение поля планирует отложенную пересборку предпросмотра")
+    app._flush_spec_preview()
+    check("отсрочка" in app.spec_text.get("1.0", "end").lower()
+          or "45" in app.spec_text.get("1.0", "end"),
+          "5.6: flush дособирает предпросмотр актуальным текстом")
+    app.spec_delivery_term_var.set("")
+    app._flush_spec_preview()
     app.save_spec()
     check(sum(1 for d in app.store.documents if d["kind"] == storage.KIND_SPEC) == 1,
           "спецификация сохранена в реестре")
@@ -890,7 +935,7 @@ try:
     items = app._spec_items()
     check(len(items) == 2 and items[0]["name"] == "Болт М8" and items[1]["qty"] == 12,
           "таблица: строки из буфера попали в позиции")
-    app.root.update()
+    app._flush_spec_preview()
     check("1 600" in app.spec_text.get("1.0", "end"), "таблица: итог пересчитан после вставки")
     check(len(app._spec_rows) == 10, "таблица: стартовое количество строк — 10")
 

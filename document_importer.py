@@ -35,6 +35,8 @@ import os
 import re
 import zipfile
 
+import applog
+
 UNKNOWN_FOLDER = "unknown"
 
 KIND_CONTRACT = "contract"
@@ -743,7 +745,15 @@ def analyze_file(path: str) -> dict:
     папку документов. ``recognized`` — карточку контрагента можно создать
     автоматически (найден ИНН). Если ``ok`` и не ``recognized``, документ
     требует выбора контрагента пользователем (п. 3.3).
+
+    Длительные разборы (более 500 мс) попадают в журнал (п. 10 этапа 5).
     """
+    with applog.timed("Анализ файла импорта", 500, "import"):
+        return _analyze_file(path)
+
+
+def _analyze_file(path: str) -> dict:
+    """Реализация разбора (см. ``analyze_file``)."""
     result = {
         "path": path,
         "name": os.path.basename(path),

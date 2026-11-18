@@ -72,6 +72,25 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
+# ---------- Кэш шаблонов печатных форм (п. 5.5 этапа 5) ----------
+# Шаблон .docx разбирается один раз; на каждый рендер отдаётся deepcopy.
+# Раньше предпросмотр при каждом вводе заново читал и разбирал ZIP шаблона.
+# Кэш инвалидируется по mtime — правка шаблона подхватывается без перезапуска.
+_TEMPLATE_CACHE: dict = {}
+
+
+def load_template_cached(template_path: str):
+    """Возвращает копию разобранного шаблона .docx (кэш по пути + mtime)."""
+    try:
+        mtime = os.path.getmtime(template_path)
+    except OSError:
+        mtime = 0.0
+    cached = _TEMPLATE_CACHE.get(template_path)
+    if cached is None or cached[0] != mtime:
+        _TEMPLATE_CACHE[template_path] = (mtime, Document(template_path))
+    return copy.deepcopy(_TEMPLATE_CACHE[template_path][1])
+
+
 # ---------- Сохранение настроек между запусками ----------
 SETTINGS_DIR_NAME = "DogovorGenerator"
 MIN_WINDOW_WIDTH = 1120  # логические пиксели
@@ -3059,7 +3078,16 @@ class ContractApp:
         self.refresh_registry()
 
     def refresh_registry(self):
-        """Перерисовывает реестр: контрагенты + документы выбранного."""
+        """Перерисовывает реестр: контрагенты + документы выбранного.
+
+        Длительные перерисовки (более 500 мс на больших объёмах) попадают
+        в журнал (п. 10 этапа 5); клик по контрагенту перерисовывает только
+        секцию документов (_refresh_registry_selection, п. 5.1).
+        """
+        with applog.timed("Перерисовка реестра", 500, "ui"):
+            self._refresh_registry_full()
+
+    def _refresh_registry_full(self):
         for child in self.registry_list.winfo_children():
             try:
                 child.destroy()
@@ -3839,7 +3867,7 @@ class ContractApp:
     def _render_contract_docx(self, data: dict, is_ip: bool) -> "Document":
         """Договор из шаблона: печатная форма сохраняется без искажений."""
         template_path = resource_path("dogovor_template_ip.docx" if is_ip else "dogovor_template.docx")
-        doc = Document(template_path)
+        doc = load_template_cached(template_path)
         replace_in_doc(doc, build_replacements(data, is_ip))
         return doc
 
@@ -3847,7 +3875,7 @@ class ContractApp:
                                 limit_display: str, term: str) -> "Document":
         """Доп. соглашение из шаблона с подстановкой лимита и отсрочки."""
         template_path = resource_path("additional_agreement_ip.docx" if is_ip else "additional_agreement.docx")
-        doc = Document(template_path)
+        doc = load_template_cached(template_path)
         replacements = build_replacements(data, is_ip)
         replacements[PH.AGREEMENT_NUMBER] = number or "б/н"
         limit = digits_only(limit_display)
@@ -3874,7 +3902,7 @@ class ContractApp:
         template_path = resource_path(
             "spec_template_ip.docx" if is_ip else "spec_template.docx"
         )
-        doc = Document(template_path)
+        doc = load_template_cached(template_path)
         data = dict(rec.get("data") or {})
         extra = rec.get("extra") or {}
         replacements = build_replacements(data, is_ip)

@@ -679,6 +679,15 @@ try:
           "печатная форма договора: номер подставлен")
     check(len(doc.tables) == 1, "печатная форма договора: таблица реквизитов на месте")
 
+    # 5.5: шаблон разбирается один раз и кэшируется, рендер получает копию.
+    check(bool(m._TEMPLATE_CACHE), "5.5: шаблоны печатных форм кэшируются")
+    _cached = m._TEMPLATE_CACHE.get(m.resource_path("dogovor_template.docx"))
+    check(_cached is not None and _cached[0] > 0,
+          "5.5: в кэше шаблона хранятся mtime и разобранный Document")
+    _doc_again = app._render_contract_docx(data, is_ip=False)
+    check("{{" not in "\n".join(p.text for p in _doc_again.paragraphs),
+          "5.5: повторный рендер из кэша даёт чистый документ без {{...}}")
+
     app.save_contract()
     check(len(app.store.documents) == 1 and app.store.documents[0]["kind"] == storage.KIND_CONTRACT,
           "договор сохранён в реестре")

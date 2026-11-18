@@ -108,8 +108,9 @@ class DataStore:
         log = applog.get_logger("storage")
         path = db_path()
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
+            with applog.timed("Чтение реестра", 500, "storage"):
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
         except FileNotFoundError:
             log.info("Файл реестра не найден — создан пустой реестр")
             return  # первый запуск — пустой реестр
@@ -274,7 +275,11 @@ class DataStore:
                 self._remove_silent(candidate)
 
     def save(self) -> bool:
-        """Атомарно записывает реестр. Возвращает False и заполняет last_error при сбое."""
+        """Атомарно записывает реестр. Возвращает False и заполняет last_error при сбое.
+
+        Долгая запись (более 500 мс — обычно антивирус или медленный диск)
+        попадает в журнал (п. 10 этапа 5).
+        """
         log = applog.get_logger("storage")
         self.last_error = ""
         payload = {
@@ -294,31 +299,32 @@ class DataStore:
         directory = os.path.dirname(path)
         tmp = f"{path}.{os.getpid()}.tmp"
         last_exc: Exception | None = None
-        for attempt in range(1, SAVE_RETRIES + 1):
-            try:
-                os.makedirs(directory, exist_ok=True)
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    fh.write(text)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                self._rotate_backups(path)
-                os.replace(tmp, path)
-                self._cleanup_stale_tmp(path)
-                self.schema_version = SCHEMA_VERSION
-                log.info(
-                    "Реестр записан: контрагентов=%d, документов=%d",
-                    len(self.counterparties), len(self.documents),
-                )
-                return True
-            except OSError as exc:
-                last_exc = exc
-                self._remove_silent(tmp)
-                if attempt < SAVE_RETRIES:
-                    log.warning(
-                        "Запись реестра не удалась (попытка %d из %d): %s",
-                        attempt, SAVE_RETRIES, type(exc).__name__,
+        with applog.timed("Запись реестра", 500, "storage"):
+            for attempt in range(1, SAVE_RETRIES + 1):
+                try:
+                    os.makedirs(directory, exist_ok=True)
+                    with open(tmp, "w", encoding="utf-8") as fh:
+                        fh.write(text)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    self._rotate_backups(path)
+                    os.replace(tmp, path)
+                    self._cleanup_stale_tmp(path)
+                    self.schema_version = SCHEMA_VERSION
+                    log.info(
+                        "Реестр записан: контрагентов=%d, документов=%d",
+                        len(self.counterparties), len(self.documents),
                     )
-                    time.sleep(RETRY_DELAY_SECONDS * attempt)
+                    return True
+                except OSError as exc:
+                    last_exc = exc
+                    self._remove_silent(tmp)
+                    if attempt < SAVE_RETRIES:
+                        log.warning(
+                            "Запись реестра не удалась (попытка %d из %d): %s",
+                            attempt, SAVE_RETRIES, type(exc).__name__,
+                        )
+                        time.sleep(RETRY_DELAY_SECONDS * attempt)
 
         self.last_error = f"Не удалось записать файл реестра: {last_exc}"
         log.error("Реестр не записан после %d попыток: %s", SAVE_RETRIES, last_exc)

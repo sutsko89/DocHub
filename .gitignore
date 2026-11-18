@@ -30,3 +30,7 @@ preview/
 
 # Результат локального прогона тестов
 smoke_out.txt
+
+# Артефакты pytest-cov
+.coverage
+htmlcov/

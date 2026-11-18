@@ -472,16 +472,7 @@ except OSError:
     pass
 
 # ---------- Импорт готовых документов ----------
-for key, value in (
-    (di.K_INN, m.F.INN), (di.K_KPP, m.F.KPP), (di.K_OGRN, m.F.OGRN),
-    (di.K_OGRNIP, m.F.OGRNIP), (di.K_FULL_NAME, m.F.FULL_NAME),
-    (di.K_SHORT_NAME, m.F.SHORT_NAME), (di.K_DIRECTOR, m.F.DIRECTOR),
-    (di.K_IP_NAME, m.F.IP_NAME), (di.K_LEGAL_ADDRESS, m.F.LEGAL_ADDRESS),
-    (di.K_EMAIL, m.F.EMAIL), (di.K_PHONE, m.F.PHONE),
-    (di.K_ACCOUNT, m.F.ACCOUNT), (di.K_CORR_ACCOUNT, m.F.CORR_ACCOUNT),
-    (di.K_BANK, m.F.BANK), (di.K_BIK, m.F.BIK),
-):
-    check(key == value, f"импорт: ключ «{key}» совпадает с F")
+check(di.F is m.F, "импорт: единый источник имён полей (9.6 — F из document_builder)")
 
 check(di.detect_kind("СПЕЦИФИКАЦИЯ № 12 к Договору поставки") == storage.KIND_SPEC,
       "импорт: тип — спецификация")
@@ -533,11 +524,11 @@ _party_text = (
 )
 _party = di.extract_party(_party_text)
 check(_party is not None and _party["recognized"], "импорт: карточка с ИНН распознана")
-check(_party["fields"][di.K_ACCOUNT] == "40702810123456789012",
-      f"счёт: «Р/счет №» извлечён ({_party['fields'][di.K_ACCOUNT]!r})")
-check(_party["fields"][di.K_CORR_ACCOUNT] == "30101810100000000225",
+check(_party["fields"][m.F.ACCOUNT] == "40702810123456789012",
+      f"счёт: «Р/счет №» извлечён ({_party['fields'][m.F.ACCOUNT]!r})")
+check(_party["fields"][m.F.CORR_ACCOUNT] == "30101810100000000225",
       "счёт: корр. счёт извлечён")
-check(_party["fields"][di.K_ACCOUNT] != _party["fields"][di.K_CORR_ACCOUNT],
+check(_party["fields"][m.F.ACCOUNT] != _party["fields"][m.F.CORR_ACCOUNT],
       "счёт: корр. счёт не попал в расчётный")
 
 _account_variants = (
@@ -551,13 +542,13 @@ _account_variants = (
 )
 for _line, _label in _account_variants:
     _variant = di.extract_party(f"ООО «Тест», ИНН 7701234567\n{_line}")
-    check(_variant["fields"][di.K_ACCOUNT] == "40702810123456789012",
+    check(_variant["fields"][m.F.ACCOUNT] == "40702810123456789012",
           f"счёт: вариант «{_label}» извлечён")
 
 _cell_account = di.extract_party(
     "ООО «Тест», ИНН 7701234567\nБИК 044525225\n40702810999999999991"
 )
-check(_cell_account["fields"][di.K_ACCOUNT] == "40702810999999999991",
+check(_cell_account["fields"][m.F.ACCOUNT] == "40702810999999999991",
       "счёт: 20 цифр в отдельной ячейке без подписи")
 
 _named = di.extract_party(
@@ -905,14 +896,33 @@ try:
     app.store.counterparties.remove(_ip_party)
 
     # Порядок «файл → запись» (п. 1.6): сбой реестра откатывает и запись, и файл.
-    _rb_path = os.path.join(tempfile.gettempdir(), "smoke_rollback.docx")
-    with open(_rb_path, "wb") as _fh:
-        _fh.write(b"stub")
-    _rb_rec = {"id": 987654321, "kind": storage.KIND_CONTRACT, "party_id": party_rec["id"]}
-    app.store.documents.append(_rb_rec)
-    app._rollback_document(_rb_rec, _rb_path)
-    check(_rb_rec not in app.store.documents and not os.path.exists(_rb_path),
+    # Теперь проверяется настоящая транзакция сервисного слоя (п. 9.2),
+    # а не отдельный хелпер отката.
+    _rb_dir = tempfile.mkdtemp(prefix="smoke_rollback_")
+    _orig_save = app.store.save
+
+    def _rb_failing_save():  # имитация сбоя записи реестра на диске
+        app.store.last_error = "имитация: диск недоступен"
+        return False
+
+    app.store.save = _rb_failing_save
+    try:
+        _rb_result = m.services.save_document(app.store, {
+            "kind": storage.KIND_CONTRACT,
+            "party_id": party_rec["id"],
+            "number": "RB-1",
+            "date": "12 января",
+            "data": dict(party_rec.get("fields", {})),
+            "extra": {"day": "12", "month": "января", "is_ip": False},
+            "text": "",
+        }, _rb_dir)
+    finally:
+        app.store.save = _orig_save
+        app.store.last_error = None
+    check(not _rb_result["ok"] and _rb_result["record"] is None
+          and not os.listdir(_rb_dir),
           "файл→запись: при сбое реестра документ откатывается целиком")
+    shutil.rmtree(_rb_dir, ignore_errors=True)
 
     # Регистрация импорта: документ без ИНН привязывается к подтверждённому
     # контрагенту, а не создаёт новую карточку (п. 3.3).

@@ -36,6 +36,7 @@ import re
 import zipfile
 
 import applog
+from document_builder import F
 
 UNKNOWN_FOLDER = "unknown"
 
@@ -45,23 +46,23 @@ KIND_SPEC = "spec"
 KIND_UNKNOWN = "unknown"
 
 # Ключи полей контрагента — совпадают с F в main.py (проверяется smoke-тестом).
-K_NUMBER = "Номер договора"
-K_FULL_NAME = "Полное название компании (Покупь)"
-K_SHORT_NAME = "Сокращенное название компании"
-K_DIRECTOR = "ФИО директора"
-K_IP_NAME = "ФИО ИП"
-K_INN = "ИНН"
-K_KPP = "КПП"
-K_OGRN = "ОГРН"
-K_OGRNIP = "ОГРНИП"
-K_LEGAL_ADDRESS = "Юридический адрес"
-K_FACT_ADDRESS = "Фактический адрес"
-K_EMAIL = "Email"
-K_PHONE = "Телефон"
-K_ACCOUNT = "Расчётный счёт"
-K_CORR_ACCOUNT = "Корреспондентский счёт"
-K_BANK = "Название банка"
-K_BIK = "БИК"
+F.NUMBER = "Номер договора"
+F.FULL_NAME = "Полное название компании (Покупь)"
+F.SHORT_NAME = "Сокращенное название компании"
+F.DIRECTOR = "ФИО директора"
+F.IP_NAME = "ФИО ИП"
+F.INN = "ИНН"
+F.KPP = "КПП"
+F.OGRN = "ОГРН"
+F.OGRNIP = "ОГРНИП"
+F.LEGAL_ADDRESS = "Юридический адрес"
+F.FACT_ADDRESS = "Фактический адрес"
+F.EMAIL = "Email"
+F.PHONE = "Телефон"
+F.ACCOUNT = "Расчётный счёт"
+F.CORR_ACCOUNT = "Корреспондентский счёт"
+F.BANK = "Название банка"
+F.BIK = "БИК"
 
 # Сколько символов текста сохраняем в записи реестра (для просмотра).
 # Ограничение применяется до сохранения: полный текст большого документа
@@ -276,7 +277,9 @@ _OOO_SHORT_RE = re.compile(
 _NAME = r"[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2}"
 
 _IP_RE = re.compile(
-    r"(?:[Ии]ндивидуальный\s+[Пп]редприниматель|(?<![А-ЯЁа-яё])ИП\s+)" + rf"({_NAME})"
+    # после «Индивидуальный предприниматель» тоже нужен разделитель:
+    # без \s+ имя ИП после полного написания не извлекалось
+    r"(?:[Ии]ндивидуальный\s+[Пп]редприниматель\s+|(?<![А-ЯЁа-яё])ИП\s+)" + rf"({_NAME})"
 )
 _DIRECTOR_RE = re.compile(
     r"(?:[Гг]енеральн\w*\s+)?(?:[Дд]иректор\w*|[Уу]правляющий)\s+" + rf"({_NAME})"
@@ -674,11 +677,11 @@ def extract_party(text: str, prefer_last_block: bool = False) -> dict | None:
     # «полукопии» — пользователь подтверждает карточку вручную.
     if is_ip:
         fields = {
-            K_IP_NAME: ip_name, K_INN: inn, K_OGRNIP: ogrnip,
-            K_LEGAL_ADDRESS: address, K_FACT_ADDRESS: "",
-            K_EMAIL: email, K_PHONE: phone,
-            K_ACCOUNT: account, K_CORR_ACCOUNT: corr_account,
-            K_BANK: bank, K_BIK: bik,
+            F.IP_NAME: ip_name, F.INN: inn, F.OGRNIP: ogrnip,
+            F.LEGAL_ADDRESS: address, F.FACT_ADDRESS: "",
+            F.EMAIL: email, F.PHONE: phone,
+            F.ACCOUNT: account, F.CORR_ACCOUNT: corr_account,
+            F.BANK: bank, F.BIK: bik,
         }
         display = f"ИП {ip_name}".strip()
         recognized = bool(inn and ip_name)
@@ -687,12 +690,12 @@ def extract_party(text: str, prefer_last_block: bool = False) -> dict | None:
         if not full_name and short_name:
             full_name = short_name
         fields = {
-            K_FULL_NAME: full_name, K_SHORT_NAME: short_name, K_DIRECTOR: director,
-            K_INN: inn, K_KPP: kpp, K_OGRN: ogrn,
-            K_LEGAL_ADDRESS: address, K_FACT_ADDRESS: "",
-            K_EMAIL: email, K_PHONE: phone,
-            K_ACCOUNT: account, K_CORR_ACCOUNT: corr_account,
-            K_BANK: bank, K_BIK: bik,
+            F.FULL_NAME: full_name, F.SHORT_NAME: short_name, F.DIRECTOR: director,
+            F.INN: inn, F.KPP: kpp, F.OGRN: ogrn,
+            F.LEGAL_ADDRESS: address, F.FACT_ADDRESS: "",
+            F.EMAIL: email, F.PHONE: phone,
+            F.ACCOUNT: account, F.CORR_ACCOUNT: corr_account,
+            F.BANK: bank, F.BIK: bik,
         }
         display = short_name or full_name or ""
         recognized = bool(inn and (short_name or full_name or kpp or ogrn))

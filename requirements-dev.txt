@@ -1,0 +1,9 @@
+# Инструменты разработки и тестов. Установка:
+#   python -m pip install -r requirements.txt -r requirements-dev.txt
+# Тесты идут без интерфейса: python -m pytest tests/
+# Полный smoke с интерфейсом — под Xvfb (Linux) или на Windows:
+#   xvfb-run -a python smoke_test.py
+
+-r requirements.txt
+pytest>=8.0.0             # тестовый набор tests/
+pytest-cov>=5.0.0         # покрытие: storage/importer/services/document_builder

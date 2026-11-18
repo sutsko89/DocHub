@@ -44,11 +44,43 @@ import single_instance
 import storage
 import ui_macos as ui
 
-APP_VERSION = "1.5"
+# Печатные формы вынесены в document_builder (п. 9.1 плана); имена
+# реэкспортируются, чтобы main.py, smoke_test.py и тесты работали как раньше.
+from document_builder import (
+    F, PH, SPEC_APPENDIX_NUMBER, SPEC_VAT_RATE, MONTHS_GENITIVE,
+    spec_vat_amount, spec_vat_amount_from_items, digits_only,
+    format_director_name, format_name_ip2, format_date, parse_decimal,
+    format_amount, format_quantity, format_phone, format_number_grouped,
+    number_to_words_ru, amount_to_words_ru, amount_in_words_ru,
+    prices_valid_until_default, replace_in_paragraph, replace_in_doc,
+    spec_items_table, fill_spec_items, mark_spec_final_page,
+    docx_to_text, docx_from_text, build_replacements,
+)
+
+
+# Сервисный слой (п. 9.2): валидация, кэш шаблонов, запись документов и
+# транзакция сохранения переехали в services.py; имена реэкспортируются,
+# чтобы main.py и smoke_test.py работали как раньше.
+import services
+from services import (
+    MAX_PATH_LENGTH, MAX_FILENAME_LENGTH, resource_path, _TEMPLATE_CACHE,
+    load_template_cached, validate_ogrn, validate_ogrnip, validate_inn,
+    validate_kpp, validate_email, validate_phone, validate_account,
+    validate_correspondent_account, validate_bik, _PHONE_ALLOWED_RE,
+    REQUIRED_COMMON, REQUIRED_OOO, REQUIRED_IP, REQUIRED_PARTY_COMMON,
+    validate_contract_fields, validate_party_fields, validate_all_fields,
+    save_docx_atomic, _RESERVED_FILENAMES, _FORBIDDEN_FILENAME_CHARS,
+    safe_filename, copy_with_zone_identifier,
+)
+
+
+# Составные виджеты вынесены в widgets.py (п. 9.4).
+from widgets import SpecTable
+
+
+APP_VERSION = "2.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
-MAX_PATH_LENGTH = 240
-MAX_FILENAME_LENGTH = 80
 
 # Масштабирование берём на себя: иначе customtkinter масштабирует повторно.
 ScalingTracker.deactivate_automatic_dpi_awareness = True
@@ -63,32 +95,10 @@ if sys.platform == "win32":
             pass
 
 
-def resource_path(relative_path):
-    """ Получает абсолютный путь к ресурсу, работает для разработки и для PyInstaller """
-    try:
-        base_path = sys._MEIPASS  # type: ignore[attr-defined]
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
-
-
 # ---------- Кэш шаблонов печатных форм (п. 5.5 этапа 5) ----------
 # Шаблон .docx разбирается один раз; на каждый рендер отдаётся deepcopy.
 # Раньше предпросмотр при каждом вводе заново читал и разбирал ZIP шаблона.
 # Кэш инвалидируется по mtime — правка шаблона подхватывается без перезапуска.
-_TEMPLATE_CACHE: dict = {}
-
-
-def load_template_cached(template_path: str):
-    """Возвращает копию разобранного шаблона .docx (кэш по пути + mtime)."""
-    try:
-        mtime = os.path.getmtime(template_path)
-    except OSError:
-        mtime = 0.0
-    cached = _TEMPLATE_CACHE.get(template_path)
-    if cached is None or cached[0] != mtime:
-        _TEMPLATE_CACHE[template_path] = (mtime, Document(template_path))
-    return copy.deepcopy(_TEMPLATE_CACHE[template_path][1])
 
 
 # ---------- Сохранение настроек между запусками ----------
@@ -172,180 +182,55 @@ def write_settings(settings: dict) -> bool:
         return False
 
 
+# ---------- Настройки печатной формы спецификации (п. 9.7) ----------
+# Магические значения печатной формы спецификации вынесены в settings.json:
+# поставщик, подписант, город, год, ставка НДС и номер приложения меняются
+# без правки кода. Отсутствующие или битые значения заменяются дефолтами.
+DEFAULT_SPEC_SETTINGS = {
+    "spec_supplier": "ООО «Эдельвейс»",
+    "spec_supplier_signatory": "А.Н. Верещагин",
+    "spec_city": "Хабаровск",
+    "spec_vat_rate": SPEC_VAT_RATE,
+    "spec_appendix_number": SPEC_APPENDIX_NUMBER,
+    "spec_year": datetime.now().year,
+}
+
+
+def get_spec_settings() -> dict:
+    """Печатная форма спецификации: дефолты, перекрытые settings.json."""
+    saved = load_settings()
+    out = dict(DEFAULT_SPEC_SETTINGS)
+    for key in out:
+        value = saved.get(key)
+        if value is None:
+            continue
+        if key == "spec_vat_rate":
+            try:
+                out[key] = max(0, min(int(value), 100))
+            except (TypeError, ValueError):
+                pass
+        elif key == "spec_year":
+            try:
+                out[key] = int(value)
+            except (TypeError, ValueError):
+                pass
+        else:
+            out[key] = str(value)
+    return out
+
+
 # ---------- Функции валидации ----------
-def validate_ogrn(ogrn):
-    """Проверка ОГРН: только цифры, 13 символов"""
-    if not ogrn:
-        return False
-    return ogrn.isdigit() and len(ogrn) == 13
-
-
-def validate_ogrnip(ogrnip):
-    """Проверка ОГРНИП: только цифры, 15 символов"""
-    if not ogrnip:
-        return False
-    return ogrnip.isdigit() and len(ogrnip) == 15
-
-
-def validate_inn(inn, is_ip=False):
-    """Проверка ИНН: для ООО - 10 цифр, для ИП - 12 цифр"""
-    if not inn:
-        return False
-    if is_ip:
-        return inn.isdigit() and len(inn) == 12
-    return inn.isdigit() and len(inn) == 10
-
-
-def validate_kpp(kpp):
-    """Проверка КПП: только цифры, 9 символов"""
-    if not kpp:
-        return False
-    return kpp.isdigit() and len(kpp) == 9
-
-
-def validate_email(email):
-    """Проверка email по регулярному выражению"""
-    if not email:
-        return False
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return re.match(pattern, email) is not None
 
 
 # Регулярка одна на оба места: проверку сохранённых данных и фильтр ввода на лету.
-_PHONE_ALLOWED_RE = re.compile(r"^[\d\+\-\(\)\s\/\.]*$")
-
-
-def validate_phone(phone):
-    """Проверка телефона: только цифры и знаки + - ( ) / . и пробелы."""
-    return bool(phone) and _PHONE_ALLOWED_RE.match(phone) is not None
-
-
-def digits_only(text: str) -> str:
-    """Оставляет только цифры — для вставки «замусоренного» номера из буфера."""
-    return "".join(ch for ch in str(text) if ch.isdigit())
-
-
-def validate_account(account):
-    """Проверка расчетного счета: 20 цифр"""
-    if not account:
-        return False
-    return account.isdigit() and len(account) == 20
-
-
-def validate_correspondent_account(account):
-    """Проверка корреспондентского счета: 20 цифр"""
-    if not account:
-        return False
-    return account.isdigit() and len(account) == 20
-
-
-def validate_bik(bik):
-    """Проверка БИК: 9 цифр"""
-    if not bik:
-        return False
-    return bik.isdigit() and len(bik) == 9
 
 
 # ---------- Ключи полей и плейсхолдеров (единый источник имён) ----------
-class F:
-    """Ключи полей ввода. Имя поля меняется здесь — и больше нигде в коде."""
-
-    NUMBER = "Номер договора"
-    DAY = "Дата (число)"
-    MONTH = "Месяц (словом)"
-    FULL_NAME = "Полное название компании (Покупь)"
-    SHORT_NAME = "Сокращенное название компании"
-    DIRECTOR = "ФИО директора"
-    BASIS = "Основание действий"
-    IP_NAME = "ФИО ИП"
-    INN = "ИНН"
-    KPP = "КПП"
-    OGRN = "ОГРН"
-    OGRNIP = "ОГРНИП"
-    LEGAL_ADDRESS = "Юридический адрес"
-    FACT_ADDRESS = "Фактический адрес"
-    EMAIL = "Email"
-    PHONE = "Телефон"
-    ACCOUNT = "Расчётный счёт"
-    CORR_ACCOUNT = "Корреспондентский счёт"
-    BANK = "Название банка"
-    BIK = "БИК"
-    LIMIT = "Лимит"
-    TERM = "Отсрочка платежа"
-    DELIVERY_TERM = "Срок поставки"
-    PAYMENT_TERMS = "Условия оплаты"
-    DELIVERY_BASIS = "Базис поставки"
-
-
-class PH:
-    """Плейсхолдеры в шаблонах .docx: код и шаблоны всегда синхронны."""
-
-    NUMBER = "{{number}}"
-    DATE = "{{date}}"
-    MONTH = "{{month}}"                   # раньше в шаблонах был опечаткой {{mouth}}
-    IP_NAME = "{{name_IP}}"
-    IP_NAME2 = "{{name_IP2}}"
-    IP_NAME3 = "{{name_IP3}}"
-    OGRNIP = "{{OGRNIP}}"
-    INN = "{{INN}}"
-    LEGAL_ADDRESS = "{{legal_address}}"   # раньше {{Urid_adress}}
-    FACT_ADDRESS = "{{fact_address}}"     # раньше {{fact_adress}}
-    EMAIL = "{{E-mail}}"
-    PHONE = "{{Telephone}}"
-    ACCOUNT = "{{r/schet}}"
-    BANK = "{{bank}}"
-    CORR_ACCOUNT = "{{k/schet}}"
-    BIK = "{{BIK}}"
-    FULL_NAME = "{{long_name_company}}"
-    SHORT_NAME = "{{short_name_company}}"
-    DIRECTOR = "{{direct_name}}"
-    DIRECTOR_INITIALS = "{{direct_name2}}"
-    BASIS = "{{ustava}}"
-    OGRN = "{{OGRN}}"
-    KPP = "{{KPP}}"
-    LIMIT = "{{limit}}"
-    LIMIT_WORDS = "{{limit_in_words}}"
-    TERM = "{{term}}"
-    TERM_WORDS = "{{term_in_words}}"
-    AGREEMENT_NUMBER = "{{agreement_number}}"
-
-    # --- Спецификация (spec_template.docx) -------------------------------- #
-    APPENDIX_NUMBER = "{{appendix_number}}"
-    SPEC_NUMBER = "{{spec_number}}"
-    SPEC_DAY = "{{spec_day}}"
-    SPEC_MONTH = "{{spec_month}}"
-    PRICES_VALID_UNTIL = "{{prices_valid_until}}"
-    ITEM_NO = "{{item_no}}"
-    ITEM_NAME = "{{item_name}}"
-    ITEM_QTY = "{{item_qty}}"
-    ITEM_UNIT = "{{item_unit}}"
-    ITEM_PRICE = "{{item_price}}"
-    ITEM_SUM = "{{item_sum}}"
-    ITEM_NOTE = "{{item_note}}"
-    TOTAL = "{{total}}"
-    TOTAL_IN_WORDS = "{{total_in_words}}"
-    VAT = "{{vat}}"
-    VAT_RATE = "{{vat_rate}}"
-    DELIVERY_TERM = "{{delivery_term}}"
-    PAYMENT_TERMS = "{{payment_terms}}"
-    DELIVERY_BASIS = "{{delivery_basis}}"
 
 
 # Email и телефон — контактные, а не юридически обязательные поля (п. 4.5).
-REQUIRED_COMMON = (
-    F.NUMBER, F.DAY, F.MONTH, F.INN,
-    F.LEGAL_ADDRESS,
-    F.ACCOUNT, F.CORR_ACCOUNT, F.BANK, F.BIK,
-)
-REQUIRED_OOO = (
-    F.FULL_NAME, F.SHORT_NAME,
-    F.DIRECTOR, F.KPP, F.OGRN,
-)
-REQUIRED_IP = (F.IP_NAME, F.OGRNIP)
 
 # Константы печатной формы спецификации (spec_template.docx).
-SPEC_APPENDIX_NUMBER = "1"   # номер приложения к договору, как в образце
-SPEC_VAT_RATE = 22           # ставка НДС «в том числе», %
 
 # Импорт принимает только документы, которые программа умеет разбирать.
 # Всё остальное (в т. ч. .exe/.bat/.lnk) не копируется и не открывается.
@@ -359,222 +244,17 @@ IMPORT_MAX_TOTAL_SIZE = importer.MAX_TOTAL_SIZE
 IMPORT_MIN_FREE_SPACE = importer.MIN_FREE_SPACE
 
 
-def spec_vat_amount(total, rate: int = SPEC_VAT_RATE) -> Decimal:
-    """Сумма НДС «в том числе» из общей суммы: total * rate / (100 + rate)."""
-    total_dec = total if isinstance(total, Decimal) else parse_decimal(total)
-    return (total_dec * rate / (100 + rate)).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
-
-
-def spec_vat_amount_from_items(items, rate: int = SPEC_VAT_RATE) -> Decimal:
-    """Сумма НДС «в том числе» так же, как в 1С: НДС считается по каждой
-    позиции (сумма позиции * rate / (100 + rate), округление до копеек),
-    после чего НДС по позициям складывается в итог."""
-    vat = Decimal("0")
-    for item in items or []:
-        qty = item.get("qty") if isinstance(item.get("qty"), Decimal) else parse_decimal(item.get("qty"))
-        price = item.get("price") if isinstance(item.get("price"), Decimal) else parse_decimal(item.get("price"))
-        line_total = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        vat += (line_total * rate / (100 + rate)).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
-    return vat
-
 # Поля карточки контрагента (без реквизитов договора).
 # Email и телефон необязательны: без них карточку можно сохранить (п. 4.5).
-REQUIRED_PARTY_COMMON = (
-    F.INN, F.LEGAL_ADDRESS,
-    F.ACCOUNT, F.CORR_ACCOUNT, F.BANK, F.BIK,
-)
-
-
-def validate_contract_fields(data: dict, is_ip: bool = False) -> dict:
-    """Возвращает словарь «поле -> текст ошибки» для inline-подсветки в интерфейсе."""
-    errors: dict[str, str] = {}
-
-    for key in REQUIRED_COMMON + (REQUIRED_IP if is_ip else REQUIRED_OOO):
-        if not str(data.get(key, "")).strip():
-            errors[key] = "Заполните поле"
-
-    ogrn_key = F.OGRNIP if is_ip else F.OGRN
-    ogrn = str(data.get(ogrn_key, "")).strip()
-    if ogrn and not (validate_ogrnip(ogrn) if is_ip else validate_ogrn(ogrn)):
-        errors.setdefault(ogrn_key, f"{ogrn_key} должен содержать {15 if is_ip else 13} цифр")
-
-    inn = str(data.get(F.INN, "")).strip()
-    expected = 12 if is_ip else 10
-    if inn and not validate_inn(inn, is_ip=is_ip):
-        errors.setdefault(F.INN, f"ИНН должен содержать {expected} цифр")
-
-    if not is_ip:
-        kpp = str(data.get(F.KPP, "")).strip()
-        if kpp and not validate_kpp(kpp):
-            errors.setdefault(F.KPP, "КПП должен содержать 9 цифр")
-
-    email = str(data.get(F.EMAIL, "")).strip()
-    if email and not validate_email(email):
-        errors.setdefault(F.EMAIL, "Email имеет неверный формат")
-
-    phone = str(data.get(F.PHONE, "")).strip()
-    if phone and not validate_phone(phone):
-        errors.setdefault(F.PHONE, "Телефон может содержать только цифры и знаки: + - ( ) / . и пробелы")
-
-    for key, checker, message in (
-        (F.ACCOUNT, validate_account, "Расчётный счёт должен содержать 20 цифр"),
-        (F.CORR_ACCOUNT, validate_correspondent_account, "Корреспондентский счёт должен содержать 20 цифр"),
-        (F.BIK, validate_bik, "БИК должен содержать 9 цифр"),
-    ):
-        value = str(data.get(key, "")).strip()
-        if value and not checker(value):
-            errors.setdefault(key, message)
-
-    return errors
-
-
-def validate_party_fields(data: dict, is_ip: bool = False) -> dict:
-    """Проверка карточки контрагента (без номера и даты договора)."""
-    errors: dict[str, str] = {}
-
-    for key in REQUIRED_PARTY_COMMON + (REQUIRED_IP if is_ip else REQUIRED_OOO):
-        if not str(data.get(key, "")).strip():
-            errors[key] = "Заполните поле"
-
-    ogrn_key = F.OGRNIP if is_ip else F.OGRN
-    ogrn = str(data.get(ogrn_key, "")).strip()
-    if ogrn and not (validate_ogrnip(ogrn) if is_ip else validate_ogrn(ogrn)):
-        errors.setdefault(ogrn_key, f"{ogrn_key} должен содержать {15 if is_ip else 13} цифр")
-
-    inn = str(data.get(F.INN, "")).strip()
-    expected = 12 if is_ip else 10
-    if inn and not validate_inn(inn, is_ip=is_ip):
-        errors.setdefault(F.INN, f"ИНН должен содержать {expected} цифр")
-
-    if not is_ip:
-        kpp = str(data.get(F.KPP, "")).strip()
-        if kpp and not validate_kpp(kpp):
-            errors.setdefault(F.KPP, "КПП должен содержать 9 цифр")
-
-    email = str(data.get(F.EMAIL, "")).strip()
-    if email and not validate_email(email):
-        errors.setdefault(F.EMAIL, "Email имеет неверный формат")
-
-    phone = str(data.get(F.PHONE, "")).strip()
-    if phone and not validate_phone(phone):
-        errors.setdefault(F.PHONE, "Телефон может содержать только цифры и знаки: + - ( ) / . и пробелы")
-
-    for key, checker, message in (
-        (F.ACCOUNT, validate_account, "Расчётный счёт должен содержать 20 цифр"),
-        (F.CORR_ACCOUNT, validate_correspondent_account, "Корреспондентский счёт должен содержать 20 цифр"),
-        (F.BIK, validate_bik, "БИК должен содержать 9 цифр"),
-    ):
-        value = str(data.get(key, "")).strip()
-        if value and not checker(value):
-            errors.setdefault(key, message)
-
-    return errors
-
-
-def validate_all_fields(data, is_ip=False):
-    """Совместимость со старыми вызовами: список текстов ошибок по всем полям."""
-    return list(validate_contract_fields(data, is_ip).values())
 
 
 # ---------- Функции преобразования ФИО ----------
-def format_director_name(full_name):
-    """Преобразует ФИО из формата 'Фамилия Имя Отчество' в формат 'И.О. Фамилия'"""
-    parts = full_name.strip().split()
-    if len(parts) < 2:
-        return full_name
-    surname = parts[0]
-    initials = ""
-    for i in range(1, min(3, len(parts))):
-        if parts[i]:
-            initials += parts[i][0] + "."
-    return f"{initials} {surname}"
-
-
-def format_name_ip2(full_name):
-    """Преобразует ФИО из формата 'Фамилия Имя Отчество' в формат 'Фамилия И.О.'"""
-    parts = full_name.strip().split()
-    if len(parts) < 2:
-        return full_name
-    surname = parts[0]
-    initials = ""
-    for i in range(1, min(3, len(parts))):
-        if parts[i]:
-            initials += parts[i][0] + "."
-    return f"{surname} {initials}"
 
 
 # ---------- Функция форматирования даты ----------
-def format_date(day):
-    """Форматирует число дня: добавляет ведущий ноль для чисел меньше 10"""
-    day_str = str(day).strip()
-    if day_str.isdigit():
-        day_num = int(day_str)
-        return f"{day_num:02d}"
-    return day_str
 
 
 # ---------- Месяцы и маски ввода ----------
-MONTHS_GENITIVE = [
-    "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
-]
-
-
-def parse_decimal(value) -> Decimal:
-    """Разбирает число: цифры, пробелы, запятая или точка. Ошибка — 0."""
-    cleaned = str(value or "").replace("\xa0", "").replace(" ", "").replace(",", ".")
-    if not cleaned:
-        return Decimal("0")
-    try:
-        return Decimal(cleaned)
-    except InvalidOperation:
-        return Decimal("0")
-
-
-def format_amount(value) -> str:
-    """Денежная сумма: разряды по три, копейки только если есть (2052,59)."""
-    dec = (value if isinstance(value, Decimal) else parse_decimal(value))
-    dec = dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    whole = int(dec)
-    frac = int((dec - whole) * 100)
-    if frac == 0:
-        return format_number_grouped(str(whole))
-    return f"{format_number_grouped(str(whole))},{frac:02d}"
-
-
-def format_quantity(value) -> str:
-    """Количество: целое — без дробной части, дробное — с запятой (2,5)."""
-    dec = value if isinstance(value, Decimal) else parse_decimal(value)
-    if dec == dec.to_integral_value():
-        return format_number_grouped(str(int(dec)))
-    text = f"{dec.quantize(Decimal('0.001'), rounding=ROUND_HALF_UP):f}"
-    text = text.rstrip("0").rstrip(".")
-    return text.replace(".", ",")
-
-
-def format_phone(digits: str) -> str:
-    """Собирает маску +7 (999) 123-45-67 из цифр (без «7» — добавит сам)."""
-    digits = digits[:11]
-    if not digits:
-        return ""
-    if digits.startswith("8") and len(digits) == 11:
-        digits = "7" + digits[1:]
-    if not digits.startswith("7"):
-        digits = ("7" + digits)[:11]
-    out = "+7"
-    if len(digits) > 1:
-        out += " (" + digits[1:4]
-    if len(digits) >= 5:
-        out += ") " + digits[4:7]
-    if len(digits) >= 8:
-        out += "-" + digits[7:9]
-    if len(digits) >= 10:
-        out += "-" + digits[9:11]
-    return out
 
 
 def restore_caret_after_reformat(entry, caret, old_len, new_len):
@@ -625,116 +305,7 @@ def make_phone_formatter(var: "tk.StringVar", entry=None):
     return _format
 
 
-def format_number_grouped(value: str) -> str:
-    """Группирует цифры по три разряда: 1500000 -> 1 500 000."""
-    digits = digits_only(value)
-    if not digits:
-        return ""
-    groups = []
-    while len(digits) > 3:
-        groups.insert(0, digits[-3:])
-        digits = digits[:-3]
-    groups.insert(0, digits)
-    return " ".join(groups)
-
-
 # ---------- Числа прописью (RU) ----------
-_UNITS = ["", "один", "два", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять"]
-_UNITS_FEM = ["", "одна", "две", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять"]
-_TEENS = [
-    "десять", "одиннадцать", "двенадцать", "тринадцать",
-    "четырнадцать", "пятнадцать", "шестнадцать", "семнадцать",
-    "восемнадцать", "девятнадцать",
-]
-_TENS = ["", "", "двадцать", "тридцать", "сорок", "пятьдесят",
-         "шестьдесят", "семьдесят", "восемьдесят", "девяносто"]
-_HUNDREDS = ["", "сто", "двести", "триста", "четыреста",
-             "пятьсот", "шестьсот", "семьсот", "восемьсот", "девятьсот"]
-
-
-def _below_thousand(n: int, feminine: bool = False) -> str:
-    units = _UNITS_FEM if feminine else _UNITS
-    parts = []
-    hundreds, rest = divmod(n, 100)
-    if hundreds:
-        parts.append(_HUNDREDS[hundreds])
-    if 10 <= rest < 20:
-        parts.append(_TEENS[rest - 10])
-    else:
-        tens, unit = divmod(rest, 10)
-        if tens:
-            parts.append(_TENS[tens])
-        if unit:
-            parts.append(units[unit])
-    return " ".join(parts)
-
-
-def _plural(n: int, forms: tuple) -> str:
-    n %= 100
-    if 11 <= n <= 14:
-        return forms[2]
-    n %= 10
-    if n == 1:
-        return forms[0]
-    if 2 <= n <= 4:
-        return forms[1]
-    return forms[2]
-
-
-_SCALES = (
-    (("тысяча", "тысячи", "тысяч"), True),
-    (("миллион", "миллиона", "миллионов"), False),
-    (("миллиард", "миллиарда", "миллиардов"), False),
-    (("триллион", "триллиона", "триллионов"), False),
-)
-
-
-def number_to_words_ru(n: int) -> str:
-    """Число прописью (до триллионов включительно)."""
-    if n < 0:
-        return "минус " + number_to_words_ru(-n)
-    if n == 0:
-        return "ноль"
-
-    groups = []
-    while n:
-        groups.append(n % 1000)
-        n //= 1000
-
-    parts = []
-    for index in range(len(groups) - 1, -1, -1):
-        value = groups[index]
-        if value == 0:
-            continue
-        if index == 0:
-            parts.append(_below_thousand(value))
-        else:
-            forms, feminine = _SCALES[index - 1]
-            parts.append(_below_thousand(value, feminine=feminine))
-            parts.append(_plural(value, forms))
-    return " ".join(parts)
-
-
-def amount_to_words_ru(n: int) -> str:
-    """Сумма прописью: «пятьсот тысяч рублей»."""
-    return f"{number_to_words_ru(n)} {_plural(n, ('рубль', 'рубля', 'рублей'))}"
-
-
-def amount_in_words_ru(value) -> str:
-    """Сумма прописью с копейками: «Одиннадцать тысяч шестьсот пятьдесят
-    семь рублей 95 копеек» (как в образце спецификации)."""
-    dec = value if isinstance(value, Decimal) else parse_decimal(value)
-    dec = dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    whole = int(dec)
-    kopecks = int(round(float(dec - whole) * 100))
-    rubles = (
-        f"{number_to_words_ru(whole).capitalize()} "
-        f"{_plural(whole, ('рубль', 'рубля', 'рублей'))}"
-    )
-    return (
-        f"{rubles} {kopecks:02d} "
-        f"{_plural(kopecks, ('копейка', 'копейки', 'копеек'))}"
-    )
 
 
 # ---------- Открытие файла в зависимости от ОС ----------
@@ -796,289 +367,7 @@ def show_in_folder(file_path: str) -> None:
         ui.alert(ROOT_HOLDER.get(), "Не удалось открыть папку", str(exc), "error")
 
 
-def save_docx_atomic(doc, path: str) -> None:
-    """Пишет .docx во временный файл, проверяет ZIP и только затем заменяет итоговый.
-
-    Так аварийное завершение не оставляет обрезанный файл под «нормальным»
-    именем — при сбое остаётся только *.docx.tmp, который удаляется.
-    """
-    tmp = path + ".tmp"
-    try:
-        doc.save(tmp)
-        with zipfile.ZipFile(tmp) as archive:
-            if archive.testzip() is not None:
-                raise OSError("файл документа повреждён при записи")
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def copy_with_zone_identifier(src: str, dest: str) -> None:
-    """Копирует файл, сохраняя метку «скачано из интернета» (Mark-of-the-Web).
-
-    shutil.copy2 не переносит альтернативные потоки NTFS, поэтому
-    импортированный документ открывался без Protected View.
-    """
-    shutil.copy2(src, dest)
-    if sys.platform != "win32":
-        return
-    zone_stream = ":Zone.Identifier"
-    try:
-        with open(src + zone_stream, "rb") as fh:
-            zone = fh.read()
-    except OSError:
-        return
-    try:
-        with open(dest + zone_stream, "wb") as fh:
-            fh.write(zone)
-    except OSError:
-        pass
-
-
 # ---------- DOCX: замена плейсхолдеров (в т.ч. если разбиты на runs) ----------
-def replace_in_paragraph(paragraph, replacements: dict):
-    """Заменяет плейсхолдеры за один проход по параграфу (п. 5.6).
-
-    Тексты runs зеркалируются в обычные строки: поиск и замены идут по
-    обычному тексту, а в runs результат записывается один раз в конце.
-    Раньше после каждой одиночной замены текст параграфа полностью
-    пересобирался из runs (каждое обращение к run.text — обход lxml-дерева),
-    что давало O(n²) на больших шаблонах.
-    """
-    runs = paragraph.runs
-    if not runs:
-        return
-
-    texts = [r.text or "" for r in runs]
-    full_text = "".join(texts)
-    changed: set[int] = set()
-
-    for raw_key, raw_value in replacements.items():
-        key = str(raw_key)
-        value = "" if raw_value is None else str(raw_value)
-        if not key:
-            continue
-
-        search_from = 0
-        while True:
-            start = full_text.find(key, search_from)
-            if start < 0:
-                break
-            end = start + len(key)
-
-            # Границы runs — то же правило, что раньше: run выбирается,
-            # если позиция попадает в его диапазон (пустые runs пропускаются).
-            cur = 0
-            start_run = None
-            start_offset = 0
-            end_run = None
-            end_offset = 0
-            for i, text in enumerate(texts):
-                next_cur = cur + len(text)
-                if start_run is None and start < next_cur:
-                    start_run = i
-                    start_offset = start - cur
-                if end_run is None and end <= next_cur:
-                    end_run = i
-                    end_offset = end - cur
-                    break
-                cur = next_cur
-
-            if start_run is None or end_run is None:
-                break
-
-            prefix = texts[start_run][:start_offset]
-            suffix = texts[end_run][end_offset:]
-
-            texts[start_run] = prefix + value + suffix
-            if end_run != start_run:
-                for j in range(start_run + 1, end_run + 1):
-                    texts[j] = ""
-            changed.add(start_run)
-            if end_run != start_run:
-                changed.update(range(start_run + 1, end_run + 1))
-
-            full_text = full_text[:start] + value + full_text[end:]
-            # Продолжаем поиск ПОСЛЕ вставленного значения: подстановка не
-            # обрабатывает собственный результат (защита от зацикливания,
-            # если в подстановке снова встречается этот же плейсхолдер).
-            search_from = start + len(value)
-
-    for index in sorted(changed):
-        runs[index].text = texts[index]
-
-
-def replace_in_doc(doc, replacements: dict):
-    for p in doc.paragraphs:
-        replace_in_paragraph(p, replacements)
-
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    replace_in_paragraph(p, replacements)
-
-    for section in doc.sections:
-        header = section.header
-        footer = section.footer
-
-        for p in header.paragraphs:
-            replace_in_paragraph(p, replacements)
-        for table in header.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for p in cell.paragraphs:
-                        replace_in_paragraph(p, replacements)
-
-        for p in footer.paragraphs:
-            replace_in_paragraph(p, replacements)
-        for table in footer.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for p in cell.paragraphs:
-                        replace_in_paragraph(p, replacements)
-
-
-def spec_items_table(doc) -> "Table | None":
-    """Таблица позиций спецификации в шаблоне (ищется по заголовку)."""
-    for table in doc.tables:
-        if not table.rows:
-            continue
-        header = " ".join(cell.text for cell in table.rows[0].cells)
-        if "№ п/п" in header and "Наименование" in header:
-            return table
-    return None
-
-
-def fill_spec_items(doc, items: list[dict]):
-    """Заполняет таблицу позиций спецификации из шаблона.
-
-    Строка-шаблон с плейсхолдерами {{item_*}} клонируется для каждой позиции,
-    после чего исходная строка-шаблон удаляется. Форматирование ячеек
-    сохраняется — текст заменяется внутри существующих runs.
-    Цена — с копейками при наличии дробной части, кол-во может быть дробным.
-    """
-    table = spec_items_table(doc)
-    if table is None or len(table.rows) < 2:
-        return
-    tpl_tr = table.rows[1]._tr
-    for index, item in enumerate(items, start=1):
-        qty = item.get("qty") if isinstance(item.get("qty"), Decimal) else parse_decimal(item.get("qty"))
-        price = item.get("price") if isinstance(item.get("price"), Decimal) else parse_decimal(item.get("price"))
-        amount = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        values = {
-            PH.ITEM_NO: str(index),
-            PH.ITEM_NAME: str(item.get("name", "")),
-            PH.ITEM_QTY: format_quantity(qty),
-            PH.ITEM_UNIT: str(item.get("unit", "")),
-            PH.ITEM_PRICE: format_amount(price),
-            PH.ITEM_SUM: format_amount(amount),
-            PH.ITEM_NOTE: str(item.get("note", "") or ""),
-        }
-        new_tr = copy.deepcopy(tpl_tr)
-        tpl_tr.addprevious(new_tr)
-        for tc in new_tr.tc_lst:
-            for paragraph in tc.xpath(".//w:p"):
-                for run in paragraph.xpath(".//w:r"):
-                    for token, value in values.items():
-                        if token in run.text:
-                            run.text = run.text.replace(token, value)
-    tpl_tr.getparent().remove(tpl_tr)
-
-
-def prices_valid_until_default() -> str:
-    """Дата окончания действия цен — последний день текущего месяца."""
-    today = datetime.now()
-    last_day = calendar.monthrange(today.year, today.month)[1]
-    return f"{last_day:02d}.{today.month:02d}.{today.year} г."
-
-
-def mark_spec_final_page(doc):
-    """Начинает итоговый блок спецификации (после таблицы позиций) с новой
-    страницы, чтобы он всегда размещался на отдельном последнем листе."""
-    for paragraph in doc.paragraphs:
-        if PH.TOTAL_IN_WORDS in paragraph.text:
-            paragraph.paragraph_format.page_break_before = True
-            return
-
-
-def docx_to_text(doc) -> str:
-    """Извлекает текст из документа: абзацы, затем строки таблиц."""
-    lines = [p.text for p in doc.paragraphs]
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            lines.append("\t".join(cells))
-    return "\n".join(lines).strip()
-
-
-def docx_from_text(text: str) -> "Document":
-    """Собирает документ Word из редактированного текста (по строке на абзац)."""
-    doc = Document()
-    for line in (text or "").splitlines():
-        doc.add_paragraph(line)
-    return doc
-
-
-def build_replacements(data: dict, is_ip: bool) -> dict:
-    """Словарь замен плейсхолдеров для шаблонов договора и доп. соглашения."""
-    formatted_date = format_date(data.get(F.DAY, ""))
-
-    if is_ip:
-        name_ip = data.get(F.IP_NAME, "")
-        return {
-            PH.NUMBER: data.get(F.NUMBER, ""),
-            PH.DATE: formatted_date,
-            PH.MONTH: data.get(F.MONTH, ""),
-            PH.IP_NAME: name_ip,
-            PH.IP_NAME2: format_name_ip2(name_ip),
-            PH.IP_NAME3: format_director_name(name_ip),
-            PH.OGRNIP: data.get(F.OGRNIP, ""),
-            PH.INN: data.get(F.INN, ""),
-            PH.LEGAL_ADDRESS: data.get(F.LEGAL_ADDRESS, ""),
-            PH.FACT_ADDRESS: data.get(F.FACT_ADDRESS, ""),
-            PH.EMAIL: data.get(F.EMAIL, ""),
-            PH.PHONE: data.get(F.PHONE, ""),
-            PH.ACCOUNT: data.get(F.ACCOUNT, ""),
-            PH.BANK: data.get(F.BANK, ""),
-            PH.CORR_ACCOUNT: data.get(F.CORR_ACCOUNT, ""),
-            PH.BIK: data.get(F.BIK, ""),
-        }
-
-    basis = data.get(F.BASIS, "")
-    if basis == "Устав":
-        basis_text = "устава"
-    elif basis == "Доверенность":
-        basis_text = "доверенности"
-    else:
-        basis_text = ""
-
-    return {
-        PH.NUMBER: data.get(F.NUMBER, ""),
-        PH.DATE: formatted_date,
-        PH.MONTH: data.get(F.MONTH, ""),
-        PH.FULL_NAME: data.get(F.FULL_NAME, ""),
-        PH.SHORT_NAME: data.get(F.SHORT_NAME, ""),
-        PH.DIRECTOR: data.get(F.DIRECTOR, ""),
-        PH.DIRECTOR_INITIALS: format_director_name(data.get(F.DIRECTOR, "")),
-        PH.BASIS: basis_text,
-        PH.OGRN: data.get(F.OGRN, ""),
-        PH.INN: data.get(F.INN, ""),
-        PH.KPP: data.get(F.KPP, ""),
-        PH.LEGAL_ADDRESS: data.get(F.LEGAL_ADDRESS, ""),
-        PH.FACT_ADDRESS: data.get(F.FACT_ADDRESS, ""),
-        PH.EMAIL: data.get(F.EMAIL, ""),
-        PH.PHONE: data.get(F.PHONE, ""),
-        PH.ACCOUNT: data.get(F.ACCOUNT, ""),
-        PH.BANK: data.get(F.BANK, ""),
-        PH.CORR_ACCOUNT: data.get(F.CORR_ACCOUNT, ""),
-        PH.BIK: data.get(F.BIK, ""),
-    }
 
 
 class _RootHolder:
@@ -1162,683 +451,11 @@ def validate_price_input(new_value):
 
 
 # Имена, которые Windows не разрешает как имя файла или папки.
-_RESERVED_FILENAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{i}" for i in range(1, 10)}
-    | {f"LPT{i}" for i in range(1, 10)}
-)
-_FORBIDDEN_FILENAME_CHARS = frozenset('<>:"/\\|?*')
-
-
-def safe_filename(name: str, fallback: str = "") -> str:
-    """Готовит безопасное имя файла/папки для Windows.
-
-    Защищает от выхода за пределы папки документов и «неудобных» имён:
-    убирает запрещённые и управляющие символы, точки/пробелы на конце,
-    зарезервированные имена (CON, PRN, NUL, COM1…) и ограничивает длину,
-    добавляя короткий хэш для уникальности.
-    """
-    if not name:
-        return fallback
-    text = "".join(
-        char for char in str(name)
-        if char not in _FORBIDDEN_FILENAME_CHARS and ord(char) >= 32
-    )
-    text = re.sub(r"\s+", " ", text).strip().strip(".")
-    if not text or text in {".", ".."}:
-        return fallback
-    if text.split(".")[0].upper() in _RESERVED_FILENAMES:
-        text = "_" + text
-    if len(text) > MAX_FILENAME_LENGTH:
-        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
-        text = text[: MAX_FILENAME_LENGTH - 9].rstrip(" .") + "~" + digest
-    return text or fallback
 
 
 # --------------------------------------------------------------------------- #
 #  Таблица позиций спецификации (excel-подобная, вставка из буфера обмена)
 # --------------------------------------------------------------------------- #
-class SpecTable(ctk.CTkFrame):
-    """Excel-подобная таблица позиций с поддержкой вставки из буфера.
-
-    Столбцы: Наименование, Кол-во, Ед. изм., Цена за ед. с НДС (руб.).
-    Ctrl+V в любой ячейке вставляет прямоугольный блок данных (из Excel —
-    столбцы, разделённые табуляцией); при нехватке строки добавляются сами.
-    Одинарный клик выделяет строку, Delete удаляет выделенную строку,
-    двойной клик по ячейке включает правку.
-    """
-
-    HEADERS = ("№", "Наименование", "Кол-во", "Ед. изм.", "Цена за ед. с НДС (руб.)")
-    KEYS = ("name", "qty", "unit", "price")
-    MIN_ROWS = 10
-    MAX_ROWS = 500
-    # Ширина фиксированных колонок в логических пикселях (№, Кол-во, Ед. изм., Цена).
-    COL_WIDTHS = {0: 34, 2: 64, 3: 84, 4: 150}
-
-    def __init__(self, master, scale: float = 1.0, on_change=None, **kwargs):
-        super().__init__(master, fg_color="transparent", corner_radius=0, **kwargs)
-        self.scale = scale
-        self.on_change = on_change
-        self._rows: list[dict] = []
-        self._batch = False  # подавление on_change при массовой вставке
-        self._selected_row: int | None = None
-        self._digits_vcmd = self.register(self._validate_digits)
-        self._price_vcmd = self.register(self._validate_price)
-        self._entry_font = tkfont.Font(font=ui.font(12))
-        # Отмена разрушительных действий с таблицей (п. 4.4).
-        self._undo_stack: list[list[dict]] = []
-        self._undo_limit = 30
-
-        # -- Панель инструментов ---------------------------------------- #
-        toolbar = ctk.CTkFrame(self, fg_color="transparent")
-        toolbar.pack(fill="x", pady=(0, int(4 * self.scale)))
-        ui.IconButton(
-            toolbar, "plus", self.add_row, size=26, tooltip="Добавить строку",
-        ).pack(side="left")
-        ui.IconButton(
-            toolbar, "minus", self.remove_last, size=26, tooltip="Удалить последнюю строку",
-        ).pack(side="left", padx=(int(4 * self.scale), 0))
-        ui.IconButton(
-            toolbar, "trash", self.clear, size=26, tooltip="Очистить таблицу",
-        ).pack(side="left", padx=(int(4 * self.scale), 0))
-
-        # Кол-во строк: задаётся в поле, применяется по Enter.
-        self._count_var = tk.StringVar(value=str(self.MIN_ROWS))
-        ctk.CTkLabel(
-            toolbar, text="Строк:", font=ui.font(12),
-            text_color=ui.COLORS["text_secondary"],
-        ).pack(side="right")
-        count_entry = ui.entry(
-            toolbar, width=int(56 * self.scale),
-            textvariable=self._count_var,
-            validatecommand=(self._digits_vcmd, "%P"),
-        )
-        count_entry.pack(side="right", padx=(int(8 * self.scale), 0))
-        self._count_entry = count_entry
-        try:  # фокус внутри внутреннего tk.Entry — биндим именно его
-            count_entry.bind_entry("<Return>", lambda _e: self._apply_row_count())
-            count_entry.bind_entry("<KP_Enter>", lambda _e: self._apply_row_count())
-            count_entry.bind_entry("<Control-z>", self._on_undo)
-            count_entry.bind_entry("<Control-Z>", self._on_undo)
-        except Exception:
-            pass
-
-        # -- Шапка таблицы: ячейки фиксированной ширины, подписи по центру -- #
-        header = tk.Frame(self)
-        header.pack(fill="x", padx=1)
-        header.grid_columnconfigure(1, weight=1)
-        for col in (0, 2, 3, 4):
-            header.grid_columnconfigure(col, weight=0)
-        self._header_frame = header
-        self._header_cells: list[tk.Frame] = []
-        self._header_labels: list[tk.Label] = []
-        for col, title in enumerate(self.HEADERS):
-            cell = tk.Frame(header, height=int(30 * self.scale))
-            if col in self.COL_WIDTHS:
-                cell.configure(width=int(self.COL_WIDTHS[col] * self.scale))
-            cell.grid(row=0, column=col, sticky="ew",
-                      padx=(2 if col == 0 else 3, 6 if col == 0 else 3))
-            cell.pack_propagate(False)
-            cell.grid_propagate(False)
-            label = tk.Label(
-                cell, text=title, font=ui.font(11, "bold"),
-                anchor="center", justify="center",
-                wraplength=int(150 * self.scale),
-            )
-            label.pack(fill="both", expand=True)
-            self._header_cells.append(cell)
-            self._header_labels.append(label)
-
-        # -- Тело таблицы ------------------------------------------------ #
-        self.body = ctk.CTkScrollableFrame(
-            self, height=int(216 * self.scale),
-            fg_color="transparent", corner_radius=0,
-            scrollbar_button_color=ui.COLORS["scroll"],
-            scrollbar_button_hover_color=ui.COLORS["scroll_hover"],
-        )
-        self.body.pack(fill="x")
-        self.body.grid_columnconfigure(0, weight=0)
-        self._schedule_height_update()
-        self.body.grid_columnconfigure(1, weight=1)
-        for col in (2, 3, 4):
-            self.body.grid_columnconfigure(col, weight=0)
-
-        ui.register_theme_listener(self._apply_theme)
-        self._apply_theme()
-
-        for _ in range(self.MIN_ROWS):
-            self._add_row()
-
-    # -- Строки ----------------------------------------------------------- #
-    @property
-    def rows(self) -> list[dict]:
-        """Строки таблицы: словари со StringVar «name», «qty», «unit», «price»."""
-        return self._rows
-
-    def add_row(self, values: dict | None = None) -> dict:
-        return self._add_row(values)
-
-    def _entry_width_chars(self, px: int) -> int:
-        """Ширина ячейки в символах, соответствующая ширине шапки в пикселях."""
-        digit = max(1, self._entry_font.measure("0"))
-        return max(3, int((px * self.scale - 10) // digit))
-
-    def _add_row(self, values: dict | None = None) -> dict:
-        index = len(self._rows)
-        values = values or {}
-
-        num = tk.Label(self.body, text=str(index + 1), font=ui.font(11), anchor="center")
-        num.grid(row=index, column=0, sticky="ew",
-                 padx=(2, 6), ipady=int(3 * self.scale))
-        num.bind("<Button-1>", self._on_cell_click)
-
-        row: dict = {"num": num, "cells": {}}
-        for col, key in enumerate(self.KEYS, start=1):
-            var = tk.StringVar(value=str(values.get(key, "") or ""))
-            entry = tk.Entry(
-                self.body, textvariable=var, font=ui.font(12),
-                relief="flat", justify="left" if key == "name" else "center",
-                highlightthickness=1, state="readonly",  # правка — по двойному клику
-                validatecommand=(self._digits_vcmd, "%P") if key == "qty"
-                else (self._price_vcmd, "%P") if key == "price" else None,
-            )
-            if col in self.COL_WIDTHS:  # ширина синхронизирована со шапкой
-                entry.configure(width=self._entry_width_chars(self.COL_WIDTHS[col]))
-            entry.grid(row=index, column=col, sticky="ew",
-                       padx=(0 if col == 1 else 3, 3), ipady=int(3 * self.scale))
-
-            entry.bind("<Button-1>", self._on_cell_click)
-            entry.bind("<Double-Button-1>", self._begin_edit)
-            entry.bind("<FocusOut>", self._end_edit)
-            entry.bind("<Delete>", self._on_delete_key)
-            entry.bind("<Control-z>", self._on_undo)
-            entry.bind("<Control-Z>", self._on_undo)
-            entry.bind("<Return>", lambda e: self._move_row(e.widget, +1))
-            entry.bind("<KP_Enter>", lambda e: self._move_row(e.widget, +1))
-            entry.bind("<Up>", lambda e: self._move_row(e.widget, -1))
-            entry.bind("<Down>", lambda e: self._move_row(e.widget, +1))
-            entry.bind("<Tab>", lambda e: self._move_cell(e.widget, +1))
-            entry.bind("<ISO_Left_Tab>", lambda e: self._move_cell(e.widget, -1))
-            entry.bind("<<Paste>>", self._on_paste)
-            try:
-                ui.fix_clipboard_shortcuts(entry)
-            except Exception:
-                pass
-
-            var.trace_add("write", lambda *_a: self._cell_changed())
-            row[key] = var
-            row["cells"][key] = entry
-
-        self._rows.append(row)
-        # П. 5.4: стилизуем только новую строку. Раньше _apply_theme()
-        # перестилизовывала ВСЕ строки на каждое добавление — задание
-        # 500 строк было O(n²) и блокировало интерфейс.
-        if not self._batch:
-            self._style_row(index)
-            self._schedule_height_update()
-        return row
-
-    # -- Высота тела таблицы ------------------------------------------------ #
-    def _schedule_height_update(self):
-        """Пересчитать высоту таблицы, когда виджеты будут отображены."""
-        try:
-            self.after_idle(self._update_body_height)
-        except Exception:
-            pass
-
-    def _update_body_height(self):
-        """Высота тела — ровно под строки, без пустого места снизу.
-
-        Если строк больше, чем помещается на экране, высота ограничивается
-        максимумом и включается прокрутка.
-        """
-        try:
-            if not self._rows:
-                return
-            row_h = self._rows[0]["cells"]["name"].winfo_reqheight()
-            if row_h <= 1:  # виджеты ещё не отображены — оценка
-                row_h = int(24 * self.scale)
-            row_h += int(6 * self.scale)  # ipady вокруг ячейки
-            total = row_h * len(self._rows) + int(4 * self.scale)
-            max_h = int(360 * self.scale)
-            self.body.configure(height=max(int(140 * self.scale), min(total, max_h)))
-        except Exception:
-            pass
-
-    # -- Выделение строки и правка ячеек ------------------------------------- #
-    def _row_of_widget(self, widget) -> int | None:
-        for i, row in enumerate(self._rows):
-            if widget is row["num"] or widget in row["cells"].values():
-                return i
-        return None
-
-    def _on_cell_click(self, event=None):
-        """Одинарный клик: выделить строку (правка — только по двойному клику)."""
-        if event is not None:
-            index = self._row_of_widget(event.widget)
-            if index is not None and index != self._selected_row:
-                previous = self._selected_row
-                self._selected_row = index
-                # Стилизуем только прежнюю и новую строку, а не всю таблицу (п. 5.4).
-                if previous is not None:
-                    self._style_row(previous)
-                self._style_row(index)
-        return None
-
-    def _begin_edit(self, event):
-        """Двойной клик: разрешить правку ячейки."""
-        entry = event.widget
-        try:
-            entry.configure(state="normal")
-            entry.focus_set()
-            entry.icursor("end")
-        except Exception:
-            pass
-        return None
-
-    def _end_edit(self, event=None):
-        """После выхода из ячейки возвращаем режим «только чтение»."""
-        if event is None:
-            return None
-        entry = event.widget
-        try:
-            if entry.winfo_exists() and str(entry.cget("state")) == "normal":
-                entry.configure(state="readonly")
-        except Exception:
-            pass
-        return None
-
-    def _on_delete_key(self, event):
-        """Delete: если ячейка не редактируется — удалить выделенную строку."""
-        entry = event.widget
-        if str(entry.cget("state")) == "normal":
-            return None  # идёт правка — обычное удаление символа
-        index = (self._selected_row if self._selected_row is not None
-                 else self._row_of_widget(entry))
-        if index is not None and 0 <= index < len(self._rows):
-            self._delete_row(index)
-            return "break"
-        return None
-
-    def _delete_row(self, index: int):
-        if len(self._rows) <= 1:
-            return
-        row = self._rows[index]
-        if any(row[key].get().strip() for key in self.KEYS):
-            if not self._confirm_destructive("Удалить строку с данными?"):
-                return
-        self._push_undo()
-        self._destroy_row(index)
-        self._selected_row = None
-        self._renumber()
-        self._notify()
-
-    def set_row_count(self, count: int):
-        """Задаёт точное количество строк (добавляет или удаляет лишние)."""
-        count = max(1, min(int(count), self.MAX_ROWS))
-        if count == len(self._rows):
-            return
-        if count < len(self._rows):
-            lost = [
-                index for index in range(count, len(self._rows))
-                if any(self._rows[index][key].get().strip() for key in self.KEYS)
-            ]
-            if lost and not self._confirm_destructive(
-                f"Уменьшение числа строк удалит заполненные строки: {len(lost)}.\n\n"
-                "Продолжить?"
-            ):
-                self._count_var.set(str(len(self._rows)))
-                return
-            self._push_undo()
-        self._batch = True
-        try:
-            while len(self._rows) < count:
-                self._add_row()
-            while len(self._rows) > count:
-                self._destroy_row(len(self._rows) - 1)
-        finally:
-            self._batch = False
-        self._apply_theme()
-        self._schedule_height_update()
-        self._selected_row = None
-        self._renumber()
-        self._count_var.set(str(count))
-        self._notify()
-
-    def _apply_row_count(self):
-        value = digits_only(self._count_var.get())
-        self.set_row_count(int(value or self.MIN_ROWS))
-
-    def _renumber(self):
-        for i, row in enumerate(self._rows):
-            try:
-                row["num"].configure(text=str(i + 1))
-            except Exception:
-                pass
-
-    def _destroy_row(self, index: int):
-        row = self._rows.pop(index)
-        for widget in (row["num"], *row["cells"].values()):
-            try:
-                widget.destroy()
-            except Exception:
-                pass
-        self._schedule_height_update()
-
-    # -- Отмена и подтверждения (п. 4.4) --------------------------------- #
-    def _snapshot(self) -> list[dict]:
-        return [{key: row[key].get() for key in self.KEYS} for row in self._rows]
-
-    def _push_undo(self) -> None:
-        try:
-            self._undo_stack.append(self._snapshot())
-            if len(self._undo_stack) > self._undo_limit:
-                self._undo_stack.pop(0)
-        except Exception:
-            pass
-
-    def _confirm_destructive(self, message: str) -> bool:
-        try:
-            return ui.confirm(
-                self.winfo_toplevel(), "Таблица позиций", message,
-                ok_text="Продолжить", cancel_text="Отмена",
-            )
-        except Exception:
-            return True
-
-    def _on_undo(self, _event=None):
-        self.undo()
-        return "break"
-
-    def undo(self) -> bool:
-        """Возвращает таблицу к состоянию перед последним разрушительным действием."""
-        if not self._undo_stack:
-            return False
-        snapshot = self._undo_stack.pop()
-        self._batch = True
-        try:
-            self._reset_rows()
-            while len(self._rows) < len(snapshot):
-                self._add_row()
-            while len(self._rows) > len(snapshot) and len(self._rows) > self.MIN_ROWS:
-                self._destroy_row(len(self._rows) - 1)
-            for row, values in zip(self._rows, snapshot):
-                for key in self.KEYS:
-                    row[key].set(values.get(key, ""))
-            self._count_var.set(str(len(self._rows)))
-        finally:
-            self._batch = False
-        self._selected_row = None
-        self._renumber()
-        self._apply_theme()
-        self._schedule_height_update()
-        self._notify()
-        return True
-
-    def remove_last(self):
-        if len(self._rows) <= 1:
-            return
-        last = self._rows[-1]
-        if any(last[key].get().strip() for key in self.KEYS):
-            if not self._confirm_destructive("Удалить последнюю строку с данными?"):
-                return
-        self._push_undo()
-        self._destroy_row(len(self._rows) - 1)
-        self._selected_row = None
-        self._notify()
-
-    def clear(self):
-        filled = sum(
-            1 for row in self._rows
-            if any(row[key].get().strip() for key in self.KEYS)
-        )
-        if filled and not self._confirm_destructive(
-            f"Очистить таблицу? Заполненных строк: {filled}."
-        ):
-            return
-        if filled:
-            self._push_undo()
-        self._reset_rows()
-        self._selected_row = None
-        self._notify()
-
-    def _reset_rows(self):
-        """Очистка без уведомления (используется перед массовой вставкой)."""
-        while self._rows:
-            self._destroy_row(len(self._rows) - 1)
-        for _ in range(self.MIN_ROWS):
-            self._add_row()
-        self._apply_theme()
-        self._schedule_height_update()
-
-    # -- Данные ------------------------------------------------------------ #
-    def get_items(self) -> list[dict]:
-        """Позиции с заполненным наименованием; суммы считаются на лету.
-
-        Кол-во и цена — Decimal: цена может содержать копейки,
-        кол-во может быть дробным (например, 2,5 м).
-        """
-        items = []
-        for row in self._rows:
-            name = row["name"].get().strip()
-            if not name:
-                continue
-            items.append({
-                "name": name,
-                "qty": parse_decimal(row["qty"].get()),
-                "unit": row["unit"].get().strip() or "шт.",
-                "price": parse_decimal(row["price"].get()),
-            })
-        return items
-
-    def total(self) -> Decimal:
-        return sum(
-            (item["qty"] * item["price"] for item in self.get_items()),
-            Decimal("0"),
-        )
-
-    # -- Вставка из буфера -------------------------------------------------- #
-    def paste_clipboard(self):
-        """Кнопка «Вставить из Excel»: заменить содержимое таблицы буфером."""
-        if any(
-            row[key].get().strip() for row in self._rows for key in self.KEYS
-        ):
-            self._push_undo()
-        self._reset_rows()
-        self._paste_block((0, 0))
-
-    def _on_paste(self, event):
-        cell = self._cell_of(event.widget)
-        if cell is None:
-            return None
-        if any(
-            row[key].get().strip() for row in self._rows for key in self.KEYS
-        ):
-            self._push_undo()
-        self._paste_block(cell)
-        return "break"
-
-    def _paste_block(self, start_cell: tuple[int, int]) -> bool:
-        """Вставляет блок текста (TSV) начиная с ячейки start_cell."""
-        try:
-            raw = self.clipboard_get()
-        except Exception:
-            return False
-        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-        matrix = [line.split("\t") for line in raw.split("\n")]
-        while matrix and all(not cell.strip() for cell in matrix[-1]):
-            matrix.pop()
-        if not matrix:
-            return False
-
-        r0, c0 = start_cell
-        need = r0 + len(matrix) - len(self._rows)
-        for _ in range(max(0, need)):
-            self._add_row()
-
-        self._batch = True
-        try:
-            for dr, values in enumerate(matrix):
-                mapped = self._map_row(values)
-                for dc, value in enumerate(mapped):
-                    col = c0 + dc
-                    if col >= len(self.KEYS):
-                        break
-                    self._rows[r0 + dr][self.KEYS[col]].set(value)
-        finally:
-            self._batch = False
-        self._notify()
-        return True
-
-    def _map_row(self, cells: list[str]) -> list[str]:
-        """Эвристика раскладки вставленных столбцов по колонкам таблицы."""
-        cells = [cell.strip() for cell in cells]
-        while cells and not cells[-1]:
-            cells.pop()
-        n = len(cells)
-        if n == 0:
-            return ["", "", "", ""]
-        if n == 1:
-            return [cells[0], "", "", ""]
-        if n == 2:  # Наименование, Кол-во
-            return [cells[0], self._normalize_number(cells[1]), "", ""]
-        if n == 3:
-            # «Наименование, Кол-во, Цена» либо «Наименование, Кол-во, Ед. изм.»
-            if self._normalize_number(cells[2]):
-                return [cells[0], self._normalize_number(cells[1]), "",
-                        self._normalize_number(cells[2])]
-            return [cells[0], self._normalize_number(cells[1]), cells[2], ""]
-        return [cells[0], self._normalize_number(cells[1]), cells[2],
-                self._normalize_number(cells[3])]
-
-    @staticmethod
-    def _normalize_number(text: str) -> str:
-        """«1 000,50» -> «1000.50»: убирает разрядные разделители,
-        сохраняет дробную часть (копейки).
-
-        Правила: если встречаются «,» и «.» — правый из них десятичный;
-        одиночная запятая считается десятичным разделителем; повторные
-        запятые/точки считаются разрядными и удаляются.
-        """
-        text = str(text).replace("\xa0", "").replace(" ", "")
-        if "," in text and "." in text:
-            if text.rfind(",") > text.rfind("."):
-                text = text.replace(".", "")   # «2.052,59» -> «2052,59»
-            else:
-                text = text.replace(",", "")   # «2,052.59» -> «2052.59»
-        if text.count(",") > 1:
-            text = text.replace(",", "")       # «1,000,000» — разрядные
-        if text.count(".") > 1:
-            text = text.replace(".", "")       # «1.000.000» — разрядные
-        text = text.replace(",", ".")
-        cleaned = "".join(ch for ch in text if ch.isdigit() or ch == ".")
-        return cleaned.rstrip(".")
-
-    # -- Навигация ----------------------------------------------------------- #
-    def _cell_of(self, entry) -> tuple[int, int] | None:
-        for r, row in enumerate(self._rows):
-            for key, widget in row["cells"].items():
-                if widget is entry:
-                    return (r, self.KEYS.index(key))
-        return None
-
-    def _move_row(self, entry, delta: int):
-        cell = self._cell_of(entry)
-        if cell is None:
-            return None
-        r, c = cell
-        r = min(max(r + delta, 0), len(self._rows) - 1)
-        return self._focus_cell((r, c))
-
-    def _move_cell(self, entry, delta: int):
-        cell = self._cell_of(entry)
-        if cell is None:
-            return None
-        r, c = cell
-        c += delta
-        if c >= len(self.KEYS):
-            if r + 1 < len(self._rows):
-                return self._focus_cell((r + 1, 0))
-            self._add_row()
-            return self._focus_cell((r + 1, 0))
-        if c < 0:
-            if r > 0:
-                return self._focus_cell((r - 1, len(self.KEYS) - 1))
-            c = 0
-        return self._focus_cell((r, c))
-
-    def _focus_cell(self, cell: tuple[int, int]):
-        r, c = cell
-        widget = self._rows[r]["cells"][self.KEYS[c]]
-        widget.focus_set()
-        widget.icursor("end")
-        return "break"
-
-    # -- Служебное ------------------------------------------------------------ #
-    def _validate_digits(self, new_value: str) -> bool:
-        """Кол-во: цифры и запятая/точка (может быть дробным)."""
-        return new_value == "" or all(ch.isdigit() or ch in ",." for ch in new_value)
-
-    def _validate_price(self, new_value: str) -> bool:
-        """Цена: цифры, разряды и запятая/точка (копейки)."""
-        return new_value == "" or all(
-            ch.isdigit() or ch in " .," for ch in new_value
-        )
-
-    def _cell_changed(self):
-        self._notify()
-
-    def _notify(self):
-        if self._batch:
-            return
-        if self.on_change:
-            try:
-                self.on_change()
-            except Exception:
-                pass
-
-    def _style_row(self, index: int) -> None:
-        """Стилизует одну строку (фон, рамки, цвета) с учётом выделения."""
-        border = ui.resolve(ui.COLORS["entry_border"])
-        accent = ui.resolve(ui.COLORS["accent"])
-        base_bg = ui.resolve(ui.COLORS["entry_bg"])
-        selected_bg = ui.resolve(ui.COLORS["sidebar_active"])
-        bg = selected_bg if index == self._selected_row else base_bg
-        row = self._rows[index]
-        try:
-            row["num"].configure(
-                bg=bg,
-                fg=ui.resolve(ui.COLORS["text_tertiary"]),
-            )
-        except Exception:
-            pass
-        for entry in row["cells"].values():
-            try:
-                entry.configure(
-                    bg=bg,
-                    readonlybackground=bg,
-                    fg=ui.resolve(ui.COLORS["text"]),
-                    insertbackground=ui.resolve(ui.COLORS["text"]),
-                    highlightbackground=border,
-                    highlightcolor=accent,
-                )
-            except Exception:
-                pass
-
-    def _apply_theme(self):
-        header_bg = ui.resolve(ui.COLORS["chrome"])
-        for cell in self._header_cells:
-            try:
-                cell.configure(bg=header_bg)
-            except Exception:
-                pass
-        for label in self._header_labels:
-            try:
-                label.configure(bg=header_bg, fg=ui.resolve(ui.COLORS["text_secondary"]))
-            except Exception:
-                pass
-        for index in range(len(self._rows)):
-            self._style_row(index)
 
 
 class ContractApp:
@@ -3981,19 +2598,19 @@ class ContractApp:
             return False
 
     def _fit_document_path(self, directory: str, base: str, ext: str = ".docx") -> str:
-        """Собирает путь, укладывающийся в ``MAX_PATH_LENGTH`` (п. 2.7)."""
-        path = os.path.join(directory, base + ext)
-        if len(path) <= MAX_PATH_LENGTH:
-            return path
-        available = MAX_PATH_LENGTH - len(directory) - len(ext) - 1
-        if available < 12:
-            raise OSError(
-                "Слишком длинный путь к папке документов — выберите папку короче:\n"
-                + directory
-            )
-        digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
-        shortened = base[: max(1, available - 9)].rstrip(" .") + "~" + digest
-        return os.path.join(directory, shortened + ext)
+        """Собирает путь, укладывающийся в ``MAX_PATH_LENGTH`` (сервисный слой)."""
+        return services.fit_document_path(directory, base, ext)
+
+    def _persist_document(self, draft: dict) -> dict:
+        """Пишет .docx и регистрирует запись через сервисный слой (п. 9.2).
+
+        При сбое записи реестра файл удаляется, запись не добавляется —
+        результат возвращается вызывающему коду для показа сообщения.
+        """
+        docs_dir = self._party_documents_dir(
+            self.store.get_counterparty(draft.get("party_id"))
+        )
+        return services.save_document(self.store, draft, docs_dir)
 
     def _party_documents_dir(self, party_rec: dict | None,
                              interactive: bool = True) -> str:
@@ -4039,147 +2656,31 @@ class ContractApp:
 
     def _render_contract_docx(self, data: dict, is_ip: bool) -> "Document":
         """Договор из шаблона: печатная форма сохраняется без искажений."""
-        template_path = resource_path("dogovor_template_ip.docx" if is_ip else "dogovor_template.docx")
-        doc = load_template_cached(template_path)
-        replace_in_doc(doc, build_replacements(data, is_ip))
-        return doc
+        return services.render_contract(data, is_ip)
 
     def _render_additional_docx(self, data: dict, is_ip: bool, number: str,
                                 limit_display: str, term: str) -> "Document":
         """Доп. соглашение из шаблона с подстановкой лимита и отсрочки."""
-        template_path = resource_path("additional_agreement_ip.docx" if is_ip else "additional_agreement.docx")
-        doc = load_template_cached(template_path)
-        replacements = build_replacements(data, is_ip)
-        replacements[PH.AGREEMENT_NUMBER] = number or "б/н"
-        limit = digits_only(limit_display)
-        replacements.update({
-            PH.LIMIT: limit_display,
-            PH.LIMIT_WORDS: amount_to_words_ru(int(limit)) if limit else "",
-            PH.TERM: term,
-            PH.TERM_WORDS: number_to_words_ru(int(term)) if term.isdigit() else "",
-        })
-        replace_in_doc(doc, replacements)
-        return doc
+        return services.render_additional(data, is_ip, number, limit_display, term)
 
     def _render_spec_docx(self, rec: dict) -> "Document":
-        """Спецификация из шаблона (книжная ориентация).
-
-        У ООО и ИП разные шаблоны: у ИП нет КПП, а вместо ОГРН — ОГРНИП.
-        Общий spec_template.docx написан «в терминах ООО», поэтому для ИП
-        используется отдельная копия spec_template_ip.docx (п. 1.1):
-        строка «ОГРН {{OGRN}}» заменена на «ОГРНИП {{OGRNIP}}»,
-        «ИНН {{INN}} / КПП {{KPP}}» — на «ИНН {{INN}}». Без этого в печатной
-        форме ИП оставались пустые подписи «ОГРН» и «/ КПП».
-        """
-        is_ip = self._rec_is_ip(rec)
-        template_path = resource_path(
-            "spec_template_ip.docx" if is_ip else "spec_template.docx"
-        )
-        doc = load_template_cached(template_path)
-        data = dict(rec.get("data") or {})
-        extra = rec.get("extra") or {}
-        replacements = build_replacements(data, is_ip)
-
-        if is_ip:
-            # Шаблон спецификации написан в терминах ООО-покупателя;
-            # для ИП подставляем эквивалентные значения.
-            name_ip = data.get(F.IP_NAME, "")
-            replacements[PH.FULL_NAME] = (
-                f"Индивидуальный предприниматель {name_ip}".strip()
-            )
-            replacements[PH.SHORT_NAME] = f"ИП {name_ip}".strip()
-            replacements[PH.DIRECTOR] = name_ip
-            replacements[PH.DIRECTOR_INITIALS] = format_name_ip2(name_ip)
-            replacements[PH.BASIS] = (
-                "свидетельства о государственной регистрации в качестве "
-                "индивидуального предпринимателя"
-            )
-
-        # Договор-основание: номер и дата подставляются из записи договора.
-        contract = (
-            self.store.get_document(extra.get("contract_id"))
-            if extra.get("contract_id") else None
-        )
-        if contract is None or contract.get("kind") != storage.KIND_CONTRACT:
-            contract = None
-        contract_data = dict((contract or {}).get("data") or {})
-        replacements[PH.NUMBER] = (
-            (contract or {}).get("number") or extra.get("contract_number") or ""
-        )
-        replacements[PH.DATE] = format_date(contract_data.get(F.DAY, ""))
-        replacements[PH.MONTH] = contract_data.get(F.MONTH, "")
-
-        # Кол-во/цена в реестре хранятся числами (float/int) — переводим в Decimal.
-        items = [
-            dict(item, qty=parse_decimal(item.get("qty")),
-                 price=parse_decimal(item.get("price")))
-            for item in (extra.get("items") or [])
-        ]
-        total = parse_decimal(extra.get("total"))
-        if total == 0 and items:
-            total = sum((i["qty"] * i["price"] for i in items), Decimal("0"))
-        replacements.update({
-            PH.APPENDIX_NUMBER: SPEC_APPENDIX_NUMBER,
-            PH.SPEC_NUMBER: rec.get("number") or "б/н",
-            PH.SPEC_DAY: str(extra.get("spec_day", "")),
-            PH.SPEC_MONTH: str(extra.get("spec_month", "")),
-            PH.PRICES_VALID_UNTIL: prices_valid_until_default(),
-            PH.TOTAL: format_amount(total),
-            PH.TOTAL_IN_WORDS: amount_in_words_ru(total) if total else "",
-            PH.VAT: format_amount(
-                spec_vat_amount_from_items(items) if items else spec_vat_amount(total)
-            ),
-            PH.VAT_RATE: f"{SPEC_VAT_RATE}%",
-            PH.DELIVERY_TERM: str(extra.get("delivery_term", "")),
-            PH.PAYMENT_TERMS: str(extra.get("payment_terms", "")),
-            PH.DELIVERY_BASIS: str(extra.get("delivery_basis", "")),
-        })
-        mark_spec_final_page(doc)
-        replace_in_doc(doc, replacements)
-        fill_spec_items(doc, items)
-        return doc
+        """Спецификация из шаблона (ООО/ИП) — сборка в сервисном слое (п. 9.2)."""
+        return services.render_spec(rec, self.store, get_spec_settings())
 
     def _rec_is_ip(self, rec: dict) -> bool:
         """Признак ИП у сохранённой записи (учитывая старые записи реестра)."""
-        extra = rec.get("extra") or {}
-        if "is_ip" in extra:
-            return bool(extra.get("is_ip"))
-        party = self.store.get_counterparty(rec.get("party_id"))
-        return bool(party and party.get("type") == "ip")
+        return services.rec_is_ip(rec, self.store)
 
     def _build_record_docx(self, rec: dict) -> "Document":
-        """Восстанавливает .docx записи реестра из шаблона (договор и доп. соглашение)."""
-        kind = rec.get("kind")
-        extra = rec.get("extra") or {}
-        if kind == storage.KIND_CONTRACT:
-            return self._render_contract_docx(rec.get("data") or {}, self._rec_is_ip(rec))
-        if kind == storage.KIND_ADDITIONAL:
-            return self._render_additional_docx(
-                rec.get("data") or {}, self._rec_is_ip(rec),
-                rec.get("number") or "", extra.get("limit", ""), extra.get("term", ""),
-            )
-        if kind == storage.KIND_SPEC:
-            return self._render_spec_docx(rec)
-        return docx_from_text(rec.get("text", ""))
+        """Собирает .docx записи реестра по её типу (сервисный слой)."""
+        return services.build_record_docx(rec, self.store)
 
     def _write_docx(self, doc, rec: dict) -> str:
-        """Пишет .docx в папку контрагента атомарно и возвращает итоговый путь."""
+        """Пишет .docx в папку контрагента атомарно (сервисный слой, п. 9.2)."""
         directory = self._party_documents_dir(
             self.store.get_counterparty(rec.get("party_id"))
         )
-        kind_label = storage.KIND_LABELS.get(rec.get("kind"), "Документ")
-        party_name = self.store.party_name(rec.get("party_id"))
-        number = rec.get("number") or "б/н"
-        base = safe_filename(f"{kind_label} №{number} {party_name}", "Документ")
-        path = self._fit_document_path(directory, base, ".docx")
-        counter = 2
-        while os.path.exists(path):
-            path = self._fit_document_path(directory, f"{base} ({counter})", ".docx")
-            counter += 1
-        with applog.timed("Запись .docx", 500, "documents"):
-            save_docx_atomic(doc, path)
-        self._log.info("Документ записан: тип=%s, id=%s", rec.get("kind"), rec.get("id"))
-        return path
+        return services.write_docx(doc, rec, self.store, directory)
 
     def _save_and_open_document(self, rec: dict) -> str:
         """Готовит .docx в индивидуальной папке контрагента и открывает его в Word."""
@@ -4187,20 +2688,11 @@ class ContractApp:
         open_file(path)
         return path
 
-    def _rollback_document(self, rec: dict, path: str) -> None:
-        """Откатывает запись и файл, если реестр не удалось записать на диск."""
-        try:
-            self.store.documents.remove(rec)
-        except ValueError:
-            pass
-        try:
-            if path and os.path.exists(path):
-                os.remove(path)
-        except OSError:
-            pass
+    def _persist_document_result_alert(self, result: dict):
+        """Показывает сообщение при сбое транзакции сохранения (п. 9.2)."""
         ui.alert(
             self.root, "Не удалось сохранить документ",
-            f"{self.store.last_error or 'Ошибка записи реестра.'}\n\n"
+            f"{result['error']}\n\n"
             "Файл удалён, запись в реестр не добавлена.",
             "error",
         )
@@ -4241,18 +2733,21 @@ class ContractApp:
         data = dict(party.get("fields", {}))
 
         lines: list[str] = []
+        spec = get_spec_settings()
         if contract is not None:
-            lines.append(f"Приложение № {SPEC_APPENDIX_NUMBER} к Договору поставки "
-                         f"{self._contract_display(contract)}")
+            lines.append(
+                f"Приложение № {spec['spec_appendix_number']} к Договору поставки "
+                f"{self._contract_display(contract)}"
+            )
         lines.append("")
         number = self.spec_number_var.get().strip() or "б/н"
         lines.append(f"СПЕЦИФИКАЦИЯ № {number}")
         lines.append(
-            f"г. Хабаровск    «{self.spec_day_var.get().strip() or '__'}» "
-            f"{self.spec_month_var.get().strip() or '__'} 2026 г."
+            f"г. {spec['spec_city']}    «{self.spec_day_var.get().strip() or '__'}» "
+            f"{self.spec_month_var.get().strip() or '__'} {spec['spec_year']} г."
         )
         lines.append("")
-        lines.append("Поставщик: ООО «Эдельвейс»")
+        lines.append(f"Поставщик: {spec['spec_supplier']}")
         lines.append(f"Покупатель: {storage.display_name(party)}, "
                      f"ИНН {data.get(F.INN, '')}, {data.get(F.LEGAL_ADDRESS, '')}")
         lines.append("")
@@ -4278,8 +2773,8 @@ class ContractApp:
                 f"Итого: {format_amount(total)} руб. ({amount_in_words_ru(total)})"
             )
             lines.append(
-                f"в т.ч. НДС {SPEC_VAT_RATE}%: "
-                f"{format_amount(spec_vat_amount_from_items(items))} руб."
+                f"в т.ч. НДС {spec['spec_vat_rate']}%: "
+                f"{format_amount(spec_vat_amount_from_items(items, spec['spec_vat_rate']))} руб."
             )
         else:
             lines.append("Позиции не заполнены — заполните таблицу позиций справа.")
@@ -4293,8 +2788,10 @@ class ContractApp:
             if condition_value:
                 lines.append(f"{condition_label}: {condition_value}")
         lines.append("")
-        lines.append("Подписи Сторон: от Поставщика — А.Н. Верещагин, "
-                     f"от Покупателя — {data.get(F.DIRECTOR, data.get(F.IP_NAME, ''))}")
+        lines.append(
+            f"Подписи Сторон: от Поставщика — {spec['spec_supplier_signatory']}, "
+            f"от Покупателя — {data.get(F.DIRECTOR, data.get(F.IP_NAME, ''))}"
+        )
         self._set_text(self.spec_text, "\n".join(lines))
 
     # ------------------------------------------------------------------ #
@@ -4366,20 +2863,18 @@ class ContractApp:
                 "kind": storage.KIND_CONTRACT,
                 "party_id": rec["id"],
                 "number": data[F.NUMBER],
+                "date": date_text,
                 "data": data,
                 "extra": extra,
                 "text": "",
             }
-            # Сначала успешно пишем .docx, затем регистрируем запись: при сбое
-            # записи в реестр «осиротевший» файл удаляется, а не остаётся навсегда.
-            path = self._write_docx(self._build_record_docx(draft), draft)
-            rec_doc = self.store.add_document(
-                storage.KIND_CONTRACT, rec["id"], data[F.NUMBER], date_text,
-                data=data, extra=extra, text="",
-            )
-            if self.store.last_error:
-                self._rollback_document(rec_doc, path)
+            # Файл и запись реестра — транзакция сервисного слоя (п. 9.2):
+            # при сбое записи реестра файл удаляется, запись не добавляется.
+            result = self._persist_document(draft)
+            if not result["ok"]:
+                self._persist_document_result_alert(result)
                 return
+            path = result["path"]
             self._reset_form_baseline("contract")
             self.refresh_registry()
             self._update_status()
@@ -4449,20 +2944,16 @@ class ContractApp:
                 "kind": storage.KIND_ADDITIONAL,
                 "party_id": party["id"],
                 "number": number,
+                "date": date_text,
                 "data": dict(contract.get("data") or {}),
                 "extra": extra,
                 "text": "",
             }
-            path = self._write_docx(self._build_record_docx(draft), draft)
-            rec_doc = self.store.add_document(
-                storage.KIND_ADDITIONAL, party["id"], number, date_text,
-                data=dict(contract.get("data") or {}),
-                extra=extra,
-                text="",
-            )
-            if self.store.last_error:
-                self._rollback_document(rec_doc, path)
+            result = self._persist_document(draft)
+            if not result["ok"]:
+                self._persist_document_result_alert(result)
                 return
+            path = result["path"]
             self._reset_form_baseline("additional")
             self.refresh_registry()
             self._update_status()
@@ -4548,20 +3039,16 @@ class ContractApp:
                 "kind": storage.KIND_SPEC,
                 "party_id": party["id"],
                 "number": number,
+                "date": date_text,
                 "data": dict(party.get("fields", {})),
                 "extra": extra,
                 "text": text,
             }
-            path = self._write_docx(self._build_record_docx(draft), draft)
-            rec_doc = self.store.add_document(
-                storage.KIND_SPEC, party["id"], number, date_text,
-                data=dict(party.get("fields", {})),
-                extra=extra,
-                text=text,
-            )
-            if self.store.last_error:
-                self._rollback_document(rec_doc, path)
+            result = self._persist_document(draft)
+            if not result["ok"]:
+                self._persist_document_result_alert(result)
                 return
+            path = result["path"]
             self._reset_form_baseline("spec")
             self.refresh_registry()
             self._update_status()

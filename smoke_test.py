@@ -37,6 +37,7 @@ m.ui.alert = lambda *args, **kwargs: ALERTS.append(args)
 m.ui.confirm = lambda *args, **kwargs: True
 # В тесте не открываем Word и не запускаем файлы.
 OPENED: list[str] = []
+_real_open_file = m.open_file  # реальная функция до стаба ниже (нужна п. 6.2)
 m.open_file = lambda path: OPENED.append(path)
 
 
@@ -705,6 +706,9 @@ try:
     # п.9: при старте реестр не отрисовывается — ленивый рендер.
     check(getattr(app, "_registry_rendered", True) is False,
           "п.9: при старте реестр не отрисовывается (ленивый рендер)")
+    # 6.2: открытие файла подменяем детерминированным стабом (без xdg-open).
+    _orig_open_file = m.open_file
+    m.open_file = lambda path: True
 
     check(hasattr(app, "nav_holder") and len(app.nav_items) == 6,
           "кнопки разделов в шапке, включая «Настройки»")
@@ -1294,6 +1298,35 @@ try:
           "6.1: у exe есть VersionInfo в сборке")
     check(os.path.exists("license.txt"), "6.1: файл лицензии и уведомлений существует")
 
+    # 6.2: сообщение соответствует действительности — открытие проверяется.
+    app._set_current_party(party_rec)
+    m.open_file = lambda path: False
+    try:
+        app.contract_number_var.set("9")
+        app.save_contract()
+    finally:
+        m.open_file = lambda path: True  # возвращаем стаб успешного открытия
+    app.root.update()
+    _toast_text = str(app.toast_label.cget("text"))
+    check(_toast_text.rstrip(".").endswith("сохранён") and "и открыт" not in _toast_text,
+          f"6.2: при неудачном открытии не обещается «открыт»: {_toast_text!r}")
+    try:
+        app.contract_number_var.set("10")
+        app.save_contract()
+    finally:
+        m.open_file = _real_open_file
+    app.root.update()
+    check(str(app.toast_label.cget("text")).endswith("сохранён и открыт."),
+          f"6.2: при успешном открытии тост говорит «сохранён и открыт»: "
+          f"{app.toast_label.cget('text')!r}")
+
+    # 6.2: папка документов по умолчанию — видимые «Документы», а не скрытый %APPDATA%.
+    _def_dir = app._default_documents_dir(interactive=False)
+    check("Documents" in _def_dir and os.path.basename(_def_dir) == "EW.DocHub",
+          f"6.2: папка документов по умолчанию в «Документах»: {_def_dir}")
+    check(m.open_file(os.path.join(tempfile.gettempdir(), "smoke_missing_6_2.docx")) is False,
+          "6.2: open_file возвращает False при неудаче открытия (файла нет на диске)")
+
     # Реестр.
     app._select_page("registry")
     app.root.update()
@@ -1392,6 +1425,10 @@ try:
 
     app.store.save()
 finally:
+    try:
+        m.open_file = _real_open_file
+    except Exception:
+        pass
     try:
         app.root.destroy()
     except Exception:

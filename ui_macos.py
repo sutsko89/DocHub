@@ -218,13 +218,46 @@ def refresh_taskbar(window: tk.Misc) -> None:
         pass
 
 
-def workarea() -> tuple[int, int, int, int]:
-    """Рабочая область экрана (без панели задач): x, y, ширина, высота."""
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", ctypes.c_ulong),
+    ]
+
+
+def workarea(window: tk.Misc | None = None) -> tuple[int, int, int, int]:
+    """Рабочая область (без панели задач): x, y, ширина, высота.
+
+    Если передано окно — берётся рабочая область ТОГО монитора, где окно
+    находится сейчас (п. 6.3), а не только основного монитора.
+    """
     if sys.platform == "win32":
+        if window is not None:
+            try:
+                hwnd = _main_hwnd(window)
+                hmon = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+                if hmon:
+                    info = _MONITORINFO()
+                    info.cbSize = ctypes.sizeof(info)
+                    if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                        rc = info.rcWork
+                        return rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top
+            except Exception:
+                pass
         rect = _RECT()
         try:
             if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
                 return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+        except Exception:
+            pass
+    else:
+        # Не Windows: используем размеры экрана Tk (п. 6.3 — не «только 1920×1080»).
+        try:
+            source = window or getattr(tk, "_default_root", None)
+            if source is not None:
+                return 0, 0, source.winfo_screenwidth(), source.winfo_screenheight()
         except Exception:
             pass
     return 0, 0, 1920, 1080
@@ -251,7 +284,7 @@ def maximize_window(window: tk.Misc) -> None:
     """
     if sys.platform == "win32":
         try:
-            x, y, width, height = workarea()
+            x, y, width, height = workarea(window)
             window.geometry(f"{width}x{height}+{x}+{y}")
             return
         except Exception:
@@ -1341,7 +1374,7 @@ class _ComboPopup(tk.Toplevel):
 
         text_font = tkfont.Font(font=font(12))
         text_w = max((text_font.measure(v) for v in self._shown), default=0)
-        wa = workarea()
+        wa = workarea(combo)
         width = min(max(combo.winfo_width(), text_w + px(34)), px(520), wa[2])
 
         x = combo.winfo_rootx()

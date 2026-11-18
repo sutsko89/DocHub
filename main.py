@@ -44,7 +44,7 @@ import single_instance
 import storage
 import ui_macos as ui
 
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 MAX_PATH_LENGTH = 240
@@ -95,6 +95,43 @@ def load_template_cached(template_path: str):
 SETTINGS_DIR_NAME = "DogovorGenerator"
 MIN_WINDOW_WIDTH = 1120  # логические пиксели
 MIN_WINDOW_HEIGHT = 620
+
+
+def _user_documents_dir() -> str:
+    """Папка «Документы» пользователя (п. 6.2): видимое место вместо скрытого %APPDATA%."""
+    if sys.platform == "win32":
+        try:
+            import uuid as _uuid
+
+            class _GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", ctypes.c_ulong),
+                    ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort),
+                    ("Data4", ctypes.c_ubyte * 8),
+                ]
+
+            guid = _GUID()
+            known = _uuid.UUID("FDD39AD0-238F-46AF-ADB4-6C85480369C7")  # FOLDERID_Documents
+            guid.Data1, guid.Data2, guid.Data3 = (
+                known.time_low, known.time_mid, known.time_hi_version,
+            )
+            guid.Data4[:] = known.bytes[8:]
+            out = ctypes.c_void_p()
+            hr = ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(guid), 0, None, ctypes.byref(out)
+            )
+            if hr == 0 and out.value:
+                documents = ctypes.wstring_at(out.value)
+                ctypes.windll.ole32.CoTaskMemFree(out)
+                return documents
+            if out.value:
+                ctypes.windll.ole32.CoTaskMemFree(out)
+        except Exception:
+            pass
+        profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        return os.path.join(profile, "Documents")
+    return os.path.join(os.path.expanduser("~"), "Documents")
 
 
 def settings_path() -> str:
@@ -701,20 +738,41 @@ def amount_in_words_ru(value) -> str:
 
 
 # ---------- Открытие файла в зависимости от ОС ----------
-def open_file(file_path):
+def open_file(file_path) -> bool:
+    """Открывает файл системным приложением и возвращает успех (п. 6.2).
+
+    Раньше результат не возвращался: тост «сохранён и открыт» показывался
+    даже когда открытие не удалось. Теперь вызывающий код честно сообщает
+    «сохранён» без ложного «открыт». Отсутствующий файл — сразу отказ
+    (xdg-open возвращает 0 даже для несуществующего пути).
+    """
+    if not file_path or not os.path.exists(file_path):
+        applog.get_logger("files").warning(
+            "Открытие отменено: файла нет на диске (%s)",
+            os.path.splitext(str(file_path or ""))[1].lower(),
+        )
+        ui.alert(
+            ROOT_HOLDER.get(), "Файл не найден",
+            f"Файл не найден на диске:\n{file_path or '—'}", "error",
+        )
+        return False
     try:
         if platform.system() == "Windows":
             os.startfile(file_path)  # noqa: S606
         elif platform.system() == "Darwin":
-            subprocess.run(["open", file_path], check=False)
+            if subprocess.run(["open", file_path], check=False).returncode != 0:
+                return False
         else:
-            subprocess.run(["xdg-open", file_path], check=False)
+            if subprocess.run(["xdg-open", file_path], check=False).returncode != 0:
+                return False
+        return True
     except Exception as e:
         applog.get_logger("files").warning(
             "Не удалось открыть файл (%s): %s",
             os.path.splitext(str(file_path))[1].lower(), type(e).__name__,
         )
         ui.alert(ROOT_HOLDER.get(), "Не удалось открыть файл", str(e), "error")
+        return False
 
 
 def show_in_folder(file_path: str) -> None:
@@ -1899,7 +1957,15 @@ class ContractApp:
     # ------------------------------------------------------------------ #
     def _place_window(self):
         self.root.update_idletasks()
-        area_x, area_y, area_w, area_h = ui.workarea()
+        area_x, area_y, area_w, area_h = ui.workarea(self.root)
+        # Минимальный размер не должен превышать рабочую область: иначе
+        # на экране 1366×768 с масштабом 150 % окно нельзя сузить (п. 6.3).
+        self._min_width = min(self._min_width, max(320, area_w))
+        self._min_height = min(self._min_height, max(240, area_h))
+        try:
+            self.root.minsize(self._min_width, self._min_height)
+        except Exception:
+            pass
         saved = self._settings.get("window") or {}
         try:
             width = int(saved.get("width", 0))
@@ -2060,7 +2126,12 @@ class ContractApp:
         )
         self._resize_handles = []
         for edge, cursor, color_key, place_kwargs, parent in specs:
-            handle = tk.Frame(parent, bg=ui.resolve(ui.COLORS[color_key]), cursor=cursor)
+            try:
+                handle = tk.Frame(parent, bg=ui.resolve(ui.COLORS[color_key]), cursor=cursor)
+            except tk.TclError:
+                # Минимальные X-серверы могут не иметь системных курсоров —
+                # окно остаётся работоспособным без курсоров растяжения.
+                handle = tk.Frame(parent, bg=ui.resolve(ui.COLORS[color_key]))
             handle.place(**place_kwargs)
             handle.bind("<ButtonPress-1>", lambda event, e=edge: self._resize_press(event, e))
             handle.bind("<B1-Motion>", lambda event, e=edge: self._resize_drag(event, e))
@@ -3783,13 +3854,18 @@ class ContractApp:
 
     # -- Печатная форма: сборка .docx напрямую из шаблонов ---------------- #
     def _default_documents_dir(self, interactive: bool = True) -> str:
-        """Папка документов по умолчанию (внутри профиля пользователя)."""
-        base = os.path.join(
-            os.environ.get("APPDATA") or os.path.expanduser("~"),
-            SETTINGS_DIR_NAME, "documents",
-        )
+        """Папка документов по умолчанию: «Документы/EW.DocHub» (п. 6.2).
+
+        Раньше по умолчанию использовался скрытый %APPDATA%\\DogovorGenerator\\documents:
+        пользователь не видел, где лежат его файлы. Теперь — видимая папка
+        «Документы», которая не исчезает при переустановке системы и попадает
+        в обычные резервные копии. Если «Документы» недоступны — возврат
+        к прежнему месту в профиле пользователя.
+        """
+        base = os.path.join(_user_documents_dir(), "EW.DocHub")
         try:
             os.makedirs(base, exist_ok=True)
+            return base
         except OSError as exc:
             self._log.error(
                 "Папка документов по умолчанию недоступна: %s", type(exc).__name__,
@@ -3802,6 +3878,14 @@ class ContractApp:
                     "Выберите другую папку в «Настройках» или проверьте права доступа.",
                     "error",
                 )
+        base = os.path.join(
+            os.environ.get("APPDATA") or os.path.expanduser("~"),
+            SETTINGS_DIR_NAME, "documents",
+        )
+        try:
+            os.makedirs(base, exist_ok=True)
+        except OSError:
+            pass
         return base
 
     def _resolve_unavailable_documents_dir(self, custom: str, exc: OSError) -> str:
@@ -4299,9 +4383,11 @@ class ContractApp:
             self._reset_form_baseline("contract")
             self.refresh_registry()
             self._update_status()
+            opened = open_file(path)
             self._notify(
                 f"Договор № {data[F.NUMBER]} от {date_text} для "
-                f"{storage.display_name(rec)} сохранён и открыт.",
+                f"{storage.display_name(rec)} сохранён"
+                + (" и открыт." if opened else "."),
                 path,
             )
         except Exception as exc:
@@ -4380,9 +4466,11 @@ class ContractApp:
             self._reset_form_baseline("additional")
             self.refresh_registry()
             self._update_status()
+            opened = open_file(path)
             self._notify(
                 f"Доп. соглашение № {number} к договору № {contract_number or 'б/н'} "
-                "сохранено и открыто.",
+                "сохранено"
+                + (" и открыто." if opened else "."),
                 path,
             )
         except Exception as exc:
@@ -4477,9 +4565,11 @@ class ContractApp:
             self._reset_form_baseline("spec")
             self.refresh_registry()
             self._update_status()
+            opened = open_file(path)
             self._notify(
                 f"Спецификация № {number} к договору № {contract_number or 'б/н'} "
-                "сохранена и открыта.",
+                "сохранена"
+                + (" и открыта." if opened else "."),
                 path,
             )
         except Exception as exc:

@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import sys
 import tempfile
+import time
+import zipfile
 
+import applog
 import dadata_client as dadata
+import single_instance
 
 # Настройки приложения и база данных (контрагенты/документы) читаются из APPDATA:
 # изолируем тест от реальных данных пользователя, чтобы результат был детерминированным.
@@ -143,6 +148,190 @@ check(_raw_db.get("schema_version") == storage.SCHEMA_VERSION,
 check(storage.is_deleted({"deleted_at": "2026-01-01T00:00:00"}),
       "корзина: запись с deleted_at считается удалённой")
 check(not storage.is_deleted({}), "корзина: запись без deleted_at активна")
+
+# ---------- 2.1 дополнительно: tmp с PID, повтор записи, защита версии ----------
+_appdata_p1 = os.environ["APPDATA"]
+os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "smoke_p1_storage")
+shutil.rmtree(storage.data_dir(), ignore_errors=True)
+os.makedirs(storage.data_dir(), exist_ok=True)
+_p1 = storage.DataStore()
+_p1.add_counterparty("ooo", {
+    "ИНН": "7709991111", "Сокращенное название компании": "ООО Первая",
+}, save=False)
+check(_p1.save(), "2.1: первая запись реестра успешна")
+_prev_snapshot = open(storage.db_path(), encoding="utf-8").read()
+
+_orig_replace = os.replace
+_replaces: list[tuple[str, str]] = []
+
+def _spy_replace(src, dst, *args, **kwargs):
+    _replaces.append((src, dst))
+    return _orig_replace(src, dst, *args, **kwargs)
+
+os.replace = _spy_replace
+check(_p1.save(), "2.1: запись под наблюдением os.replace")
+os.replace = _orig_replace
+_tmp_to_db = [src for src, dst in _replaces
+              if dst == storage.db_path() and str(os.getpid()) in src]
+check(bool(_tmp_to_db),
+      "2.1: tmp-файл уникален — имя содержит PID процесса")
+
+# Приёмка 2.1: сбой между записью tmp и replace не теряет предыдущую версию.
+def _broken_replace(src, dst, *args, **kwargs):
+    raise OSError(28, "нет места (имитация антивируса)")
+
+_p1.add_counterparty("ooo", {
+    "ИНН": "7718882222", "Сокращенное название компании": "ООО Вторая",
+}, save=False)
+_orig_sleep = time.sleep
+time.sleep = lambda _seconds: None  # ускоряем повторы записи
+os.replace = _broken_replace
+try:
+    check(_p1.save() is False, "2.1: сбой replace повторён 3 раза и возвращён False")
+finally:
+    os.replace = _orig_replace
+    time.sleep = _orig_sleep
+check(open(storage.db_path(), encoding="utf-8").read() == _prev_snapshot,
+      "2.1: при сбое replace предыдущая версия реестра не потеряна")
+check(bool(_p1.last_error), "2.1: причина сбоя доступна пользователю")
+
+# Временный сбой (файл занят сканером): запись повторами всё же проходит.
+_transients = {"left": 2}
+
+def _flaky_replace(src, dst, *args, **kwargs):
+    if (_transients["left"] > 0 and os.path.normcase(os.path.abspath(dst))
+            == os.path.normcase(os.path.abspath(storage.db_path()))):
+        _transients["left"] -= 1
+        raise OSError(13, "файл занят сканером")
+    return _orig_replace(src, dst, *args, **kwargs)
+
+time.sleep = lambda _seconds: None
+os.replace = _flaky_replace
+try:
+    check(_p1.save(), "2.1: повтор записи переживает 2 временных сбоя")
+finally:
+    os.replace = _orig_replace
+    time.sleep = _orig_sleep
+check(_transients["left"] == 0, "2.1: обе запасные попытки понадобились")
+check(os.path.exists(storage.db_path() + ".bak.1"),
+      "2.1: ротация хранит предыдущие версии .bak.1…4")
+check(not [n for n in os.listdir(storage.data_dir()) if n.endswith(".tmp")],
+      "2.1: временные файлы после записи не остаются")
+os.environ["APPDATA"] = _appdata_p1
+
+# ---------- Блокировка второго экземпляра (п. 2.2) ----------
+_lock = single_instance.InstanceLock()
+check(_lock.acquire(), "2.2: первый запуск захватывает блокировку")
+_lock.release()
+check(single_instance.InstanceLock().acquire(),
+      "2.2: после release блокировка снова свободна")
+check(bool(single_instance.MUTEX_NAME) and "EWDocHub" in single_instance.MUTEX_NAME,
+      "2.2: именованный mutex настроен")
+with open("main.py", encoding="utf-8") as _mf:
+    _main_src = _mf.read()
+check("if not lock.acquire()" in _main_src
+      and "single_instance.show_already_running" in _main_src,
+      "2.2: старт приложения gated захватом блокировки")
+
+# ---------- Логирование без реквизитов (п. 2.3) ----------
+_ewdochub_logger = logging.getLogger(applog.LOGGER_NAME)
+_saved_handlers = _ewdochub_logger.handlers[:]
+applog._configured = False
+for _handler in _saved_handlers:
+    _ewdochub_logger.removeHandler(_handler)
+os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "smoke_p1_log")
+shutil.rmtree(applog.log_dir(), ignore_errors=True)
+applog.setup_logging("1.4.0-smoke")
+try:
+    _log_store = storage.DataStore()
+    _log_party = _log_store.add_counterparty("ooo", {
+        "ИНН": "7701234567", "Расчётный счёт": "40702810123456789012",
+        "ФИО директора": "Иванов Иван Иванович",
+        "Сокращенное название компании": "ООО Ромашка",
+    }, save=False)
+    _log_doc = _log_store.add_document(
+        storage.KIND_CONTRACT, _log_party["id"], "516", "12.01.2026",
+        {"ИНН": "7701234567"},
+        text="Секретный текст договора поставки № 516", save=False,
+    )
+    check(_log_store.save(), "2.3: операции хранилища работают с включённым логом")
+    check(_log_store.trash_document(_log_doc["id"]), "2.3: событие корзины отработало")
+    with applog.timed("Запись документа", 0, "documents"):
+        pass  # порог 0 мс — «медленная» операция точно попадёт в лог
+    try:
+        with applog.timed("Опасная операция", 0, "documents"):
+            raise RuntimeError("имитация сбоя")
+    except RuntimeError:
+        pass
+    for _handler in _ewdochub_logger.handlers:
+        _handler.flush()
+    _log_text = open(applog.log_path(), encoding="utf-8").read()
+    check("Запуск EW.DocHub" in _log_text and "1.4.0-smoke" in _log_text,
+          "2.3: в логе есть старт и версия приложения")
+    check("Реестр записан" in _log_text and "перемещён в корзину" in _log_text,
+          "2.3: операции хранилища диагностируются по логу")
+    check("заняла" in _log_text, "2.3: длительные операции фиксируются (timed)")
+    check("прервана ошибкой" in _log_text,
+          "2.3: прерванная операция попадает в лог")
+    check(applog.MAX_BYTES >= 1024 * 1024 and applog.BACKUP_COUNT >= 3,
+          "2.3: ротация лога настроена (1+ МБ, 3+ копии)")
+    # Приёмка 2.3: в логе нет реквизитов, имён и текстов документов.
+    for _secret in ("7701234567", "40702810123456789012", "Иванов Иван Иванович",
+                    "ООО Ромашка", "Секретный текст договора поставки"):
+        check(_secret not in _log_text,
+              f"2.3: в логе нет реквизитов ({_secret[:14]}…)")
+    check(applog.redact("7701234567") == "77********",
+          "2.3: redact() маскирует значение для логов")
+finally:
+    for _handler in _ewdochub_logger.handlers[:]:
+        try:
+            _handler.close()
+        except Exception:
+            pass
+        _ewdochub_logger.removeHandler(_handler)
+    for _handler in _saved_handlers:
+        _ewdochub_logger.addHandler(_handler)
+    applog._configured = True
+    os.environ["APPDATA"] = _appdata_p1
+
+# ---------- Корзина: документы, файлы, просрочка (п. 2.5, 2.6) ----------
+os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "smoke_p1_trash")
+shutil.rmtree(storage.data_dir(), ignore_errors=True)
+os.makedirs(storage.data_dir(), exist_ok=True)
+_tstore = storage.DataStore()
+_tparty = _tstore.add_counterparty("ooo", {
+    "ИНН": "7719998888", "Сокращенное название компании": "ООО Корзина",
+}, save=False)
+_disk_doc = os.path.join(tempfile.gettempdir(), "smoke_p1_disk.docx")
+with open(_disk_doc, "wb") as _fh:
+    _fh.write(b"PK\x03\x04 stub")
+_tdoc = _tstore.add_document(
+    storage.KIND_CONTRACT, _tparty["id"], "7", "01.03.2026", {},
+    extra={"source_file": _disk_doc}, save=False,
+)
+check(_tstore.save(), "корзина: подготовка реестра выполнена")
+check(_tstore.trash_document(_tdoc["id"]), "2.6: документ перемещён в корзину")
+check(_tstore.get_document(_tdoc["id"]) is None and _tstore.trashed_documents(),
+      "2.6: удалённый документ неактивен, но доступен в корзине")
+check(os.path.exists(_disk_doc),
+      "2.5: перемещение в корзину не трогает файл на диске")
+check(_tstore.trash_document(_tdoc["id"]) is False,
+      "2.6: повторное перемещение в корзину отклонено")
+check(_tstore.restore_document(_tdoc["id"]), "2.6: документ восстановлен из корзины")
+check(_tstore.get_document(_tdoc["id"]) is not None,
+      "2.6: восстановленный документ снова активен")
+check(_tstore.restore_document(_tdoc["id"]) is False,
+      "2.6: восстановление активного документа отклонено")
+check(_tstore.trash_document(_tdoc["id"]), "2.6: документ снова в корзине")
+_tdoc["deleted_at"] = "2020-01-01T00:00:00"
+check(_tstore.cleanup_trash(retention_days=1) == 1,
+      "2.6: просроченная запись удаляется автоматически")
+check(_tstore.get_document(_tdoc["id"], include_deleted=True) is None,
+      "2.6: после автоочистки записи нет даже в корзине")
+check(os.path.exists(_disk_doc),
+      "2.6: автоочистка корзины не трогает файлы на диске")
+os.remove(_disk_doc)
+os.environ["APPDATA"] = _appdata_p1
 
 # ---------- Защита чтения реестра (п. 1.4) ----------
 _appdata_main = os.environ["APPDATA"]
@@ -408,6 +597,43 @@ if os.path.exists(_sample_additional):
           f"образец доп. соглашения: название без хвоста ({_sample_res['party']['display']!r})")
     check(not _sample_res["recognized"] and _sample_res["warning"],
           "образец доп. соглашения: карточка требует подтверждения (нет ИНН)")
+
+# ---------- Лимиты и защита парсера (п. 3.4) — реальная zip-бомба ----------
+_zb_path = os.path.join(tempfile.gettempdir(), "smoke_zipbomb.docx")
+with zipfile.ZipFile(_zb_path, "w", zipfile.ZIP_DEFLATED) as _zb:
+    _zb.writestr("word/document.xml", b"\0" * (30 * 1024 * 1024))
+_zb_bytes = os.path.getsize(_zb_path)
+try:
+    di.check_file_limits(_zb_path)
+    check(False, "3.4: реальная zip-бомба должна отклоняться")
+except ValueError as _exc:
+    check("сжат подозрительно сильно" in str(_exc).lower(),
+          f"3.4: zip-бомба {_zb_bytes} Б -> 30 МБ распаковки отклонена ({_exc})")
+
+_orig_member_limit = di.MAX_ZIP_MEMBERS
+di.MAX_ZIP_MEMBERS = 2
+try:
+    try:
+        di.check_file_limits(_import_docx)
+        check(False, "3.4: превышение числа частей должно отклоняться")
+    except ValueError as _exc:
+        check("част" in str(_exc).lower(),
+              "3.4: офисный архив с избытком частей отклонён")
+finally:
+    di.MAX_ZIP_MEMBERS = _orig_member_limit
+check(di.MAX_FILES_PER_BATCH > 0 and di.MAX_TOTAL_SIZE > 0,
+      "3.4: лимиты пакета импорта настроены")
+check("IMPORT_MAX_FILES" in _main_src and "IMPORT_MAX_TOTAL_SIZE" in _main_src
+      and "disk_usage" in _main_src,
+      "3.4: пакет импорта и свободное место проверяются в приложении")
+
+# ---------- Причины отказа импорта (п. 3.5) ----------
+_broken_office = os.path.join(tempfile.gettempdir(), "smoke_broken_office.docx")
+with open(_broken_office, "wb") as _fh:
+    _fh.write(b"this is definitely not a zip archive")
+_broken_res = di.analyze_file(_broken_office)
+check(not _broken_res["ok"] and "повреждён" in _broken_res["error"].lower(),
+      f"3.5: битый офисный файл — понятная причина ({_broken_res['error']})")
 
 check(store.find_by_name("ООО «Ромашка»") is not None,
       "хранилище: поиск контрагента по названию без учёта кавычек")
@@ -686,6 +912,202 @@ try:
           "таблица: Delete удаляет выделенную строку, нумерация сдвигается")
     check(str(app._spec_rows[0]["cells"]["name"].cget("state")) == "readonly",
           "таблица: ячейка доступна для правки только по двойному клику")
+
+    # ---------- P1: подтверждения, диалоги, защита данных (этапы 2–4) ----------
+
+    # 2.5: подтверждение удаления документа с описанием последствий.
+    _orig_confirm_stub = m.ui.confirm
+    _del_caps: list = []
+    m.ui.confirm = lambda *args, **kwargs: _del_caps.append(args) or False
+    try:
+        app._delete_document(app.store.documents[0])
+    finally:
+        m.ui.confirm = _orig_confirm_stub
+    _del_msg = str(_del_caps[-1]) if _del_caps else ""
+    check(bool(_del_caps), "2.5: удаление документа требует подтверждения")
+    check("Переместить документ в корзину" in _del_msg
+          and "Файл на диске останется" in _del_msg
+          and "№ 5" in _del_msg and "Ромашка" in _del_msg,
+          "2.5: в подтверждении тип, номер, контрагент и судьба файла")
+    check(not app.store.trashed_documents(),
+          "2.5: после «Отмена» документ не удаляется")
+
+    # 2.5: подтверждение удаления контрагента с перечнем документов.
+    _cp_caps: list = []
+    m.ui.confirm = lambda *args, **kwargs: _cp_caps.append(args) or False
+    try:
+        app._delete_counterparty(party_rec)
+    finally:
+        m.ui.confirm = _orig_confirm_stub
+    _cp_msg = str(_cp_caps[-1]) if _cp_caps else ""
+    check(bool(_cp_caps) and "Удалить контрагента" in _cp_msg,
+          "2.5: удаление контрагента требует подтверждения")
+    check("Договор поставки" in _cp_msg and "Файлы на диске останутся" in _cp_msg,
+          "2.5: в подтверждении перечень документов и судьба файлов")
+    check(not app.store.trashed_documents(),
+          "2.5: после «Отмена» ничего не удалено")
+
+    # 2.8: недоступная папка документов — явный выбор, а не молчаливая подмена.
+    _choice_caps: list = []
+    _orig_choice = app._choice_dialog
+    app._choice_dialog = lambda *args, **kwargs: _choice_caps.append(args) or "retry"
+    try:
+        app._resolve_unavailable_documents_dir(
+            os.path.join(tempfile.gettempdir(), "missing_docs_dir"),
+            OSError(2, "Нет такого каталога"),
+        )
+    finally:
+        app._choice_dialog = _orig_choice
+        app._docs_dir_retry_count = 0
+    check(bool(_choice_caps), "2.8: недоступная папка поднимает диалог")
+    _choice_text = str(_choice_caps[0]) if _choice_caps else ""
+    check("недоступна" in _choice_text.lower()
+          and "Повторить" in _choice_text and "Папка по умолчанию" in _choice_text,
+          "2.8: в диалоге варианты повторить / другая / по умолчанию")
+
+    # 2.9: утерянный оригинал импортированного документа не подменяется молча.
+    _lost_rec = {
+        "id": 555001, "kind": storage.KIND_CONTRACT, "party_id": party_rec["id"],
+        "number": "777", "date": "10.01.2026",
+        "data": dict(party_rec["fields"]),
+        "extra": {
+            "imported": True,
+            "source_file": os.path.join(tempfile.gettempdir(), "smoke_no_original.docx"),
+        },
+    }
+    _lost_caps: list = []
+    app._choice_dialog = lambda *args, **kwargs: _lost_caps.append(args) or "cancel"
+    _orig_show_folder = m.show_in_folder
+    m.show_in_folder = lambda path: OPENED.append(f"folder:{path}")
+    try:
+        app.export_document(_lost_rec)
+    finally:
+        app._choice_dialog = _orig_choice
+        m.show_in_folder = _orig_show_folder
+    check(bool(_lost_caps) and "Оригинал не найден" in str(_lost_caps[0][0]),
+          "2.9: утеря оригинала поднимает диалог")
+    check("Пересобрать из шаблона" in str(_lost_caps[0])
+          and "отличаться" in str(_lost_caps[0]),
+          "2.9: диалог предупреждает о неточности пересборки")
+    check(not OPENED,
+          "2.9: без выбора пользователя суррогат не создаётся")
+    OPENED.clear()
+
+    # 3.3: повторный импорт того же файла не плодит карточки.
+    _dup_copy = os.path.join(tempfile.gettempdir(), "smoke_p1_dup.docx")
+    with open(_dup_copy, "wb") as _fh:
+        _fh.write(b"PK\x03\x04 stub")
+    _dup_result = {
+        "name": "Договор ООО.docx", "kind": storage.KIND_CONTRACT,
+        "number": "888", "date": "10.01.2026",
+        "party": {
+            "recognized": True, "type": "ooo",
+            "display": "ООО «Ромашка-Импорт»",
+            "fields": {"ИНН": "2540123456",
+                       "Сокращенное название компании": "ООО «Ромашка-Импорт»"},
+            "missing": "",
+        },
+        "text": "", "ok": True, "recognized": True,
+        "copied": _dup_copy, "error": "", "warning": "",
+    }
+    _orig_report = app._show_import_report
+    app._show_import_report = lambda entries, summary: None
+    try:
+        app._finish_documents_import([dict(_dup_result)])
+        _dup_card = app.store.find_by_inn("2540123456")
+        check(_dup_card is not None, "3.3: карточка по ИНН создана автоматически")
+        _parties_after_first = len(app.store.counterparties)
+        app._finish_documents_import([dict(_dup_result)])
+        check(len(app.store.counterparties) == _parties_after_first,
+              "3.3: повторный импорт того же файла не плодит карточек")
+        check(app.store.find_by_inn("2540123456")["id"] == _dup_card["id"],
+              "3.3: документ привязан к существующей карточке")
+        app.store.purge_counterparty(_dup_card["id"])
+    finally:
+        app._show_import_report = _orig_report
+        try:
+            os.remove(_dup_copy)
+        except OSError:
+            pass
+
+    # 4.1: дубликаты контрагентов по ИНН и номеров документов.
+    # Создание карточки с чужим ИНН gated диалогом _cp_save (find_by_inn).
+    _dup_party = app.store.add_counterparty("ooo", {
+        "ИНН": "7701234567",
+        "Сокращенное название компании": "ООО Ромашка",
+    }, save=False)
+    check(any("ООО Ромашка" in base for base in app._party_duplicate_bases()),
+          "4.1: одинаковые карточки помечаются дубликатами в списках")
+    app.store.counterparties.remove(_dup_party)
+    _cp_src_start = _main_src.index("def _cp_save")
+    _cp_src = _main_src[_cp_src_start:_cp_src_start + 3000]
+    check("find_by_inn" in _cp_src and "Открыть существующего" in _cp_src,
+          "4.1: при создании карточки ИНН проверяется на дубликат")
+    check(app.store.find_by_inn("7701234567")["id"] == party_rec["id"],
+          "4.1: ИНН из формы найдёт существующую карточку")
+    _dupnum_caps: list = []
+    m.ui.confirm = lambda *args, **kwargs: _dupnum_caps.append(args) or False
+    try:
+        _dup_allowed = app._confirm_document_duplicate(
+            party_rec["id"], storage.KIND_CONTRACT, "5", "12.01.2026",
+        )
+    finally:
+        m.ui.confirm = _orig_confirm_stub
+    check(not _dup_allowed and bool(_dupnum_caps),
+          "4.1: повтор номера договора требует подтверждения")
+    check("уже есть" in str(_dupnum_caps[0]) and "№ 5" in str(_dupnum_caps[0]),
+          "4.1: в предупреждении назван существующий документ")
+    check(app._confirm_document_duplicate(
+        party_rec["id"], storage.KIND_CONTRACT, "555", "12.01.2026",
+    ), "4.1: новый номер не требует подтверждения")
+
+    # 4.2: единый «текущий контрагент» на всех страницах документов.
+    app._set_current_party(party_rec)
+    _expected_party = app._party_display(party_rec, app._party_duplicate_bases())
+    check(app._current_party_id == party_rec["id"],
+          "4.2: текущий контрагент запомнен")
+    for _attr in ("contract_party_var", "addl_party_var", "spec_party_var"):
+        check(getattr(app, _attr).get() == _expected_party,
+              f"4.2: выбор перенесён на {_attr}")
+    app.contract_party_var.set("Несуществующий контрагент XYZ")
+    app._refresh_party_combo_values()
+    check(app.contract_party_var.get() == "",
+          "4.2: устаревшее имя в поле выбора сбрасывается")
+
+    # 4.3: предпросмотр только для чтения — UI не обещает правок.
+    check(str(app.contract_preview.cget("state")) == "disabled"
+          and str(app.addl_preview.cget("state")) == "disabled"
+          and str(app.spec_text.cget("state")) == "disabled",
+          "4.3: предпросмотр только для чтения")
+
+    # 4.4: защита несохранённых данных.
+    check("contract" not in app._dirty_pages(),
+          "4.4: сохранённая форма не считается изменённой")
+    app.contract_number_var.set("999")
+    check("contract" in app._dirty_pages(),
+          "4.4: изменение формы фиксируется как несохранённое")
+    _close_caps: list = []
+    m.ui.confirm = lambda *args, **kwargs: _close_caps.append(args) or False
+    try:
+        app.close()
+    finally:
+        m.ui.confirm = _orig_confirm_stub
+    check(bool(_close_caps)
+          and "несохранённые изменения" in str(_close_caps[0]).lower(),
+          "4.4: при закрытии с изменениями запрашивается подтверждение")
+    check(app.root.winfo_exists(), "4.4: после «Остаться» окно живо")
+    app.contract_number_var.set("5")
+    check("contract" not in app._dirty_pages(),
+          "4.4: возврат значений возвращает форме сохранённое состояние")
+
+    # 4.5: быстрые UX-правки.
+    check("<Control-s>" in _main_src, "4.5: Ctrl+S привязан к сохранению")
+    check(hasattr(app, "toast"), "4.5: немодальное уведомление об успехе есть")
+    _no_contacts = {key: value for key, value in party_rec["fields"].items()
+                    if key not in (m.F.EMAIL, m.F.PHONE)}
+    _contact_errors = m.validate_party_fields(_no_contacts, is_ip=False)
+    check("Email" not in _contact_errors and "Телефон" not in _contact_errors,
+          "4.5: email и телефон необязательны")
 
     # Реестр.
     app._select_page("registry")

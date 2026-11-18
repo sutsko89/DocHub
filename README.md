@@ -90,7 +90,8 @@ pyinstaller --noconfirm EWDochub.spec
 | `dogovor_template_ip.docx` | Шаблон договора для ИП |
 | `additional_agreement.docx` | Шаблон доп. соглашения для юр. лица |
 | `additional_agreement_ip.docx` | Шаблон доп. соглашения для ИП |
-| `spec_template.docx` | Шаблон спецификации |
+| `spec_template.docx` | Шаблон спецификации (юр. лицо) |
+| `spec_template_ip.docx` | Шаблон спецификации для ИП (ОГРНИП, без КПП) |
 | `EWDochub.spec` | Сборка `EW.DocHub.exe` через PyInstaller |
 | `installer.iss` | Сборка установщика `install.exe` через Inno Setup |
 | `smoke_test.py` | Быстрая проверка интерфейса и логики без ручного запуска |

@@ -598,6 +598,43 @@ if os.path.exists(_sample_additional):
     check(not _sample_res["recognized"] and _sample_res["warning"],
           "образец доп. соглашения: карточка требует подтверждения (нет ИНН)")
 
+# ---------- Лимиты и защита парсера (п. 3.4) — реальная zip-бомба ----------
+_zb_path = os.path.join(tempfile.gettempdir(), "smoke_zipbomb.docx")
+with zipfile.ZipFile(_zb_path, "w", zipfile.ZIP_DEFLATED) as _zb:
+    _zb.writestr("word/document.xml", b"\0" * (30 * 1024 * 1024))
+_zb_bytes = os.path.getsize(_zb_path)
+try:
+    di.check_file_limits(_zb_path)
+    check(False, "3.4: реальная zip-бомба должна отклоняться")
+except ValueError as _exc:
+    check("сжат подозрительно сильно" in str(_exc).lower(),
+          f"3.4: zip-бомба {_zb_bytes} Б -> 30 МБ распаковки отклонена ({_exc})")
+
+_orig_member_limit = di.MAX_ZIP_MEMBERS
+di.MAX_ZIP_MEMBERS = 2
+try:
+    try:
+        di.check_file_limits(_import_docx)
+        check(False, "3.4: превышение числа частей должно отклоняться")
+    except ValueError as _exc:
+        check("част" in str(_exc).lower(),
+              "3.4: офисный архив с избытком частей отклонён")
+finally:
+    di.MAX_ZIP_MEMBERS = _orig_member_limit
+check(di.MAX_FILES_PER_BATCH > 0 and di.MAX_TOTAL_SIZE > 0,
+      "3.4: лимиты пакета импорта настроены")
+check("IMPORT_MAX_FILES" in _main_src and "IMPORT_MAX_TOTAL_SIZE" in _main_src
+      and "disk_usage" in _main_src,
+      "3.4: пакет импорта и свободное место проверяются в приложении")
+
+# ---------- Причины отказа импорта (п. 3.5) ----------
+_broken_office = os.path.join(tempfile.gettempdir(), "smoke_broken_office.docx")
+with open(_broken_office, "wb") as _fh:
+    _fh.write(b"this is definitely not a zip archive")
+_broken_res = di.analyze_file(_broken_office)
+check(not _broken_res["ok"] and "повреждён" in _broken_res["error"].lower(),
+      f"3.5: битый офисный файл — понятная причина ({_broken_res['error']})")
+
 check(store.find_by_name("ООО «Ромашка»") is not None,
       "хранилище: поиск контрагента по названию без учёта кавычек")
 check(store.find_by_name("нет такого") is None,

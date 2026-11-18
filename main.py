@@ -1312,8 +1312,12 @@ class SpecTable(ctk.CTkFrame):
             row["cells"][key] = entry
 
         self._rows.append(row)
-        self._apply_theme()
-        self._schedule_height_update()
+        # П. 5.4: стилизуем только новую строку. Раньше _apply_theme()
+        # перестилизовывала ВСЕ строки на каждое добавление — задание
+        # 500 строк было O(n²) и блокировало интерфейс.
+        if not self._batch:
+            self._style_row(index)
+            self._schedule_height_update()
         return row
 
     # -- Высота тела таблицы ------------------------------------------------ #
@@ -1354,9 +1358,13 @@ class SpecTable(ctk.CTkFrame):
         """Одинарный клик: выделить строку (правка — только по двойному клику)."""
         if event is not None:
             index = self._row_of_widget(event.widget)
-            if index is not None:
+            if index is not None and index != self._selected_row:
+                previous = self._selected_row
                 self._selected_row = index
-                self._apply_theme()
+                # Стилизуем только прежнюю и новую строку, а не всю таблицу (п. 5.4).
+                if previous is not None:
+                    self._style_row(previous)
+                self._style_row(index)
         return None
 
     def _begin_edit(self, event):
@@ -1432,6 +1440,8 @@ class SpecTable(ctk.CTkFrame):
                 self._destroy_row(len(self._rows) - 1)
         finally:
             self._batch = False
+        self._apply_theme()
+        self._schedule_height_update()
         self._selected_row = None
         self._renumber()
         self._count_var.set(str(count))
@@ -1502,6 +1512,8 @@ class SpecTable(ctk.CTkFrame):
             self._batch = False
         self._selected_row = None
         self._renumber()
+        self._apply_theme()
+        self._schedule_height_update()
         self._notify()
         return True
 
@@ -1538,6 +1550,8 @@ class SpecTable(ctk.CTkFrame):
             self._destroy_row(len(self._rows) - 1)
         for _ in range(self.MIN_ROWS):
             self._add_row()
+        self._apply_theme()
+        self._schedule_height_update()
 
     # -- Данные ------------------------------------------------------------ #
     def get_items(self) -> list[dict]:
@@ -1725,12 +1739,36 @@ class SpecTable(ctk.CTkFrame):
             except Exception:
                 pass
 
-    def _apply_theme(self):
-        header_bg = ui.resolve(ui.COLORS["chrome"])
+    def _style_row(self, index: int) -> None:
+        """Стилизует одну строку (фон, рамки, цвета) с учётом выделения."""
         border = ui.resolve(ui.COLORS["entry_border"])
         accent = ui.resolve(ui.COLORS["accent"])
         base_bg = ui.resolve(ui.COLORS["entry_bg"])
         selected_bg = ui.resolve(ui.COLORS["sidebar_active"])
+        bg = selected_bg if index == self._selected_row else base_bg
+        row = self._rows[index]
+        try:
+            row["num"].configure(
+                bg=bg,
+                fg=ui.resolve(ui.COLORS["text_tertiary"]),
+            )
+        except Exception:
+            pass
+        for entry in row["cells"].values():
+            try:
+                entry.configure(
+                    bg=bg,
+                    readonlybackground=bg,
+                    fg=ui.resolve(ui.COLORS["text"]),
+                    insertbackground=ui.resolve(ui.COLORS["text"]),
+                    highlightbackground=border,
+                    highlightcolor=accent,
+                )
+            except Exception:
+                pass
+
+    def _apply_theme(self):
+        header_bg = ui.resolve(ui.COLORS["chrome"])
         for cell in self._header_cells:
             try:
                 cell.configure(bg=header_bg)
@@ -1741,27 +1779,8 @@ class SpecTable(ctk.CTkFrame):
                 label.configure(bg=header_bg, fg=ui.resolve(ui.COLORS["text_secondary"]))
             except Exception:
                 pass
-        for i, row in enumerate(self._rows):
-            bg = selected_bg if i == self._selected_row else base_bg
-            try:
-                row["num"].configure(
-                    bg=bg,
-                    fg=ui.resolve(ui.COLORS["text_tertiary"]),
-                )
-            except Exception:
-                pass
-            for entry in row["cells"].values():
-                try:
-                    entry.configure(
-                        bg=bg,
-                        readonlybackground=bg,
-                        fg=ui.resolve(ui.COLORS["text"]),
-                        insertbackground=ui.resolve(ui.COLORS["text"]),
-                        highlightbackground=border,
-                        highlightcolor=accent,
-                    )
-                except Exception:
-                    pass
+        for index in range(len(self._rows)):
+            self._style_row(index)
 
 
 class ContractApp:
@@ -3037,7 +3056,9 @@ class ContractApp:
         self._registry_rows: dict = {}
         self._registry_docs_row = 1
         self._registry_docs_frame = None
-        self.refresh_registry()
+        # Ленивый рендер (п. 9 этапа 5): при старте список не рисуется —
+        # реестр отрисуется при первом открытии страницы или при изменениях.
+        self._registry_rendered = False
 
     # -- Реестр: список контрагентов и документы выбранного -------------- #
     def _registry_parties(self) -> list[dict]:
@@ -3159,6 +3180,7 @@ class ContractApp:
         """
         with applog.timed("Перерисовка реестра", 500, "ui"):
             self._refresh_registry_full()
+        self._registry_rendered = True
 
     def _refresh_registry_full(self):
         for child in self.registry_list.winfo_children():

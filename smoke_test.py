@@ -671,10 +671,40 @@ check(store.find_by_name("ООО «Ромашка»") is not None,
 check(store.find_by_name("нет такого") is None,
       "хранилище: поиск по названию не находит лишнего")
 
+# ---------- п.10/5.1: производительность реестра на 600 контрагентах ----------
+_perf_dir = tempfile.mkdtemp(prefix="smoke_perf_")
+_appdata_perf_backup = os.environ["APPDATA"]
+os.environ["APPDATA"] = _perf_dir
+try:
+    _t0 = time.perf_counter()
+    _perf_store = storage.DataStore()
+    for _i in range(600):
+        _perf_store.add_counterparty("ooo", {
+            "ИНН": f"7701{_i:06d}",
+            "Сокращенное название компании": f"ООО Нагрузка-{_i}",
+        }, save=False)
+    _perf_store.save()
+    _t1 = time.perf_counter()
+    _perf_store = storage.DataStore()
+    _t2 = time.perf_counter()
+    check(len(_perf_store.counterparties) == 600,
+          "п.10: реестр на 600 контрагентов загружается целиком")
+    check((_t1 - _t0) < 5.0,
+          f"п.10: запись 600 контрагентов одним save() заняла {(_t1 - _t0):.2f} с (<5 с)")
+    check((_t2 - _t1) < 5.0,
+          f"п.10: загрузка 600 контрагентов заняла {(_t2 - _t1):.2f} с (<5 с)")
+finally:
+    os.environ["APPDATA"] = _appdata_perf_backup
+    shutil.rmtree(_perf_dir, ignore_errors=True)
+
 # ---------- Интерфейс ----------
 app = m.ContractApp()
 try:
     app.root.update_idletasks()
+
+    # п.9: при старте реестр не отрисовывается — ленивый рендер.
+    check(getattr(app, "_registry_rendered", True) is False,
+          "п.9: при старте реестр не отрисовывается (ленивый рендер)")
 
     check(hasattr(app, "nav_holder") and len(app.nav_items) == 6,
           "кнопки разделов в шапке, включая «Настройки»")
@@ -957,6 +987,39 @@ try:
     app.root.update()
     check(len(app._spec_rows) == 6, "таблица: количество строк применяется по Enter")
 
+    # 5.4: массовое задание строк больше не O(n²) — 500 строк создаются быстро.
+    _t0 = time.perf_counter()
+    app.spec_table.set_row_count(500)
+    _elapsed = time.perf_counter() - _t0
+    check(len(app._spec_rows) == 500, "5.4: таблица задаёт 500 строк")
+    check(_elapsed < 10.0,
+          f"5.4: 500 строк создаются без O(n²) за {_elapsed:.1f} с (<10 с)")
+    check(str(app._spec_rows[0]["cells"]["name"].cget("readonlybackground")) != "",
+          "5.4: после массового задания строк все строки стилизованы")
+
+    # 5.4: комбобокс ограничивает число пунктов, подсветка движется точечно.
+    _combo = m.ui.ComboField(app.root, values=["— выберите —"])
+    _many = [f"Вариант {_i:03d}" for _i in range(300)]
+    _popup = m.ui._ComboPopup(_combo, _many, _combo._pick)
+    check(len(_popup._rows) == m.ui._ComboPopup.MAX_ITEMS,
+          "5.4: в выпадающем списке не больше 100 пунктов")
+    check(_popup._truncated, "5.4: длинный список помечен как обрезанный")
+    _popup._set_index(0)
+    _hover_bg = _popup._rows[0].cget("bg")
+    _normal_bg = _popup._rows[7].cget("bg")
+    check(_hover_bg != _normal_bg, "5.4: активная строка подсвечивается")
+    _popup._set_index(5)
+    check(_popup._rows[0].cget("bg") == _normal_bg
+          and _popup._rows[5].cget("bg") == _hover_bg,
+          "5.4: подсветка переставляется точечно, не перескрашивая список")
+    _popup._confirm(5)
+    check(_combo.get() == _many[5], "5.4: выбор из обрезанного списка работает")
+    try:
+        _popup.close()
+    except Exception:
+        pass
+    _combo.destroy()
+
     # Выделение строки и удаление по Delete.
     app.spec_table.set_row_count(4)
     app.spec_table._selected_row = 1
@@ -1217,6 +1280,8 @@ try:
     # Реестр.
     app._select_page("registry")
     app.root.update()
+    check(app._registry_rendered is True,
+          "п.9: реестр отрисован при первом открытии страницы")
     check(app.current_page == "registry" and not app.save_button.winfo_manager(),
           "кнопка сохранения скрыта на реестре")
     texts = []

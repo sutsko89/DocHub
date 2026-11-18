@@ -1171,6 +1171,7 @@ class _ComboPopup(tk.Toplevel):
 
     ROW_H = 26
     MAX_VISIBLE = 8
+    MAX_ITEMS = 100  # выше — список обрезается с подсказкой (п. 5.4)
 
     def __init__(self, combo: "ComboField", values: Sequence[str], on_pick: Callable[[str], None]):
         super().__init__(combo)
@@ -1178,11 +1179,13 @@ class _ComboPopup(tk.Toplevel):
         self.overrideredirect(True)
         self._combo = combo
         self._values = [str(v) for v in values]
+        self._shown = self._values[:self.MAX_ITEMS]
+        self._truncated = len(self._values) > len(self._shown)
         self._on_pick = on_pick
         self._index = -1
 
         selected = combo.get()
-        self._selected_index = self._values.index(selected) if selected in self._values else -1
+        self._selected_index = self._shown.index(selected) if selected in self._shown else -1
 
         self._frame = tk.Frame(
             self, bg=resolve(COLORS["card"]),
@@ -1207,10 +1210,11 @@ class _ComboPopup(tk.Toplevel):
         )
 
         self._rows: list[tk.Label] = []
-        for index, value in enumerate(self._values):
+        for index, value in enumerate(self._shown):
             row = tk.Label(
                 self._inner, text=value, anchor="w", justify="left",
                 padx=px(11), pady=px(4), font=font(12),
+                bg=resolve(COLORS["card"]), fg=resolve(COLORS["text"]),
             )
             row.pack(fill="x")
             row.bind("<Enter>", lambda _e, i=index: self._set_index(i))
@@ -1220,6 +1224,16 @@ class _ComboPopup(tk.Toplevel):
                 lambda _e, i=index: self._confirm(i),
             )
             self._rows.append(row)
+
+        if self._truncated:
+            tk.Label(
+                self._inner,
+                text=f"Показаны первые {len(self._shown)} из {len(self._values)}. "
+                     "Используйте поиск по ИНН или реестр.",
+                anchor="w", justify="left", padx=px(11), pady=px(6),
+                font=font(11), fg=resolve(COLORS["text_tertiary"]),
+                bg=resolve(COLORS["card"]), wraplength=px(300),
+            ).pack(fill="x")
 
         # Колесо мыши и клавиатура
         for widget in (self, self._frame, self._canvas, self._inner, *self._rows):
@@ -1236,18 +1250,28 @@ class _ComboPopup(tk.Toplevel):
 
     # -- внешний вид ------------------------------------------------------ #
     def _set_index(self, index: int) -> None:
+        """Подсвечивает только прежнюю и новую строку — O(1) на движение (п. 5.4)."""
+        previous = self._index
         self._index = index
-        for i, row in enumerate(self._rows):
-            if i == index:
-                row.configure(
-                    bg=resolve(COLORS["accent"]), fg=resolve(COLORS["on_accent"]),
-                    font=font(12, "bold"),
-                )
-            else:
-                row.configure(
-                    bg=resolve(COLORS["card"]), fg=resolve(COLORS["text"]),
-                    font=font(12, "bold" if i == self._selected_index else "normal"),
-                )
+        if previous == index:
+            return
+        if 0 <= previous < len(self._rows):
+            self._style_row(previous)
+        if 0 <= index < len(self._rows):
+            self._style_row(index)
+
+    def _style_row(self, index: int) -> None:
+        row = self._rows[index]
+        if index == self._index:
+            row.configure(
+                bg=resolve(COLORS["accent"]), fg=resolve(COLORS["on_accent"]),
+                font=font(12, "bold"),
+            )
+        else:
+            row.configure(
+                bg=resolve(COLORS["card"]), fg=resolve(COLORS["text"]),
+                font=font(12, "bold" if index == self._selected_index else "normal"),
+            )
 
     # -- события ---------------------------------------------------------- #
     def _on_wheel(self, event) -> None:
@@ -1279,8 +1303,8 @@ class _ComboPopup(tk.Toplevel):
         return "break"
 
     def _confirm(self, index: int) -> None:
-        if 0 <= index < len(self._values):
-            self._on_pick(self._values[index])
+        if 0 <= index < len(self._shown):
+            self._on_pick(self._shown[index])
         self.close()
 
     def _ensure_visible(self, index: int) -> None:
@@ -1316,7 +1340,7 @@ class _ComboPopup(tk.Toplevel):
         import tkinter.font as tkfont
 
         text_font = tkfont.Font(font=font(12))
-        text_w = max((text_font.measure(v) for v in self._values), default=0)
+        text_w = max((text_font.measure(v) for v in self._shown), default=0)
         wa = workarea()
         width = min(max(combo.winfo_width(), text_w + px(34)), px(520), wa[2])
 

@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import sys
 import tempfile
+import time
+import zipfile
 
+import applog
 import dadata_client as dadata
+import single_instance
 
 # Настройки приложения и база данных (контрагенты/документы) читаются из APPDATA:
 # изолируем тест от реальных данных пользователя, чтобы результат был детерминированным.
@@ -143,6 +148,190 @@ check(_raw_db.get("schema_version") == storage.SCHEMA_VERSION,
 check(storage.is_deleted({"deleted_at": "2026-01-01T00:00:00"}),
       "корзина: запись с deleted_at считается удалённой")
 check(not storage.is_deleted({}), "корзина: запись без deleted_at активна")
+
+# ---------- 2.1 дополнительно: tmp с PID, повтор записи, защита версии ----------
+_appdata_p1 = os.environ["APPDATA"]
+os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "smoke_p1_storage")
+shutil.rmtree(storage.data_dir(), ignore_errors=True)
+os.makedirs(storage.data_dir(), exist_ok=True)
+_p1 = storage.DataStore()
+_p1.add_counterparty("ooo", {
+    "ИНН": "7709991111", "Сокращенное название компании": "ООО Первая",
+}, save=False)
+check(_p1.save(), "2.1: первая запись реестра успешна")
+_prev_snapshot = open(storage.db_path(), encoding="utf-8").read()
+
+_orig_replace = os.replace
+_replaces: list[tuple[str, str]] = []
+
+def _spy_replace(src, dst, *args, **kwargs):
+    _replaces.append((src, dst))
+    return _orig_replace(src, dst, *args, **kwargs)
+
+os.replace = _spy_replace
+check(_p1.save(), "2.1: запись под наблюдением os.replace")
+os.replace = _orig_replace
+_tmp_to_db = [src for src, dst in _replaces
+              if dst == storage.db_path() and str(os.getpid()) in src]
+check(bool(_tmp_to_db),
+      "2.1: tmp-файл уникален — имя содержит PID процесса")
+
+# Приёмка 2.1: сбой между записью tmp и replace не теряет предыдущую версию.
+def _broken_replace(src, dst, *args, **kwargs):
+    raise OSError(28, "нет места (имитация антивируса)")
+
+_p1.add_counterparty("ooo", {
+    "ИНН": "7718882222", "Сокращенное название компании": "ООО Вторая",
+}, save=False)
+_orig_sleep = time.sleep
+time.sleep = lambda _seconds: None  # ускоряем повторы записи
+os.replace = _broken_replace
+try:
+    check(_p1.save() is False, "2.1: сбой replace повторён 3 раза и возвращён False")
+finally:
+    os.replace = _orig_replace
+    time.sleep = _orig_sleep
+check(open(storage.db_path(), encoding="utf-8").read() == _prev_snapshot,
+      "2.1: при сбое replace предыдущая версия реестра не потеряна")
+check(bool(_p1.last_error), "2.1: причина сбоя доступна пользователю")
+
+# Временный сбой (файл занят сканером): запись повторами всё же проходит.
+_transients = {"left": 2}
+
+def _flaky_replace(src, dst, *args, **kwargs):
+    if (_transients["left"] > 0 and os.path.normcase(os.path.abspath(dst))
+            == os.path.normcase(os.path.abspath(storage.db_path()))):
+        _transients["left"] -= 1
+        raise OSError(13, "файл занят сканером")
+    return _orig_replace(src, dst, *args, **kwargs)
+
+time.sleep = lambda _seconds: None
+os.replace = _flaky_replace
+try:
+    check(_p1.save(), "2.1: повтор записи переживает 2 временных сбоя")
+finally:
+    os.replace = _orig_replace
+    time.sleep = _orig_sleep
+check(_transients["left"] == 0, "2.1: обе запасные попытки понадобились")
+check(os.path.exists(storage.db_path() + ".bak.1"),
+      "2.1: ротация хранит предыдущие версии .bak.1…4")
+check(not [n for n in os.listdir(storage.data_dir()) if n.endswith(".tmp")],
+      "2.1: временные файлы после записи не остаются")
+os.environ["APPDATA"] = _appdata_p1
+
+# ---------- Блокировка второго экземпляра (п. 2.2) ----------
+_lock = single_instance.InstanceLock()
+check(_lock.acquire(), "2.2: первый запуск захватывает блокировку")
+_lock.release()
+check(single_instance.InstanceLock().acquire(),
+      "2.2: после release блокировка снова свободна")
+check(bool(single_instance.MUTEX_NAME) and "EWDocHub" in single_instance.MUTEX_NAME,
+      "2.2: именованный mutex настроен")
+with open("main.py", encoding="utf-8") as _mf:
+    _main_src = _mf.read()
+check("if not lock.acquire()" in _main_src
+      and "single_instance.show_already_running" in _main_src,
+      "2.2: старт приложения gated захватом блокировки")
+
+# ---------- Логирование без реквизитов (п. 2.3) ----------
+_ewdochub_logger = logging.getLogger(applog.LOGGER_NAME)
+_saved_handlers = _ewdochub_logger.handlers[:]
+applog._configured = False
+for _handler in _saved_handlers:
+    _ewdochub_logger.removeHandler(_handler)
+os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "smoke_p1_log")
+shutil.rmtree(applog.log_dir(), ignore_errors=True)
+applog.setup_logging("1.4.0-smoke")
+try:
+    _log_store = storage.DataStore()
+    _log_party = _log_store.add_counterparty("ooo", {
+        "ИНН": "7701234567", "Расчётный счёт": "40702810123456789012",
+        "ФИО директора": "Иванов Иван Иванович",
+        "Сокращенное название компании": "ООО Ромашка",
+    }, save=False)
+    _log_doc = _log_store.add_document(
+        storage.KIND_CONTRACT, _log_party["id"], "516", "12.01.2026",
+        {"ИНН": "7701234567"},
+        text="Секретный текст договора поставки № 516", save=False,
+    )
+    check(_log_store.save(), "2.3: операции хранилища работают с включённым логом")
+    check(_log_store.trash_document(_log_doc["id"]), "2.3: событие корзины отработало")
+    with applog.timed("Запись документа", 0, "documents"):
+        pass  # порог 0 мс — «медленная» операция точно попадёт в лог
+    try:
+        with applog.timed("Опасная операция", 0, "documents"):
+            raise RuntimeError("имитация сбоя")
+    except RuntimeError:
+        pass
+    for _handler in _ewdochub_logger.handlers:
+        _handler.flush()
+    _log_text = open(applog.log_path(), encoding="utf-8").read()
+    check("Запуск EW.DocHub" in _log_text and "1.4.0-smoke" in _log_text,
+          "2.3: в логе есть старт и версия приложения")
+    check("Реестр записан" in _log_text and "перемещён в корзину" in _log_text,
+          "2.3: операции хранилища диагностируются по логу")
+    check("заняла" in _log_text, "2.3: длительные операции фиксируются (timed)")
+    check("прервана ошибкой" in _log_text,
+          "2.3: прерванная операция попадает в лог")
+    check(applog.MAX_BYTES >= 1024 * 1024 and applog.BACKUP_COUNT >= 3,
+          "2.3: ротация лога настроена (1+ МБ, 3+ копии)")
+    # Приёмка 2.3: в логе нет реквизитов, имён и текстов документов.
+    for _secret in ("7701234567", "40702810123456789012", "Иванов Иван Иванович",
+                    "ООО Ромашка", "Секретный текст договора поставки"):
+        check(_secret not in _log_text,
+              f"2.3: в логе нет реквизитов ({_secret[:14]}…)")
+    check(applog.redact("7701234567") == "77********",
+          "2.3: redact() маскирует значение для логов")
+finally:
+    for _handler in _ewdochub_logger.handlers[:]:
+        try:
+            _handler.close()
+        except Exception:
+            pass
+        _ewdochub_logger.removeHandler(_handler)
+    for _handler in _saved_handlers:
+        _ewdochub_logger.addHandler(_handler)
+    applog._configured = True
+    os.environ["APPDATA"] = _appdata_p1
+
+# ---------- Корзина: документы, файлы, просрочка (п. 2.5, 2.6) ----------
+os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "smoke_p1_trash")
+shutil.rmtree(storage.data_dir(), ignore_errors=True)
+os.makedirs(storage.data_dir(), exist_ok=True)
+_tstore = storage.DataStore()
+_tparty = _tstore.add_counterparty("ooo", {
+    "ИНН": "7719998888", "Сокращенное название компании": "ООО Корзина",
+}, save=False)
+_disk_doc = os.path.join(tempfile.gettempdir(), "smoke_p1_disk.docx")
+with open(_disk_doc, "wb") as _fh:
+    _fh.write(b"PK\x03\x04 stub")
+_tdoc = _tstore.add_document(
+    storage.KIND_CONTRACT, _tparty["id"], "7", "01.03.2026", {},
+    extra={"source_file": _disk_doc}, save=False,
+)
+check(_tstore.save(), "корзина: подготовка реестра выполнена")
+check(_tstore.trash_document(_tdoc["id"]), "2.6: документ перемещён в корзину")
+check(_tstore.get_document(_tdoc["id"]) is None and _tstore.trashed_documents(),
+      "2.6: удалённый документ неактивен, но доступен в корзине")
+check(os.path.exists(_disk_doc),
+      "2.5: перемещение в корзину не трогает файл на диске")
+check(_tstore.trash_document(_tdoc["id"]) is False,
+      "2.6: повторное перемещение в корзину отклонено")
+check(_tstore.restore_document(_tdoc["id"]), "2.6: документ восстановлен из корзины")
+check(_tstore.get_document(_tdoc["id"]) is not None,
+      "2.6: восстановленный документ снова активен")
+check(_tstore.restore_document(_tdoc["id"]) is False,
+      "2.6: восстановление активного документа отклонено")
+check(_tstore.trash_document(_tdoc["id"]), "2.6: документ снова в корзине")
+_tdoc["deleted_at"] = "2020-01-01T00:00:00"
+check(_tstore.cleanup_trash(retention_days=1) == 1,
+      "2.6: просроченная запись удаляется автоматически")
+check(_tstore.get_document(_tdoc["id"], include_deleted=True) is None,
+      "2.6: после автоочистки записи нет даже в корзине")
+check(os.path.exists(_disk_doc),
+      "2.6: автоочистка корзины не трогает файлы на диске")
+os.remove(_disk_doc)
+os.environ["APPDATA"] = _appdata_p1
 
 # ---------- Защита чтения реестра (п. 1.4) ----------
 _appdata_main = os.environ["APPDATA"]

@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import sys
 import tempfile
+
+import dadata_client as dadata
 
 # Настройки приложения и база данных (контрагенты/документы) читаются из APPDATA:
 # изолируем тест от реальных данных пользователя, чтобы результат был детерминированным.
@@ -63,15 +67,53 @@ check(m.validate_party_fields({
     "ФИО директора": "Иванов И.И.",
 }, is_ip=False) == {}, "валидация контрагента: валидные данные")
 
+# ---------- DaData: ключ только через настройки (п. 1.3) ----------
+# Ключ мог остаться в песочнице от прошлого прогона — чистим для детерминизма.
+for _stale_key in (dadata.key_storage_path(), dadata.legacy_key_storage_path()):
+    try:
+        os.remove(_stale_key)
+    except OSError:
+        pass
+check(dadata.get_api_key() == "", "dadata: без сохранённого ключа get_api_key пуст")
+check(not dadata.save_api_key(""), "dadata: пустой ключ не сохраняется")
+check(not dadata.save_api_key("ключ с пробелом"), "dadata: ключ с пробелом отклонён")
+check(dadata.save_api_key("smoke-test-key"), "dadata: ключ сохранён")
+check(dadata.get_api_key() == "smoke-test-key", "dadata: сохранённый ключ читается")
+
+# Миграция ключа из прежнего расположения (DogovorPostavki).
+_appdata_backup = os.environ["APPDATA"]
+os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "smoke_dadata_legacy")
+os.makedirs(os.path.dirname(dadata.legacy_key_storage_path()), exist_ok=True)
+with open(dadata.legacy_key_storage_path(), "w", encoding="utf-8") as _kf:
+    _kf.write("legacy-key-123")
+check(dadata.get_api_key() == "legacy-key-123",
+      "dadata: ключ из прежнего расположения подхвачен")
+check(dadata.clear_api_key(), "dadata: ключ удаляется")
+check(dadata.get_api_key() == "", "dadata: после удаления ключа get_api_key пуст")
+os.environ["APPDATA"] = _appdata_backup
+
+# В исходнике нет вшитых ключей: присваивания строковых литералов запрещены.
+with open("dadata_client.py", "r", encoding="utf-8") as _df:
+    _dadata_src = _df.read()
+check(re.search(r"(API_KEY|SECRET_KEY)\s*=\s*[\"'][^\"']+[\"']", _dadata_src) is None,
+      "dadata: в исходнике нет вшитых ключей")
+
 # ---------- Санитизация имён и путей (п. 2.7) ----------
 check(m.safe_filename("..") == "", "пути: «..» не превращается в имя файла")
 check(m.safe_filename("CON").startswith("_"), "пути: зарезервированное имя CON обезврежено")
 check(len(m.safe_filename("Очень длинное имя " * 20)) <= m.MAX_FILENAME_LENGTH,
       "пути: имя файла ограничено по длине")
 check(":" not in m.safe_filename('a:b/c\\d'), "пути: запрещённые символы удалены")
-check(m.ContractApp._is_inside_directory(r"C:\docs", r"C:\docs\party"),
+# Проверка вложенности путей зависит от семантики ОС: на Windows «C:\docs»,
+# на Linux/macOS «/docs». Логика одна, разделители и корни разные — поэтому
+# smoke-тест можно гонять и вне Windows (CI, Linux-машина).
+if sys.platform == "win32":
+    _path_base, _path_inside, _path_outside = r"C:\docs", r"C:\docs\party", r"C:\other"
+else:
+    _path_base, _path_inside, _path_outside = "/docs", "/docs/party", "/other"
+check(m.ContractApp._is_inside_directory(_path_base, _path_inside),
       "пути: вложенная папка разрешена")
-check(not m.ContractApp._is_inside_directory(r"C:\docs", r"C:\other"),
+check(not m.ContractApp._is_inside_directory(_path_base, _path_outside),
       "пути: выход за папку документов запрещён")
 
 # ---------- Хранилище ----------
@@ -101,6 +143,88 @@ check(_raw_db.get("schema_version") == storage.SCHEMA_VERSION,
 check(storage.is_deleted({"deleted_at": "2026-01-01T00:00:00"}),
       "корзина: запись с deleted_at считается удалённой")
 check(not storage.is_deleted({}), "корзина: запись без deleted_at активна")
+
+# ---------- Защита чтения реестра (п. 1.4) ----------
+_appdata_main = os.environ["APPDATA"]
+os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "smoke_storage_bad")
+# Песочница могла остаться от прошлого прогона (в т.ч. .bad/.tmp файлы) — сбрасываем.
+shutil.rmtree(storage.data_dir(), ignore_errors=True)
+os.makedirs(storage.data_dir(), exist_ok=True)
+with open(storage.db_path(), "w", encoding="utf-8") as _fh:
+    _fh.write("{ это не JSON !!!")
+_broken = storage.DataStore()
+check(bool(_broken.load_warning), "реестр: при битом JSON пользователь предупреждён")
+check(not _broken.counterparties and not _broken.documents,
+      "реестр: битый файл — реестр пуст, запуск не падает")
+_bad_copies = [n for n in os.listdir(storage.data_dir())
+               if n.startswith("database.json.bad-")]
+check(len(_bad_copies) == 1,
+      f"реестр: повреждённый файл сохранён как .bad ({_bad_copies})")
+
+# Восстановление из временного файла записи.
+with open(storage.db_path(), "w", encoding="utf-8") as _fh:
+    _fh.write("{ тоже не JSON")
+_rescue_tmp = storage.db_path() + ".999.tmp"
+with open(_rescue_tmp, "w", encoding="utf-8") as _fh:
+    _fh.write('{"counterparties": [{"id": 3, "type": "ooo", "fields": {"ИНН": "7701234567"}}], '
+              '"documents": [], "seq": 4}')
+_rescued = storage.DataStore()
+check([rec["id"] for rec in _rescued.counterparties] == [3],
+      "реестр: данные восстановлены из временного файла записи")
+check("восстановлены" in _rescued.load_warning,
+      "реестр: о восстановлении сообщено пользователю")
+
+# null вместо списков не роняет запуск (п. 1.4).
+with open(storage.db_path(), "w", encoding="utf-8") as _fh:
+    _fh.write('{"counterparties": null, "documents": null}')
+_null_store = storage.DataStore()
+check(bool(_null_store.load_warning) and not _null_store.counterparties,
+      "реестр: null вместо разделов — предупреждение без падения")
+
+# ---------- Сбой записи реестра (п. 1.5) ----------
+os.remove(storage.db_path())
+_ro = storage.DataStore()
+_ro.add_counterparty("ooo", {"ИНН": "7709999999"}, save=False)
+os.makedirs(storage.db_path())  # каталог вместо файла: os.replace падает
+check(_ro.save() is False and _ro.last_error,
+      "save(): сбой записи возвращает False и last_error, а не ложный успех")
+_upd_id = _ro.counterparties[0]["id"]
+check(_ro.update_counterparty(_upd_id, {"ИНН": "7700000001"}) is None,
+      "update_counterparty: при сбое записи правки откатываются (None)")
+check(_ro.get_counterparty(_upd_id)["fields"]["ИНН"] == "7709999999",
+      "update_counterparty: данные не изменились после сбоя")
+os.rmdir(storage.db_path())
+os.environ["APPDATA"] = _appdata_main
+
+# ---------- Атомарная запись .docx и настроек (п. 1.7) ----------
+_atomic_dir = os.path.join(tempfile.gettempdir(), "smoke_atomic")
+os.makedirs(_atomic_dir, exist_ok=True)
+_atomic_ok = os.path.join(_atomic_dir, "Документ.docx")
+m.save_docx_atomic(_Doc(), _atomic_ok)
+check(os.path.exists(_atomic_ok) and not os.path.exists(_atomic_ok + ".tmp"),
+      "atomic: .docx записан, tmp-файл не остался")
+
+class _BrokenDoc:
+    def save(self, path):
+        with open(path, "wb") as _fh:
+            _fh.write("это не zip-архив".encode("utf-8"))
+
+_broken_target = os.path.join(_atomic_dir, "Битый.docx")
+try:
+    m.save_docx_atomic(_BrokenDoc(), _broken_target)
+    check(False, "atomic: повреждённый docx должен отклоняться")
+except Exception:
+    check(True, "atomic: повреждённый docx отклонён с ошибкой")
+check(not os.path.exists(_broken_target) and not os.path.exists(_broken_target + ".tmp"),
+      "atomic: при сбое нет ни итогового файла, ни tmp")
+
+check(m.write_settings({"theme": "dark"}), "настройки: атомарная запись")
+check(m.load_settings() == {"theme": "dark"}, "настройки: прочитаны после записи")
+os.remove(m.settings_path())
+os.makedirs(m.settings_path())  # каталог вместо файла: os.replace падает
+check(not m.write_settings({"theme": "light"}), "настройки: сбой записи -> False")
+check(not m.load_settings(), "настройки: при сбое читаются пустыми без падения")
+os.rmdir(m.settings_path())
 
 # ---------- Сверка «реестр ↔ папка документов» (п. 2.4) ----------
 _reconcile_root = os.path.join(tempfile.gettempdir(), "smoke_reconcile")
@@ -261,6 +385,22 @@ _bad_res = di.analyze_file(_bad_ext)
 check(not _bad_res["ok"] and "Неподдерживаемый формат" in _bad_res["error"],
       "импорт: неподдерживаемый формат — понятная причина")
 
+# Потенциально опасные файлы запрещены на входе (п. 1.2): ни анализа,
+# ни копирования — .exe/.bat/.cmd/.vbs/.lnk в программу не попадают.
+for _ext, _label in (
+    (".exe", "исполняемый"), (".bat", "batch"), (".cmd", "cmd"),
+    (".vbs", "скрипт"), (".lnk", "ярлык"),
+):
+    _danger_path = os.path.join(tempfile.gettempdir(), "smoke_import_danger" + _ext)
+    with open(_danger_path, "wb") as _fh:
+        _fh.write(b"MZ stub")
+    _danger_res = di.analyze_file(_danger_path)
+    check(not _danger_res["ok"], f"импорт: {_ext} ({_label}) отклонён")
+    try:
+        os.remove(_danger_path)
+    except OSError:
+        pass
+
 _sample_additional = os.path.join("образцы", "Доп. соглашение ООО «ЛИДЕР ДВ».docx")
 if os.path.exists(_sample_additional):
     _sample_res = di.analyze_file(_sample_additional)
@@ -382,6 +522,83 @@ try:
     app.save_spec()
     check(sum(1 for d in app.store.documents if d["kind"] == storage.KIND_SPEC) == 1,
           "спецификация сохранена в реестре")
+
+    # Приёмка п. 1.1: у ИП печатается ОГРНИП, нет КПП и пустых подписей.
+    def _doc_full_text(document):
+        _chunks = [p.text for p in document.paragraphs]
+        for _t in document.tables:
+            for _row in _t.rows:
+                for _cell in _row.cells:
+                    _chunks.append(_cell.text)
+        for _section in document.sections:
+            for _part in (_section.header, _section.footer):
+                _chunks.extend(p.text for p in _part.paragraphs)
+        return "\n".join(_chunks)
+
+    _ip_party = app.store.add_counterparty("ip", {
+        m.F.IP_NAME: "Иванов Иван Иванович",
+        m.F.INN: "253612345678",
+        m.F.OGRNIP: "304253600012345",
+        m.F.LEGAL_ADDRESS: "690074, г. Владивосток, ул. Ленина, д. 5",
+        m.F.FACT_ADDRESS: "690074, г. Владивосток, ул. Ленина, д. 5",
+        m.F.EMAIL: "ip@mail.ru",
+        m.F.PHONE: "+7 (912) 345-67-89",
+        m.F.ACCOUNT: "40802810500000012345",
+        m.F.CORR_ACCOUNT: "30101810800000000770",
+        m.F.BANK: "ФИЛИАЛ «ХАБАРОВСКИЙ» АО «АЛЬФА-БАНК»",
+        m.F.BIK: "040813770",
+    }, save=False)
+    _ip_spec_rec = {
+        "kind": storage.KIND_SPEC,
+        "party_id": _ip_party["id"],
+        "number": "1",
+        "data": dict(_ip_party["fields"]),
+        "extra": {
+            "items": [{"name": "Товар", "qty": 10.0, "unit": "шт.", "price": 100.0}],
+            "total": 1000.0,
+            "spec_day": "20",
+            "spec_month": "ноября",
+            "is_ip": True,
+        },
+        "text": "",
+    }
+    _ip_doc = app._render_spec_docx(_ip_spec_rec)
+    check("{{" not in _doc_full_text(_ip_doc),
+          "спецификация ИП: в документе нет незаполненных {{...}}")
+    _ip_buyer = next(
+        (cell.text
+         for table in _ip_doc.tables
+         for row in table.rows
+         for cell in row.cells if "Покупателя" in cell.text),
+        "",
+    )
+    check(bool(_ip_buyer), "спецификация ИП: блок реквизитов покупателя найден")
+    check("КПП" not in _ip_buyer, "спецификация ИП: в реквизитах покупателя нет КПП")
+    check(re.search(r"\bОГРН\b", _ip_buyer) is None,
+          "спецификация ИП: подпись «ОГРН» заменена на ОГРНИП")
+    check("ОГРНИП 304253600012345" in _ip_buyer,
+          "спецификация ИП: печатается значение ОГРНИП")
+
+    # Печатная форма ООО не пострадала (КПП и ОГРН на месте).
+    _ooo_spec_rec = next(d for d in app.store.documents if d["kind"] == storage.KIND_SPEC)
+    _ooo_text = _doc_full_text(app._render_spec_docx(_ooo_spec_rec))
+    check("{{" not in _ooo_text, "спецификация ООО: нет незаполненных {{...}}")
+    check("770101001" in _ooo_text and "1037739010221" in _ooo_text,
+          "спецификация ООО: КПП и ОГРН подставлены как раньше")
+
+    # ИП-карточка нужна была только для проверки печатной формы — убираем её,
+    # чтобы не мешать проверкам корзины ниже.
+    app.store.counterparties.remove(_ip_party)
+
+    # Порядок «файл → запись» (п. 1.6): сбой реестра откатывает и запись, и файл.
+    _rb_path = os.path.join(tempfile.gettempdir(), "smoke_rollback.docx")
+    with open(_rb_path, "wb") as _fh:
+        _fh.write(b"stub")
+    _rb_rec = {"id": 987654321, "kind": storage.KIND_CONTRACT, "party_id": party_rec["id"]}
+    app.store.documents.append(_rb_rec)
+    app._rollback_document(_rb_rec, _rb_path)
+    check(_rb_rec not in app.store.documents and not os.path.exists(_rb_path),
+          "файл→запись: при сбое реестра документ откатывается целиком")
 
     # Регистрация импорта: документ без ИНН привязывается к подтверждённому
     # контрагенту, а не создаёт новую карточку (п. 3.3).

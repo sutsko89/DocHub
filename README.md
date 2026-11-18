@@ -39,8 +39,17 @@
 ## Запуск из исходников
 
 ```powershell
-python -m pip install customtkinter python-docx
+python -m pip install -r requirements.txt
 python main.py
+```
+
+## Проверка
+
+Быстрый тест логики и интерфейса без ручного кликанья — работает и на Windows,
+и на Linux/macOS (для интерфейса нужен дисплей или Xvfb):
+
+```powershell
+python smoke_test.py
 ```
 
 ## Сборка и установщик
@@ -81,7 +90,8 @@ pyinstaller --noconfirm EWDochub.spec
 | `dogovor_template_ip.docx` | Шаблон договора для ИП |
 | `additional_agreement.docx` | Шаблон доп. соглашения для юр. лица |
 | `additional_agreement_ip.docx` | Шаблон доп. соглашения для ИП |
-| `spec_template.docx` | Шаблон спецификации |
+| `spec_template.docx` | Шаблон спецификации (юр. лицо) |
+| `spec_template_ip.docx` | Шаблон спецификации для ИП (ОГРНИП, без КПП) |
 | `EWDochub.spec` | Сборка `EW.DocHub.exe` через PyInstaller |
 | `installer.iss` | Сборка установщика `install.exe` через Inno Setup |
 | `smoke_test.py` | Быстрая проверка интерфейса и логики без ручного запуска |

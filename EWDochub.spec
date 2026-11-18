@@ -19,6 +19,7 @@ a = Analysis(
         ('additional_agreement.docx', '.'),
         ('additional_agreement_ip.docx', '.'),
         ('spec_template.docx', '.'),
+        ('spec_template_ip.docx', '.'),
         ('app_icon.ico', '.'),
     ] + customtkinter_datas,
     hiddenimports=customtkinter_imports + ['darkdetect'],

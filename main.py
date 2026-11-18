@@ -3861,12 +3861,22 @@ class ContractApp:
         return doc
 
     def _render_spec_docx(self, rec: dict) -> "Document":
-        """Спецификация из шаблона spec_template.docx (книжная ориентация)."""
-        template_path = resource_path("spec_template.docx")
+        """Спецификация из шаблона (книжная ориентация).
+
+        У ООО и ИП разные шаблоны: у ИП нет КПП, а вместо ОГРН — ОГРНИП.
+        Общий spec_template.docx написан «в терминах ООО», поэтому для ИП
+        используется отдельная копия spec_template_ip.docx (п. 1.1):
+        строка «ОГРН {{OGRN}}» заменена на «ОГРНИП {{OGRNIP}}»,
+        «ИНН {{INN}} / КПП {{KPP}}» — на «ИНН {{INN}}». Без этого в печатной
+        форме ИП оставались пустые подписи «ОГРН» и «/ КПП».
+        """
+        is_ip = self._rec_is_ip(rec)
+        template_path = resource_path(
+            "spec_template_ip.docx" if is_ip else "spec_template.docx"
+        )
         doc = Document(template_path)
         data = dict(rec.get("data") or {})
         extra = rec.get("extra") or {}
-        is_ip = self._rec_is_ip(rec)
         replacements = build_replacements(data, is_ip)
 
         if is_ip:
@@ -3883,10 +3893,6 @@ class ContractApp:
                 "свидетельства о государственной регистрации в качестве "
                 "индивидуального предпринимателя"
             )
-            # В шаблоне спецификации эти токены написаны «в терминах ООО».
-            # У ИП КПП и ОГРН нет — иначе в печатной форме остаются {{KPP}}/{{OGRN}}.
-            replacements[PH.KPP] = ""
-            replacements[PH.OGRN] = ""
 
         # Договор-основание: номер и дата подставляются из записи договора.
         contract = (

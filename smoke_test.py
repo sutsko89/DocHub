@@ -69,9 +69,16 @@ check(m.safe_filename("CON").startswith("_"), "пути: зарезервиро�
 check(len(m.safe_filename("Очень длинное имя " * 20)) <= m.MAX_FILENAME_LENGTH,
       "пути: имя файла ограничено по длине")
 check(":" not in m.safe_filename('a:b/c\\d'), "пути: запрещённые символы удалены")
-check(m.ContractApp._is_inside_directory(r"C:\docs", r"C:\docs\party"),
+# Проверка вложенности путей зависит от семантики ОС: на Windows «C:\docs»,
+# на Linux/macOS «/docs». Логика одна, разделители и корни разные — поэтому
+# smoke-тест можно гонять и вне Windows (CI, Linux-машина).
+if sys.platform == "win32":
+    _path_base, _path_inside, _path_outside = r"C:\docs", r"C:\docs\party", r"C:\other"
+else:
+    _path_base, _path_inside, _path_outside = "/docs", "/docs/party", "/other"
+check(m.ContractApp._is_inside_directory(_path_base, _path_inside),
       "пути: вложенная папка разрешена")
-check(not m.ContractApp._is_inside_directory(r"C:\docs", r"C:\other"),
+check(not m.ContractApp._is_inside_directory(_path_base, _path_outside),
       "пути: выход за папку документов запрещён")
 
 # ---------- Хранилище ----------

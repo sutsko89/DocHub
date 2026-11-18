@@ -1,0 +1,8 @@
+# Зависимости EW.DocHub (Python 3.10+).
+# Установка: python -m pip install -r requirements.txt
+# Версии соответствуют сборке 1.3.1; обновлять — вместе с прогоном
+# smoke_test.py и пересборкой EWDochub.spec.
+
+customtkinter>=6.0.0      # интерфейс в стиле macOS
+python-docx>=1.2.0        # сборка печатных форм из шаблонов .docx
+darkdetect>=0.8.0         # системная тема для customtkinter

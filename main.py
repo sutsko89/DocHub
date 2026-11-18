@@ -5146,6 +5146,8 @@ class ContractApp:
         self._import_queue = queue.Queue()
         self._import_results: list[dict] = []
         self._import_total = max(1, len(files))
+        self._import_cancelled = False
+        self._import_cancelled_count = 0
 
         win = ctk.CTkToplevel(self.root)
         win.title("Загрузка документов")
@@ -5175,11 +5177,16 @@ class ContractApp:
             font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
             anchor="w", justify="left", wraplength=int(360 * self.scale),
         ).pack(anchor="w", pady=(int(10 * self.scale), 0))
+        self._import_cancel_btn = ui.ghost_button(
+            frame, "Отменить", self._cancel_import,
+            width=int(120 * self.scale), height=int(28 * self.scale),
+        )
+        self._import_cancel_btn.pack(anchor="e", pady=(int(8 * self.scale), 0))
 
         # Окно по центру родительского, поверх остальных.
         win.update_idletasks()
         width = int(430 * self.scale)
-        height = int(210 * self.scale)
+        height = int(240 * self.scale)
         x = self.root.winfo_x() + (self.root.winfo_width() - width) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - height) // 2
         win.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
@@ -5191,9 +5198,25 @@ class ContractApp:
         threading.Thread(target=self._import_worker, args=(files,), daemon=True).start()
         self.root.after(80, self._import_tick)
 
+    def _cancel_import(self):
+        """Отменяет импорт: остаток пакета не анализируется и не регистрируется (п. 5.3)."""
+        if not getattr(self, "_import_running", False):
+            return
+        self._import_cancelled = True
+        try:
+            self._import_status_var.set("Отмена…")
+            self._import_cancel_btn.configure(state="disabled")
+        except Exception:
+            pass
+
     def _import_worker(self, files: list[str]):
-        """Фоновый поток: анализ каждого файла и копирование в папку контрагента."""
+        """Фоновый поток: анализ каждого файла и копирование в папку контрагента.
+
+        После нажатия «Отменить» остаток пакета не анализируется (п. 5.3).
+        """
         for index, path in enumerate(files):
+            if self._import_cancelled:
+                break
             name = os.path.basename(path)
             self._import_queue.put(
                 ("status", f"Анализ файла {index + 1} из {len(files)}:\n{name}")
@@ -5291,6 +5314,10 @@ class ContractApp:
                     self._import_win = None
                     self._import_progress = None
                     self._import_running = False
+                    # Часть пакета могла быть пропущена по «Отмене» (п. 5.3).
+                    self._import_cancelled_count = max(
+                        0, self._import_total - len(results)
+                    )
                     try:
                         win.grab_release()
                         win.destroy()
@@ -5312,111 +5339,36 @@ class ContractApp:
           * без ИНН — диалог «привязать к существующему / создать / пропустить»;
           * документ, который уже есть в реестре, повторно не добавляется;
           * по каждому файлу в отчёте видны тип, результат и причина.
+
+        Пакетная запись (п. 5.2): все изменения пакета пишутся на диск ОДНИМ
+        ``save()`` в конце. Раньше каждое «добавить» полностью перезаписывало
+        JSON с fsync и ротацией копий — импорт 200 файлов давал 200 полных
+        записей реестра.
         """
-        added = 0
-        new_parties = 0
-        skipped = 0
-        duplicates = 0
+        stats = {
+            "added": 0,
+            "new_parties": 0,
+            "skipped": 0,
+            "duplicates": 0,
+            "cancelled": max(0, int(getattr(self, "_import_cancelled_count", 0))),
+        }
         save_errors: list[str] = []
         entries: list[dict] = []
+        store_dirty = False
 
         for result in results:
-            entry = {
-                "name": result.get("name") or "файл",
-                "kind": result.get("kind") or storage.KIND_UNKNOWN,
-                "status": "skip",
-                "detail": "",
-                "warning": "",
-            }
+            entry = self._new_import_entry(result)
             entries.append(entry)
-            copied = result.get("copied") or ""
-            party = result.get("party") or {}
+            if self._register_import_result(result, entry, stats):
+                store_dirty = True
 
-            if not result.get("ok") or not party:
-                skipped += 1
-                entry["detail"] = result.get("error") or "документ не распознан"
-                result["copied"] = self._move_import_to_unknown(copied)
-                continue
+        if store_dirty:
+            with applog.timed("Запись реестра (импорт)", 500, "storage"):
+                if not self.store.save():
+                    save_errors.append(self.store.last_error or "реестр не записан")
+            self._log.info("Пакет импорта записан одним save() (п. 5.2)")
 
-            fields = dict(party.get("fields") or {})
-            inn = str(fields.get(F.INN, "")).strip()
-            rec = None
-            action = ""
-            if result.get("recognized") and inn:
-                rec = self.store.find_by_inn(inn)
-                if rec is not None:
-                    action = "attach"
-                else:
-                    # ИНН новый, но карточка с таким названием уже может быть
-                    # (например, заведена вручную без ИНН) — не плодим дубль.
-                    same_name = self.store.find_by_name(party.get("display"))
-                    if same_name is not None:
-                        attach = ui.confirm(
-                            self.root, "Похожее название уже есть",
-                            f"Файл: {result.get('name')}\n"
-                            f"Распознано: {party.get('display')}\n\n"
-                            f"В реестре есть «{storage.display_name(same_name)}» "
-                            "с другим ИНН.\n\n"
-                            "Привязать документ к этой карточке?",
-                            "Привязать", "Создать новую",
-                        )
-                        if attach:
-                            rec, action = same_name, "attach"
-                    if action != "attach":
-                        action = "create"
-            else:
-                rec, action = self._ask_import_party(result)
-
-            if action == "create":
-                rec = self.store.add_counterparty(party.get("type") or "ooo", fields)
-                if self.store.last_error:
-                    save_errors.append(self.store.last_error)
-                new_parties += 1
-                entry["detail"] = "создана новая карточка"
-            elif action == "attach" and rec is not None:
-                entry["detail"] = f"привязан к «{storage.display_name(rec)}»"
-
-            if action == "skip" or rec is None:
-                skipped += 1
-                entry["detail"] = entry["detail"] or "контрагент не выбран"
-                result["copied"] = self._move_import_to_unknown(copied)
-                continue
-
-            if not copied:
-                skipped += 1
-                entry["detail"] = result.get("error") or "файл не скопирован"
-                continue
-
-            if self._import_document_is_duplicate(rec["id"], result):
-                duplicates += 1
-                entry["status"] = "duplicate"
-                entry["detail"] = "такой документ уже есть в реестре"
-                result["copied"] = self._move_import_to_unknown(copied)
-                continue
-
-            self.store.add_document(
-                result.get("kind") or storage.KIND_UNKNOWN,
-                rec["id"],
-                result.get("number") or "",
-                result.get("date") or "",
-                data=dict(rec.get("fields") or {}),
-                extra={
-                    "imported": True,
-                    "source_file": copied,
-                    "is_ip": rec.get("type") == "ip",
-                },
-                text=result.get("text") or "",
-            )
-            if self.store.last_error:
-                save_errors.append(self.store.last_error)
-            added += 1
-            entry["status"] = "added"
-            if not result.get("recognized"):
-                entry["warning"] = (
-                    result.get("warning") or "карточка создана без ИНН"
-                )
-
-        if added:
+        if stats["added"]:
             self._refresh_party_combo_values()
             self._preview_contract()
             self._preview_additional()
@@ -5425,11 +5377,13 @@ class ContractApp:
 
         message = (
             "Загрузка завершена.\n"
-            f"Добавлено документов: {added} (новых контрагентов: {new_parties})\n"
-            f"Пропущено: {skipped}"
+            f"Добавлено документов: {stats['added']} (новых контрагентов: {stats['new_parties']})\n"
+            f"Пропущено: {stats['skipped']}"
         )
-        if duplicates:
-            message += f", уже были в реестре: {duplicates}"
+        if stats["duplicates"]:
+            message += f", уже были в реестре: {stats['duplicates']}"
+        if stats["cancelled"]:
+            message += f"\nОтменено пользователем: {stats['cancelled']}"
         if save_errors:
             message += (
                 "\n\nВНИМАНИЕ: часть записей не попала на диск:\n"
@@ -5438,9 +5392,113 @@ class ContractApp:
         self._log.info(
             "Импорт завершён: добавлено=%d, новых контрагентов=%d, "
             "пропущено=%d, дубликатов=%d, ошибок записи=%d",
-            added, new_parties, skipped, duplicates, len(save_errors),
+            stats["added"], stats["new_parties"], stats["skipped"],
+            stats["duplicates"], len(save_errors),
         )
         self._show_import_report(entries, message)
+        self._import_cancelled_count = 0
+
+    @staticmethod
+    def _new_import_entry(result: dict) -> dict:
+        """Заготовка строки отчёта импорта для одного файла."""
+        return {
+            "name": result.get("name") or "файл",
+            "kind": result.get("kind") or storage.KIND_UNKNOWN,
+            "status": "skip",
+            "detail": "",
+            "warning": "",
+        }
+
+    def _register_import_result(self, result: dict, entry: dict, stats: dict) -> bool:
+        """Регистрирует один результат разбора. Возвращает True, если реестр менялся.
+
+        Изменения остаются в памяти: сохранение на диск делает вызывающий код
+        одним ``save()`` на весь пакет (п. 5.2).
+        """
+        copied = result.get("copied") or ""
+        party = result.get("party") or {}
+
+        if not result.get("ok") or not party:
+            stats["skipped"] += 1
+            entry["detail"] = result.get("error") or "документ не распознан"
+            result["copied"] = self._move_import_to_unknown(copied)
+            return False
+
+        fields = dict(party.get("fields") or {})
+        inn = str(fields.get(F.INN, "")).strip()
+        rec = None
+        action = ""
+        if result.get("recognized") and inn:
+            rec = self.store.find_by_inn(inn)
+            if rec is not None:
+                action = "attach"
+            else:
+                # ИНН новый, но карточка с таким названием уже может быть
+                # (например, заведена вручную без ИНН) — не плодим дубль.
+                same_name = self.store.find_by_name(party.get("display"))
+                if same_name is not None:
+                    attach = ui.confirm(
+                        self.root, "Похожее название уже есть",
+                        f"Файл: {result.get('name')}\n"
+                        f"Распознано: {party.get('display')}\n\n"
+                        f"В реестре есть «{storage.display_name(same_name)}» "
+                        "с другим ИНН.\n\n"
+                        "Привязать документ к этой карточке?",
+                        "Привязать", "Создать новую",
+                    )
+                    if attach:
+                        rec, action = same_name, "attach"
+                if action != "attach":
+                    action = "create"
+        else:
+            rec, action = self._ask_import_party(result)
+
+        if action == "create":
+            rec = self.store.add_counterparty(party.get("type") or "ooo", fields, save=False)
+            stats["new_parties"] += 1
+            entry["detail"] = "создана новая карточка"
+        elif action == "attach" and rec is not None:
+            entry["detail"] = f"привязан к «{storage.display_name(rec)}»"
+
+        if action == "skip" or rec is None:
+            stats["skipped"] += 1
+            entry["detail"] = entry["detail"] or "контрагент не выбран"
+            result["copied"] = self._move_import_to_unknown(copied)
+            return False
+
+        if not copied:
+            stats["skipped"] += 1
+            entry["detail"] = result.get("error") or "файл не скопирован"
+            return False
+
+        if self._import_document_is_duplicate(rec["id"], result):
+            stats["duplicates"] += 1
+            entry["status"] = "duplicate"
+            entry["detail"] = "такой документ уже есть в реестре"
+            result["copied"] = self._move_import_to_unknown(copied)
+            return False
+
+        self.store.add_document(
+            result.get("kind") or storage.KIND_UNKNOWN,
+            rec["id"],
+            result.get("number") or "",
+            result.get("date") or "",
+            data=dict(rec.get("fields") or {}),
+            extra={
+                "imported": True,
+                "source_file": copied,
+                "is_ip": rec.get("type") == "ip",
+            },
+            text=result.get("text") or "",
+            save=False,
+        )
+        stats["added"] += 1
+        entry["status"] = "added"
+        if not result.get("recognized"):
+            entry["warning"] = (
+                result.get("warning") or "карточка создана без ИНН"
+            )
+        return True
 
     def _ask_import_party(self, result: dict) -> tuple[dict | None, str]:
         """Спрашивает, к какому контрагенту отнести документ без ИНН (п. 3.3).

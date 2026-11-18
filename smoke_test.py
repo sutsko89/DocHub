@@ -1084,6 +1084,57 @@ try:
         except OSError:
             pass
 
+    # 5.2/5.3: пакет импорта пишется на диск ОДНИМ save(), разбор отменяется.
+    _batch_dir = tempfile.mkdtemp(prefix="smoke_batch_")
+    _batch_results = []
+    _batch_fields = {"ИНН": "2540999887", "Сокращенное название компании": "ООО «Батч»"}
+    for _i in range(1, 31):
+        _fpath = os.path.join(_batch_dir, f"Док {_i}.docx")
+        _docx = m.Document()
+        _docx.add_paragraph(f"Спецификация № {_i} от 01.01.2026 ООО «Батч» ИНН 2540999887")
+        _docx.save(_fpath)
+        _batch_results.append({
+            "name": f"Док {_i}.docx", "kind": storage.KIND_SPEC,
+            "number": str(_i), "date": "01.01.2026",
+            "party": {"recognized": True, "type": "ooo", "display": "ООО «Батч»",
+                      "fields": dict(_batch_fields), "missing": ""},
+            "text": "", "ok": True, "recognized": True,
+            "copied": _fpath, "error": "", "warning": "",
+        })
+    _save_calls = [0]
+    _orig_store_save = app.store.save
+
+    def _counting_save():
+        _save_calls[0] += 1
+        return bool(_orig_store_save())
+
+    app.store.save = _counting_save
+    _orig_report2 = app._show_import_report
+    app._show_import_report = lambda entries, summary: None
+    try:
+        _docs_before = len(app.store.documents)
+        app._finish_documents_import(_batch_results)
+        check(_save_calls == [1],
+              f"5.2: пакет из 30 файлов записан одним save() (раньше — 30 записей): {_save_calls}")
+        check(len(app.store.documents) == _docs_before + 30,
+              "5.2: все 30 документов пакета добавлены в реестр")
+        check(app.store.find_by_inn("2540999887") is not None,
+              "5.2: карточка контрагента из пакета создана")
+        check("_cancel_import" in _main_src and "_import_cancelled" in _main_src,
+              "5.3: у импорта есть отмена «Отменить» (кнопка в окне загрузки)")
+        app._import_running = True
+        app._cancel_import()
+        check(app._import_cancelled, "5.3: после «Отменить» разбор остатка пакета прекращается")
+        app._import_running = False
+        app._import_cancelled = False
+    finally:
+        app.store.save = _orig_store_save
+        app._show_import_report = _orig_report2
+        _batch_party_rec = app.store.find_by_inn("2540999887")
+        if _batch_party_rec is not None:
+            app.store.purge_counterparty(_batch_party_rec["id"])
+        shutil.rmtree(_batch_dir, ignore_errors=True)
+
     # 4.1: дубликаты контрагентов по ИНН и номеров документов.
     # Создание карточки с чужим ИНН gated диалогом _cp_save (find_by_inn).
     _dup_party = app.store.add_counterparty("ooo", {

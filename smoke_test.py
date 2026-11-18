@@ -913,6 +913,202 @@ try:
     check(str(app._spec_rows[0]["cells"]["name"].cget("state")) == "readonly",
           "таблица: ячейка доступна для правки только по двойному клику")
 
+    # ---------- P1: подтверждения, диалоги, защита данных (этапы 2–4) ----------
+
+    # 2.5: подтверждение удаления документа с описанием последствий.
+    _orig_confirm_stub = m.ui.confirm
+    _del_caps: list = []
+    m.ui.confirm = lambda *args, **kwargs: _del_caps.append(args) or False
+    try:
+        app._delete_document(app.store.documents[0])
+    finally:
+        m.ui.confirm = _orig_confirm_stub
+    _del_msg = str(_del_caps[-1]) if _del_caps else ""
+    check(bool(_del_caps), "2.5: удаление документа требует подтверждения")
+    check("Переместить документ в корзину" in _del_msg
+          and "Файл на диске останется" in _del_msg
+          and "№ 5" in _del_msg and "Ромашка" in _del_msg,
+          "2.5: в подтверждении тип, номер, контрагент и судьба файла")
+    check(not app.store.trashed_documents(),
+          "2.5: после «Отмена» документ не удаляется")
+
+    # 2.5: подтверждение удаления контрагента с перечнем документов.
+    _cp_caps: list = []
+    m.ui.confirm = lambda *args, **kwargs: _cp_caps.append(args) or False
+    try:
+        app._delete_counterparty(party_rec)
+    finally:
+        m.ui.confirm = _orig_confirm_stub
+    _cp_msg = str(_cp_caps[-1]) if _cp_caps else ""
+    check(bool(_cp_caps) and "Удалить контрагента" in _cp_msg,
+          "2.5: удаление контрагента требует подтверждения")
+    check("Договор поставки" in _cp_msg and "Файлы на диске останутся" in _cp_msg,
+          "2.5: в подтверждении перечень документов и судьба файлов")
+    check(not app.store.trashed_documents(),
+          "2.5: после «Отмена» ничего не удалено")
+
+    # 2.8: недоступная папка документов — явный выбор, а не молчаливая подмена.
+    _choice_caps: list = []
+    _orig_choice = app._choice_dialog
+    app._choice_dialog = lambda *args, **kwargs: _choice_caps.append(args) or "retry"
+    try:
+        app._resolve_unavailable_documents_dir(
+            os.path.join(tempfile.gettempdir(), "missing_docs_dir"),
+            OSError(2, "Нет такого каталога"),
+        )
+    finally:
+        app._choice_dialog = _orig_choice
+        app._docs_dir_retry_count = 0
+    check(bool(_choice_caps), "2.8: недоступная папка поднимает диалог")
+    _choice_text = str(_choice_caps[0]) if _choice_caps else ""
+    check("недоступна" in _choice_text.lower()
+          and "Повторить" in _choice_text and "Папка по умолчанию" in _choice_text,
+          "2.8: в диалоге варианты повторить / другая / по умолчанию")
+
+    # 2.9: утерянный оригинал импортированного документа не подменяется молча.
+    _lost_rec = {
+        "id": 555001, "kind": storage.KIND_CONTRACT, "party_id": party_rec["id"],
+        "number": "777", "date": "10.01.2026",
+        "data": dict(party_rec["fields"]),
+        "extra": {
+            "imported": True,
+            "source_file": os.path.join(tempfile.gettempdir(), "smoke_no_original.docx"),
+        },
+    }
+    _lost_caps: list = []
+    app._choice_dialog = lambda *args, **kwargs: _lost_caps.append(args) or "cancel"
+    _orig_show_folder = m.show_in_folder
+    m.show_in_folder = lambda path: OPENED.append(f"folder:{path}")
+    try:
+        app.export_document(_lost_rec)
+    finally:
+        app._choice_dialog = _orig_choice
+        m.show_in_folder = _orig_show_folder
+    check(bool(_lost_caps) and "Оригинал не найден" in str(_lost_caps[0][0]),
+          "2.9: утеря оригинала поднимает диалог")
+    check("Пересобрать из шаблона" in str(_lost_caps[0])
+          and "отличаться" in str(_lost_caps[0]),
+          "2.9: диалог предупреждает о неточности пересборки")
+    check(not OPENED,
+          "2.9: без выбора пользователя суррогат не создаётся")
+    OPENED.clear()
+
+    # 3.3: повторный импорт того же файла не плодит карточки.
+    _dup_copy = os.path.join(tempfile.gettempdir(), "smoke_p1_dup.docx")
+    with open(_dup_copy, "wb") as _fh:
+        _fh.write(b"PK\x03\x04 stub")
+    _dup_result = {
+        "name": "Договор ООО.docx", "kind": storage.KIND_CONTRACT,
+        "number": "888", "date": "10.01.2026",
+        "party": {
+            "recognized": True, "type": "ooo",
+            "display": "ООО «Ромашка-Импорт»",
+            "fields": {"ИНН": "2540123456",
+                       "Сокращенное название компании": "ООО «Ромашка-Импорт»"},
+            "missing": "",
+        },
+        "text": "", "ok": True, "recognized": True,
+        "copied": _dup_copy, "error": "", "warning": "",
+    }
+    _orig_report = app._show_import_report
+    app._show_import_report = lambda entries, summary: None
+    try:
+        app._finish_documents_import([dict(_dup_result)])
+        _dup_card = app.store.find_by_inn("2540123456")
+        check(_dup_card is not None, "3.3: карточка по ИНН создана автоматически")
+        _parties_after_first = len(app.store.counterparties)
+        app._finish_documents_import([dict(_dup_result)])
+        check(len(app.store.counterparties) == _parties_after_first,
+              "3.3: повторный импорт того же файла не плодит карточек")
+        check(app.store.find_by_inn("2540123456")["id"] == _dup_card["id"],
+              "3.3: документ привязан к существующей карточке")
+        app.store.purge_counterparty(_dup_card["id"])
+    finally:
+        app._show_import_report = _orig_report
+        try:
+            os.remove(_dup_copy)
+        except OSError:
+            pass
+
+    # 4.1: дубликаты контрагентов по ИНН и номеров документов.
+    # Создание карточки с чужим ИНН gated диалогом _cp_save (find_by_inn).
+    _dup_party = app.store.add_counterparty("ooo", {
+        "ИНН": "7701234567",
+        "Сокращенное название компании": "ООО Ромашка",
+    }, save=False)
+    check(any("ООО Ромашка" in base for base in app._party_duplicate_bases()),
+          "4.1: одинаковые карточки помечаются дубликатами в списках")
+    app.store.counterparties.remove(_dup_party)
+    _cp_src_start = _main_src.index("def _cp_save")
+    _cp_src = _main_src[_cp_src_start:_cp_src_start + 3000]
+    check("find_by_inn" in _cp_src and "Открыть существующего" in _cp_src,
+          "4.1: при создании карточки ИНН проверяется на дубликат")
+    check(app.store.find_by_inn("7701234567")["id"] == party_rec["id"],
+          "4.1: ИНН из формы найдёт существующую карточку")
+    _dupnum_caps: list = []
+    m.ui.confirm = lambda *args, **kwargs: _dupnum_caps.append(args) or False
+    try:
+        _dup_allowed = app._confirm_document_duplicate(
+            party_rec["id"], storage.KIND_CONTRACT, "5", "12.01.2026",
+        )
+    finally:
+        m.ui.confirm = _orig_confirm_stub
+    check(not _dup_allowed and bool(_dupnum_caps),
+          "4.1: повтор номера договора требует подтверждения")
+    check("уже есть" in str(_dupnum_caps[0]) and "№ 5" in str(_dupnum_caps[0]),
+          "4.1: в предупреждении назван существующий документ")
+    check(app._confirm_document_duplicate(
+        party_rec["id"], storage.KIND_CONTRACT, "555", "12.01.2026",
+    ), "4.1: новый номер не требует подтверждения")
+
+    # 4.2: единый «текущий контрагент» на всех страницах документов.
+    app._set_current_party(party_rec)
+    _expected_party = app._party_display(party_rec, app._party_duplicate_bases())
+    check(app._current_party_id == party_rec["id"],
+          "4.2: текущий контрагент запомнен")
+    for _attr in ("contract_party_var", "addl_party_var", "spec_party_var"):
+        check(getattr(app, _attr).get() == _expected_party,
+              f"4.2: выбор перенесён на {_attr}")
+    app.contract_party_var.set("Несуществующий контрагент XYZ")
+    app._refresh_party_combo_values()
+    check(app.contract_party_var.get() == "",
+          "4.2: устаревшее имя в поле выбора сбрасывается")
+
+    # 4.3: предпросмотр только для чтения — UI не обещает правок.
+    check(str(app.contract_preview.cget("state")) == "disabled"
+          and str(app.addl_preview.cget("state")) == "disabled"
+          and str(app.spec_text.cget("state")) == "disabled",
+          "4.3: предпросмотр только для чтения")
+
+    # 4.4: защита несохранённых данных.
+    check("contract" not in app._dirty_pages(),
+          "4.4: сохранённая форма не считается изменённой")
+    app.contract_number_var.set("999")
+    check("contract" in app._dirty_pages(),
+          "4.4: изменение формы фиксируется как несохранённое")
+    _close_caps: list = []
+    m.ui.confirm = lambda *args, **kwargs: _close_caps.append(args) or False
+    try:
+        app.close()
+    finally:
+        m.ui.confirm = _orig_confirm_stub
+    check(bool(_close_caps)
+          and "несохранённые изменения" in str(_close_caps[0]).lower(),
+          "4.4: при закрытии с изменениями запрашивается подтверждение")
+    check(app.root.winfo_exists(), "4.4: после «Остаться» окно живо")
+    app.contract_number_var.set("5")
+    check("contract" not in app._dirty_pages(),
+          "4.4: возврат значений возвращает форме сохранённое состояние")
+
+    # 4.5: быстрые UX-правки.
+    check("<Control-s>" in _main_src, "4.5: Ctrl+S привязан к сохранению")
+    check(hasattr(app, "toast"), "4.5: немодальное уведомление об успехе есть")
+    _no_contacts = {key: value for key, value in party_rec["fields"].items()
+                    if key not in (m.F.EMAIL, m.F.PHONE)}
+    _contact_errors = m.validate_party_fields(_no_contacts, is_ip=False)
+    check("Email" not in _contact_errors and "Телефон" not in _contact_errors,
+          "4.5: email и телефон необязательны")
+
     # Реестр.
     app._select_page("registry")
     app.root.update()

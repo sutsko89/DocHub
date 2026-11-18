@@ -11,6 +11,7 @@ import copy
 import hashlib
 import os
 import re
+import shutil
 import sys
 import zipfile
 from decimal import Decimal
@@ -247,6 +248,27 @@ def safe_filename(name: str, fallback: str = "") -> str:
 # ------------------------------------------------------------------ #
 #  Сборка и запись документов (перенос из ContractApp, п. 9.2)         #
 # ------------------------------------------------------------------ #
+def copy_with_zone_identifier(src: str, dest: str) -> None:
+    """Копирует файл, сохраняя метку «скачано из интернета» (Mark-of-the-Web).
+
+    shutil.copy2 не переносит альтернативные потоки NTFS, поэтому
+    импортированный документ открывался без Protected View.
+    """
+    shutil.copy2(src, dest)
+    if sys.platform != "win32":
+        return
+    zone_stream = ":Zone.Identifier"
+    try:
+        with open(src + zone_stream, "rb") as fh:
+            zone = fh.read()
+    except OSError:
+        return
+    try:
+        with open(dest + zone_stream, "wb") as fh:
+            fh.write(zone)
+    except OSError:
+        pass
+
 
 def fit_document_path(directory: str, base: str, ext: str = ".docx") -> str:
     """Собирает путь, укладывающийся в ``MAX_PATH_LENGTH`` (п. 2.7)."""

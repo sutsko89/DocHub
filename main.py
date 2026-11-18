@@ -70,7 +70,7 @@ from services import (
     REQUIRED_COMMON, REQUIRED_OOO, REQUIRED_IP, REQUIRED_PARTY_COMMON,
     validate_contract_fields, validate_party_fields, validate_all_fields,
     save_docx_atomic, _RESERVED_FILENAMES, _FORBIDDEN_FILENAME_CHARS,
-    safe_filename,
+    safe_filename, copy_with_zone_identifier,
 )
 
 
@@ -365,28 +365,6 @@ def show_in_folder(file_path: str) -> None:
             subprocess.run(["xdg-open", os.path.dirname(file_path)], check=False)
     except Exception as exc:
         ui.alert(ROOT_HOLDER.get(), "Не удалось открыть папку", str(exc), "error")
-
-
-def copy_with_zone_identifier(src: str, dest: str) -> None:
-    """Копирует файл, сохраняя метку «скачано из интернета» (Mark-of-the-Web).
-
-    shutil.copy2 не переносит альтернативные потоки NTFS, поэтому
-    импортированный документ открывался без Protected View.
-    """
-    shutil.copy2(src, dest)
-    if sys.platform != "win32":
-        return
-    zone_stream = ":Zone.Identifier"
-    try:
-        with open(src + zone_stream, "rb") as fh:
-            zone = fh.read()
-    except OSError:
-        return
-    try:
-        with open(dest + zone_stream, "wb") as fh:
-            fh.write(zone)
-    except OSError:
-        pass
 
 
 # ---------- DOCX: замена плейсхолдеров (в т.ч. если разбиты на runs) ----------

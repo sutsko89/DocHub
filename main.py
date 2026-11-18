@@ -182,6 +182,43 @@ def write_settings(settings: dict) -> bool:
         return False
 
 
+# ---------- Настройки печатной формы спецификации (п. 9.7) ----------
+# Магические значения печатной формы спецификации вынесены в settings.json:
+# поставщик, подписант, город, год, ставка НДС и номер приложения меняются
+# без правки кода. Отсутствующие или битые значения заменяются дефолтами.
+DEFAULT_SPEC_SETTINGS = {
+    "spec_supplier": "ООО «Эдельвейс»",
+    "spec_supplier_signatory": "А.Н. Верещагин",
+    "spec_city": "Хабаровск",
+    "spec_vat_rate": SPEC_VAT_RATE,
+    "spec_appendix_number": SPEC_APPENDIX_NUMBER,
+    "spec_year": datetime.now().year,
+}
+
+
+def get_spec_settings() -> dict:
+    """Печатная форма спецификации: дефолты, перекрытые settings.json."""
+    saved = load_settings()
+    out = dict(DEFAULT_SPEC_SETTINGS)
+    for key in out:
+        value = saved.get(key)
+        if value is None:
+            continue
+        if key == "spec_vat_rate":
+            try:
+                out[key] = max(0, min(int(value), 100))
+            except (TypeError, ValueError):
+                pass
+        elif key == "spec_year":
+            try:
+                out[key] = int(value)
+            except (TypeError, ValueError):
+                pass
+        else:
+            out[key] = str(value)
+    return out
+
+
 # ---------- Функции валидации ----------
 
 
@@ -2650,7 +2687,7 @@ class ContractApp:
 
     def _render_spec_docx(self, rec: dict) -> "Document":
         """Спецификация из шаблона (ООО/ИП) — сборка в сервисном слое (п. 9.2)."""
-        return services.render_spec(rec, self.store)
+        return services.render_spec(rec, self.store, get_spec_settings())
 
     def _rec_is_ip(self, rec: dict) -> bool:
         """Признак ИП у сохранённой записи (учитывая старые записи реестра)."""
@@ -2718,18 +2755,21 @@ class ContractApp:
         data = dict(party.get("fields", {}))
 
         lines: list[str] = []
+        spec = get_spec_settings()
         if contract is not None:
-            lines.append(f"Приложение № {SPEC_APPENDIX_NUMBER} к Договору поставки "
-                         f"{self._contract_display(contract)}")
+            lines.append(
+                f"Приложение № {spec['spec_appendix_number']} к Договору поставки "
+                f"{self._contract_display(contract)}"
+            )
         lines.append("")
         number = self.spec_number_var.get().strip() or "б/н"
         lines.append(f"СПЕЦИФИКАЦИЯ № {number}")
         lines.append(
-            f"г. Хабаровск    «{self.spec_day_var.get().strip() or '__'}» "
-            f"{self.spec_month_var.get().strip() or '__'} 2026 г."
+            f"г. {spec['spec_city']}    «{self.spec_day_var.get().strip() or '__'}» "
+            f"{self.spec_month_var.get().strip() or '__'} {spec['spec_year']} г."
         )
         lines.append("")
-        lines.append("Поставщик: ООО «Эдельвейс»")
+        lines.append(f"Поставщик: {spec['spec_supplier']}")
         lines.append(f"Покупатель: {storage.display_name(party)}, "
                      f"ИНН {data.get(F.INN, '')}, {data.get(F.LEGAL_ADDRESS, '')}")
         lines.append("")
@@ -2755,8 +2795,8 @@ class ContractApp:
                 f"Итого: {format_amount(total)} руб. ({amount_in_words_ru(total)})"
             )
             lines.append(
-                f"в т.ч. НДС {SPEC_VAT_RATE}%: "
-                f"{format_amount(spec_vat_amount_from_items(items))} руб."
+                f"в т.ч. НДС {spec['spec_vat_rate']}%: "
+                f"{format_amount(spec_vat_amount_from_items(items, spec['spec_vat_rate']))} руб."
             )
         else:
             lines.append("Позиции не заполнены — заполните таблицу позиций справа.")
@@ -2770,8 +2810,10 @@ class ContractApp:
             if condition_value:
                 lines.append(f"{condition_label}: {condition_value}")
         lines.append("")
-        lines.append("Подписи Сторон: от Поставщика — А.Н. Верещагин, "
-                     f"от Покупателя — {data.get(F.DIRECTOR, data.get(F.IP_NAME, ''))}")
+        lines.append(
+            f"Подписи Сторон: от Поставщика — {spec['spec_supplier_signatory']}, "
+            f"от Покупателя — {data.get(F.DIRECTOR, data.get(F.IP_NAME, ''))}"
+        )
         self._set_text(self.spec_text, "\n".join(lines))
 
     # ------------------------------------------------------------------ #

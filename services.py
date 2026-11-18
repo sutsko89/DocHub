@@ -299,7 +299,7 @@ def render_additional(data: dict, is_ip: bool, number: str,
     return doc
 
 
-def render_spec(rec: dict, store) -> "Document":
+def render_spec(rec: dict, store, spec_settings: dict | None = None) -> "Document":
     """Спецификация из шаблона (книжная ориентация).
 
     У ООО и ИП разные шаблоны: у ИП нет КПП, а вместо ОГРН — ОГРНИП.
@@ -308,7 +308,18 @@ def render_spec(rec: dict, store) -> "Document":
     строка «ОГРН {{OGRN}}» заменена на «ОГРНИП {{OGRNIP}}»,
     «ИНН {{INN}} / КПП {{KPP}}» — на «ИНН {{INN}}». Без этого в печатной
     форме ИП оставались пустые подписи «ОГРН» и «/ КПП».
+
+    Ставка НДС и номер приложения берутся из spec_settings (п. 9.7);
+    при отсутствии — дефолты SPEC_VAT_RATE / SPEC_APPENDIX_NUMBER.
     """
+    spec_settings = spec_settings or {}
+    try:
+        vat_rate = int(spec_settings.get("spec_vat_rate") or SPEC_VAT_RATE)
+    except (TypeError, ValueError):
+        vat_rate = SPEC_VAT_RATE
+    appendix_number = str(
+        spec_settings.get("spec_appendix_number") or SPEC_APPENDIX_NUMBER
+    )
     is_ip = rec_is_ip(rec, store)
     template_path = resource_path(
         "spec_template_ip.docx" if is_ip else "spec_template.docx"
@@ -357,7 +368,7 @@ def render_spec(rec: dict, store) -> "Document":
     if total == 0 and items:
         total = sum((i["qty"] * i["price"] for i in items), Decimal("0"))
     replacements.update({
-        PH.APPENDIX_NUMBER: SPEC_APPENDIX_NUMBER,
+        PH.APPENDIX_NUMBER: appendix_number,
         PH.SPEC_NUMBER: rec.get("number") or "б/н",
         PH.SPEC_DAY: str(extra.get("spec_day", "")),
         PH.SPEC_MONTH: str(extra.get("spec_month", "")),
@@ -365,9 +376,10 @@ def render_spec(rec: dict, store) -> "Document":
         PH.TOTAL: format_amount(total),
         PH.TOTAL_IN_WORDS: amount_in_words_ru(total) if total else "",
         PH.VAT: format_amount(
-            spec_vat_amount_from_items(items) if items else spec_vat_amount(total)
+            spec_vat_amount_from_items(items, vat_rate)
+            if items else spec_vat_amount(total, vat_rate)
         ),
-        PH.VAT_RATE: f"{SPEC_VAT_RATE}%",
+        PH.VAT_RATE: f"{vat_rate}%",
         PH.DELIVERY_TERM: str(extra.get("delivery_term", "")),
         PH.PAYMENT_TERMS: str(extra.get("payment_terms", "")),
         PH.DELIVERY_BASIS: str(extra.get("delivery_basis", "")),

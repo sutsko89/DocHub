@@ -57,13 +57,13 @@ SPEC_ITEMS = [
 
 
 def spec_total() -> float:
-    """Итоговая сумма образца спецификации (как её хранит реестр)."""
-    from decimal import Decimal
-    total = sum(
-        (Decimal(str(i["qty"])) * Decimal(str(i["price"])) for i in SPEC_ITEMS),
-        Decimal("0"),
-    )
-    return float(total)
+    """Итоговая сумма образца спецификации — общий расчёт приложения (п. 9.8).
+
+    Тесты сверяют печатную форму и реестр с тем же spec_total из
+    document_builder, каким считает приложение: ожидание и расчёт — один путь.
+    """
+    import document_builder
+    return float(document_builder.spec_total(SPEC_ITEMS))
 
 
 def spec_rec(party_rec: dict, contract_rec: dict | None) -> dict:

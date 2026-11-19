@@ -14,7 +14,6 @@ import re
 import shutil
 import sys
 import zipfile
-from decimal import Decimal
 
 import applog
 import storage
@@ -24,8 +23,8 @@ from document_builder import (
     amount_in_words_ru, amount_to_words_ru, build_replacements, digits_only,
     docx_from_text, fill_spec_items, format_amount, format_date,
     format_name_ip2, mark_spec_final_page, number_to_words_ru, parse_decimal,
-    prices_valid_until_default, replace_in_doc, spec_vat_amount,
-    spec_vat_amount_from_items,
+    prices_valid_until_default, replace_in_doc, spec_total,
+    spec_vat_amount, spec_vat_amount_from_items,
 )
 
 MAX_PATH_LENGTH = 240
@@ -386,9 +385,13 @@ def render_spec(rec: dict, store, spec_settings: dict | None = None) -> "Documen
              price=parse_decimal(item.get("price")))
         for item in (extra.get("items") or [])
     ]
-    total = parse_decimal(extra.get("total"))
-    if total == 0 and items:
-        total = sum((i["qty"] * i["price"] for i in items), Decimal("0"))
+    # Один путь расчёта итога (п. 9.8): сумма копеечных строк позиций —
+    # ровно то, что напечатано в таблице. Старые записи с сырым total в
+    # extra печатаются по исправленному итогу; без позиций — как записано.
+    if items:
+        total = spec_total(items)
+    else:
+        total = parse_decimal(extra.get("total"))
     replacements.update({
         PH.APPENDIX_NUMBER: appendix_number,
         PH.SPEC_NUMBER: rec.get("number") or "б/н",

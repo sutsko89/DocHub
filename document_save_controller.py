@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from typing import Any
 
 import customtkinter as ctk
@@ -50,6 +50,7 @@ import ui_macos as ui
 from document_builder import (
     F, MONTHS_GENITIVE, digits_only, format_quantity, format_amount,
     amount_in_words_ru, prices_valid_until_default, spec_vat_amount_from_items,
+    spec_line_total, spec_total,
 )
 from services import safe_filename, validate_contract_fields
 from widgets import SpecTable
@@ -231,10 +232,8 @@ class DocumentSaveController:
         return self.app.spec_table.get_items()
 
     def spec_total(self) -> Decimal:
-        return sum(
-            (item["qty"] * item["price"] for item in self.spec_items()),
-            Decimal("0"),
-        )
+        """Итого позиций таблицы — общий расчёт с печатной формой (п. 9.8)."""
+        return spec_total(self.spec_items())
 
     def on_spec_item_changed(self, *_args):
         self.regenerate_spec()
@@ -438,15 +437,14 @@ class DocumentSaveController:
         if items:
             lines.append("№   Наименование                Кол-во   Ед. изм.   Цена, руб.     Сумма, руб.")
             for index, item in enumerate(items, start=1):
-                amount = (item["qty"] * item["price"]).quantize(
-                    Decimal("0.01"), rounding=ROUND_HALF_UP
-                )
+                amount = spec_line_total(item)
                 lines.append(
                     f"{index}.  {item['name']}   —   {format_quantity(item['qty'])} "
                     f"{item['unit']} × {format_amount(item['price'])} = "
                     f"{format_amount(amount)} руб."
                 )
-            total = sum((i["qty"] * i["price"] for i in items), Decimal("0"))
+            # Один путь расчёта с печатью (п. 9.8): итог — сумма копеечных строк.
+            total = spec_total(items)
             lines.append(
                 f"Итого: {format_amount(total)} руб. ({amount_in_words_ru(total)})"
             )
@@ -700,7 +698,9 @@ class DocumentSaveController:
                 return
 
             # Decimal не сериализуется в JSON — сохраняем кол-во/цены float'ами.
-            total = sum((i["qty"] * i["price"] for i in items), Decimal("0"))
+            # Итог — общий расчёт с предпросмотром и печатью (п. 9.8):
+            # сумма копеечных строк, а не сырая сумма qty × price.
+            total = spec_total(items)
             items_json = [
                 {"name": i["name"], "qty": float(i["qty"]),
                  "unit": i["unit"], "price": float(i["price"])}

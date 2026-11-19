@@ -105,6 +105,33 @@ SPEC_APPENDIX_NUMBER = "1"   # номер приложения к договор
 SPEC_VAT_RATE = 22           # ставка НДС «в том числе», %
 
 
+def spec_line_total(item) -> Decimal:
+    """Сумма позиции: qty × price с копеечным округлением (ROUND_HALF_UP).
+
+    Единственный расчёт суммы строки: его используют и таблица печатной
+    формы (fill_spec_items), и предпросмотр, и итоговая сумма — предпросмотр
+    всегда совпадает с печатью (п. 9.8).
+    """
+    qty = item.get("qty") if isinstance(item.get("qty"), Decimal) else parse_decimal(item.get("qty"))
+    price = item.get("price") if isinstance(item.get("price"), Decimal) else parse_decimal(item.get("price"))
+    return (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def spec_total(items) -> Decimal:
+    """Итого спецификации: сумма копеечных сумм позиций («как в 1С»).
+
+    Итог считается по уже округлённым строкам, поэтому «Итого» всегда
+    равно сумме строк таблицы: сырая сумма qty × price может отличаться
+    от суммы строк на копейку (3 × 3,335 + 1 × 1,115: строки дают 11,13,
+    сырая сумма — 11,12). Единый путь расчёта для предпросмотра, записи
+    в реестр и печатной формы (п. 9.8).
+    """
+    return sum(
+        (spec_line_total(item) for item in items or []),
+        Decimal("0"),
+    )
+
+
 def spec_vat_amount(total, rate: int = SPEC_VAT_RATE) -> Decimal:
     """Сумма НДС «в том числе» из общей суммы: total * rate / (100 + rate)."""
     total_dec = total if isinstance(total, Decimal) else parse_decimal(total)
@@ -115,13 +142,11 @@ def spec_vat_amount(total, rate: int = SPEC_VAT_RATE) -> Decimal:
 
 def spec_vat_amount_from_items(items, rate: int = SPEC_VAT_RATE) -> Decimal:
     """Сумма НДС «в том числе» так же, как в 1С: НДС считается по каждой
-    позиции (сумма позиции * rate / (100 + rate), округление до копеек),
+    позиции (spec_line_total * rate / (100 + rate), округление до копеек),
     после чего НДС по позициям складывается в итог."""
     vat = Decimal("0")
     for item in items or []:
-        qty = item.get("qty") if isinstance(item.get("qty"), Decimal) else parse_decimal(item.get("qty"))
-        price = item.get("price") if isinstance(item.get("price"), Decimal) else parse_decimal(item.get("price"))
-        line_total = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        line_total = spec_line_total(item)
         vat += (line_total * rate / (100 + rate)).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )

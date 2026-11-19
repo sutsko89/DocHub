@@ -108,3 +108,34 @@ def test_same_document_name_gets_numbered_suffix(store, tmp_path, ooo_fields):
     assert first["ok"] and second["ok"]
     assert first["path"] != second["path"]
     assert "(2)" in os.path.basename(second["path"])
+
+
+def test_spec_printed_total_matches_printed_lines(store, ooo_fields):
+    """П. 9.8: «Итого» печатной формы равен сумме напечатанных строк.
+
+    Копеечный раскол (3 × 3,335 + 1 × 1,115): строки дают 11,13, сырая
+    сумма — 11,12. Старый путь писал в реестр сырую сумму и печатал её
+    в «Итого» — расхождение с таблицей на копейку. Единый spec_total
+    исключает его и исправляет итог старых записей.
+    """
+    from document_builder import parse_decimal, spec_total as db_spec_total
+
+    party = store.add_counterparty("ooo", ooo_fields)
+    items = [
+        {"name": "Кабель", "qty": 3.0, "unit": "м", "price": 3.335},
+        {"name": "Разъём", "qty": 1.0, "unit": "шт", "price": 1.115},
+    ]
+    rec = spec_rec(party, None)
+    rec["extra"]["items"] = items
+    rec["extra"]["total"] = 11.12  # сырая сумма, как её писала версия до 2.14.0
+    rec["number"] = "13"
+
+    doc = services.render_spec(rec, store)
+    text = docx_to_text(doc)
+
+    expected = format_amount(db_spec_total(items))
+    raw = format_amount(parse_decimal("11.120"))
+    assert expected == "11,13" and raw == "11,12"
+    assert expected in text, "«Итого» — сумма копеечных строк"
+    assert raw not in text, "сырая сумма больше не печатается как итог"
+    assert "{{" not in text

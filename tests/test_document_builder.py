@@ -15,7 +15,8 @@ from document_builder import (
     F, PH, amount_in_words_ru, amount_to_words_ru, build_replacements,
     digits_only, docx_from_text, docx_to_text, format_amount, format_date,
     format_phone, number_to_words_ru, parse_decimal, prices_valid_until_default,
-    replace_in_paragraph, spec_vat_amount, spec_vat_amount_from_items,
+    replace_in_paragraph, spec_line_total, spec_total, spec_vat_amount,
+    spec_vat_amount_from_items,
 )
 
 
@@ -35,6 +36,45 @@ def test_vat_from_items_is_line_by_line():
     items = [{"qty": 3, "price": "100.50"}, {"qty": 2, "price": 50}]
     # позиция 1: 301.50 * 22/122 = 54.37; позиция 2: 100 * 22/122 = 18.03
     assert spec_vat_amount_from_items(items) == Decimal("72.40")
+
+
+# ---------- Единый путь расчёта итога (п. 9.8) ----------
+
+def test_line_total_quantizes_to_kopecks():
+    item = {"name": "Кабель", "qty": 3, "unit": "м", "price": "3,335"}
+    assert spec_line_total(item) == Decimal("10.01")  # 10.005 → 10.01 (HALF_UP)
+
+
+def test_spec_total_is_sum_of_rounded_lines_not_raw_sum():
+    """Копеечный раскол: сырая сумма 11,12, сумма строк 11,13 — итог 11,13.
+
+    Печатная форма показывает строки по spec_line_total; «Итого», посчитанный
+    по сырым суммам, расходился с таблицей на копейку (п. 9.8).
+    """
+    items = [
+        {"name": "A", "qty": 3, "unit": "м", "price": "3.335"},
+        {"name": "B", "qty": 1, "unit": "шт", "price": "1.115"},
+    ]
+    raw = sum(parse_decimal(i["qty"]) * parse_decimal(i["price"]) for i in items)
+    assert raw == Decimal("11.120")
+    assert spec_total(items) == Decimal("11.13")
+    # и НДС по строкам соответствует тому же итогу
+    assert spec_vat_amount_from_items(items) == Decimal("2.01")
+
+
+def test_spec_total_empty_items_is_zero():
+    assert spec_total([]) == Decimal("0")
+    assert spec_total(None) == Decimal("0")
+
+
+def test_spec_total_accepts_floats_and_strings():
+    """Позиции из реестра (float) и из таблицы (Decimal/строки) — один результат."""
+    floats = [{"qty": 2.0, "price": 100.5}]
+    strings = [{"qty": "2", "price": "100,50"}]
+    decimals = [{"qty": parse_decimal("2"), "price": parse_decimal("100.5")}]
+    assert spec_total(floats) == Decimal("201.00")
+    assert spec_total(strings) == Decimal("201.00")
+    assert spec_total(decimals) == Decimal("201.00")
 
 
 # ---------- Числа и суммы ----------

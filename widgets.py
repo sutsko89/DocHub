@@ -457,11 +457,9 @@ class SpecTable(ctk.CTkFrame):
             })
         return items
 
-    def total(self) -> Decimal:
-        return sum(
-            (item["qty"] * item["price"] for item in self.get_items()),
-            Decimal("0"),
-        )
+    # Итог таблицы считает document_builder.spec_total (п. 9.8) — один
+    # расчёт для предпросмотра, реестра и печатной формы; собственный
+    # метод total() удалён как дублирующий (п. 9.5).
 
     # -- Вставка из буфера -------------------------------------------------- #
     def paste_clipboard(self):

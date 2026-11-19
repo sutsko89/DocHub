@@ -1,6 +1,7 @@
 """Быстрая проверка интерфейса и логики без ручного запуска."""
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
@@ -13,7 +14,9 @@ import zipfile
 
 import applog
 import dadata_client as dadata
+import document_builder
 import single_instance
+import win_shell
 import sqlite3
 from datetime import datetime
 
@@ -84,7 +87,7 @@ check(m.validate_party_fields({
     "Юридический адрес": "Москва", "Email": "a@b.ru", "Телефон": "+7 (912) 345-67-89",
     "Расчётный счёт": "40702810123456789012", "Корреспондентский счёт": "30101810100000000225",
     "Название банка": "Банк", "БИК": "044525225",
-    "Полное название компании (Покупь)": "ООО", "Сокращенное название компании": "ООО",
+    document_builder.F.FULL_NAME: "ООО", "Сокращенное название компании": "ООО",
     "ФИО директора": "Иванов И.И.",
 }, is_ip=False) == {}, "валидация контрагента: валидные данные")
 
@@ -178,6 +181,27 @@ check(not settings_controller.SettingsController.is_inside_directory(_path_base,
       "пути: выход за папку документов запрещён")
 
 # ---------- Хранилище ----------
+# v2.13.0: опечатка «(Покупь)» в имени поля исправлена (п. 9.6).
+check(document_builder.F.FULL_NAME == "Полное название компании (Покупатель)",
+      "имя поля: опечатка «Покупь» исправлена на «Покупатель»")
+_legacy = {"fields": {storage.LEGACY_FULL_NAME_FIELD: "ООО Ромашка"}, "data": {}}
+storage._normalize_field_names(_legacy)
+check(_legacy["fields"].get(document_builder.F.FULL_NAME) == "ООО Ромашка"
+      and storage.LEGACY_FULL_NAME_FIELD not in _legacy["fields"],
+      "миграция поля: старый ключ «(Покупь)» переименован при загрузке")
+
+# ---------- DPI и хуки окна (п. 6.3) ----------
+check(win_shell.dpi_scale_from_wparam((144 << 16) | 144) == 1.5
+      and win_shell.dpi_scale_from_wparam((120 << 16) | 120) == 1.25,
+      "DPI: масштаб интерфейса из wparam WM_DPICHANGED (144 → 1.5, 120 → 1.25)")
+_rc = win_shell._RECT(100, 50, 1700, 950)
+check(win_shell.suggested_rect_from_lparam(ctypes.addressof(_rc)) == (100, 50, 1600, 900),
+      "DPI: прямоугольник-подсказка Windows из lparam WM_DPICHANGED")
+check(bool(win_shell.documents_known_folder()),
+      "DPI: папка «Документы» определяется (п. 6.2)")
+win_shell.enable_dpi_awareness()
+check(True, "DPI: per-monitor awareness установлен без ошибок")
+
 os.makedirs(storage.data_dir(), exist_ok=True)
 store = storage.DataStore()
 party_rec = store.add_counterparty("ooo", {

@@ -34,6 +34,7 @@ from tkinter import filedialog
 
 import applog
 import dadata_client as dadata
+import dadata_controller
 import document_importer as importer
 import import_controller
 import reconcile
@@ -75,7 +76,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -524,13 +525,10 @@ class ContractApp:
         self._cp_error_vars: dict[str, dict[str, tk.StringVar]] = {"ooo": {}, "ip": {}}
         self._cp_date_error_vars = {"ooo": tk.StringVar(value=""), "ip": tk.StringVar(value="")}
         self._cp_status_var = tk.StringVar(value="")
-        self._cp_busy = False
-        self._cp_busy_after = None
-        self._cp_busy_phase = 0
-        # Результат DaData приходит через очередь и опрашивается только
-        # из главного потока Tk — root.after() из рабочего потока запрещён
-        # (аудит 2.0.1): тот же паттерн, что у пакетного импорта.
-        self._cp_result_queue = None
+        # Оркестрация DaData (заполнение по ИНН) — в отдельном контроллере
+        # (шаг декомпозиции ContractApp, аудит 2.0.1 P2): busy-анимация,
+        # воркер и опрос очереди живут в dadata_controller.DadataController.
+        self._dadata_flow = dadata_controller.DadataController(self)
 
         # Единый «текущий контрагент» и защита несохранённых данных (п. 4.2, 4.4).
         self._current_party_id = None
@@ -897,73 +895,12 @@ class ContractApp:
     # ------------------------------------------------------------------ #
     def _choice_dialog(self, title: str, message: str,
                        options: list[tuple[str, str, bool]]) -> str | None:
-        """Модальный диалог с N кнопками.
+        """Модальный диалог с N кнопками — примитив переехал в ui_macos.
 
         ``options``: список ``(ключ, подпись, главная_кнопка)`` слева направо.
         Возвращает ключ выбранного варианта или ``None`` при закрытии окна.
         """
-        result: dict[str, str | None] = {"key": None}
-        win = ctk.CTkToplevel(self.root)
-        win.title(title)
-        win.configure(fg_color=ui.COLORS["window"])
-        win.transient(self.root)
-        win.resizable(False, False)
-
-        body = ctk.CTkFrame(win, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=int(24 * self.scale),
-                  pady=int(20 * self.scale))
-        ctk.CTkLabel(
-            body, text=title, font=ui.font(16, "bold", display=True),
-            text_color=ui.COLORS["text"], anchor="w", justify="left",
-            wraplength=int(460 * self.scale),
-        ).pack(anchor="w")
-        ctk.CTkLabel(
-            body, text=message, font=ui.font(12),
-            text_color=ui.COLORS["text_secondary"], anchor="w", justify="left",
-            wraplength=int(460 * self.scale),
-        ).pack(anchor="w", pady=(int(10 * self.scale), int(16 * self.scale)))
-
-        buttons = ctk.CTkFrame(body, fg_color="transparent")
-        buttons.pack(fill="x")
-
-        def choose(key: str | None) -> None:
-            result["key"] = key
-            try:
-                win.grab_release()
-            except Exception:
-                pass
-            try:
-                win.destroy()
-            except Exception:
-                pass
-
-        for key, label, primary in options:
-            if primary:
-                button = ui.primary_button(
-                    buttons, label, lambda k=key: choose(k),
-                    width=int(190 * self.scale), height=int(32 * self.scale),
-                )
-            else:
-                button = ui.ghost_button(
-                    buttons, label, lambda k=key: choose(k),
-                    width=int(160 * self.scale), height=int(32 * self.scale),
-                )
-            button.pack(side="left", padx=(0, int(8 * self.scale)))
-
-        win.protocol("WM_DELETE_WINDOW", lambda: choose(None))
-        win.update_idletasks()
-        try:
-            x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
-            y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
-            win.geometry(f"+{max(0, x)}+{max(0, y)}")
-        except Exception:
-            pass
-        try:
-            win.grab_set()
-        except Exception:
-            pass
-        win.wait_window()
-        return result["key"]
+        return ui.choice_dialog(self.root, title, message, options, self.scale)
 
     def _persist_settings(self) -> bool:
         """Сразу сохраняет настройки (тема, папка документов) на диск."""
@@ -4155,142 +4092,56 @@ class ContractApp:
         self._select_page("contract")
 
     # ------------------------------------------------------------------ #
-    #  DaData: автозаполнение карточки контрагента
+    #  DaData: автозаполнение — оркестрация в DadataController
     # ------------------------------------------------------------------ #
-    def _cp_fill_from_inn(self):
-        # Защита от повторных кликов (аудит 2.0.1): пока запрос выполняется,
-        # новый воркер не запускается — раньше два параллельных запроса
-        # гонялись за одними полями формы.
-        if self._cp_busy:
-            return
-        mode = "ip" if self._cp_type_var.get() == "ИП" else "ooo"
-        widget = self._cp_entries[mode].get(F.INN)
-        inn = widget.get().strip() if widget is not None else ""
-        expected = 12 if mode == "ip" else 10
-        if not inn.isdigit() or len(inn) != expected:
-            ui.alert(
-                self.root, "Проверьте ИНН",
-                f"ИНН должен содержать {expected} цифр.", "error",
-            )
-            return
+    #  Шаг декомпозиции «бог-класса» ContractApp (аудит 2.0.1, P2): guard
+    #  повторных кликов, busy-анимация, воркер и опрос очереди живут в
+    #  dadata_controller.DadataController; здесь — фасады с прежними именами.
+    #  Результат приходит через очередь и опрашивается только из главного
+    #  потока Tk — root.after() из рабочего потока запрещён (аудит 2.0.1).
 
-        api_key = dadata.get_api_key()
-        if not api_key:
-            ui.alert(
-                self.root, "Нет API-ключа",
-                "Ключ DaData не задан. Укажите его на странице «Настройки» "
-                "или заполните реквизиты вручную.", "error",
-            )
-            return
+    @property
+    def _cp_busy(self) -> bool:
+        """Выполняется ли сейчас запрос реквизитов по ИНН."""
+        return self._dadata_flow.busy
 
-        self._cp_busy = True
-        self._cp_busy_phase = 0
-        # Очередь результата + опрос из главного потока (как у пакетного
-        # импорта): рабочий поток не трогает Tk и не вызывает root.after()
-        # (аудит 2.0.1 — гарантий потокобезопасности Tcl нет).
-        result_queue: queue.Queue = queue.Queue()
-        self._cp_result_queue = result_queue
-        self._cp_busy_tick()
-        worker = threading.Thread(
-            target=self._cp_fetch_worker, args=(inn, api_key, mode, result_queue),
-            daemon=True,
-        )
-        worker.start()
-        self.root.after(80, self._cp_result_tick)
+    @_cp_busy.setter
+    def _cp_busy(self, value) -> None:
+        self._dadata_flow.busy = bool(value)
 
-    def _cp_busy_tick(self):
-        if not self._cp_busy:
-            return
-        dots = "." * (self._cp_busy_phase % 4)
-        self._cp_status_var.set(f"Загружаю реквизиты из ЕГРЮЛ/ЕГРИП{dots}")
-        self._cp_busy_phase += 1
-        self._cp_busy_after = self.root.after(300, self._cp_busy_tick)
+    def _cp_fill_from_inn(self) -> None:
+        """Заполняет карточку контрагента из ЕГРЮЛ/ЕГРИП по ИНН.
 
-    def _cp_busy_stop(self):
-        self._cp_busy = False
-        if self._cp_busy_after is not None:
-            try:
-                self.root.after_cancel(self._cp_busy_after)
-            except Exception:
-                pass
-            self._cp_busy_after = None
-        self._cp_result_queue = None  # цикл опроса останавливается
+        Guard повторных кликов — в DadataController.fill_from_inn (аудит
+        2.0.1). Фабрика потока передаётся из main на каждый вызов:
+        smoke-тест подменяет main.threading.Thread синхронным исполнителем.
+        """
+        self._dadata_flow.fill_from_inn(thread_factory=threading.Thread)
 
-    def _cp_fetch_worker(self, inn: str, api_key: str, mode: str, result_queue: "queue.Queue"):
+    def _cp_busy_tick(self) -> None:
+        """Кадр анимации «Загружаю реквизиты…»."""
+        self._dadata_flow.busy_tick()
+
+    def _cp_busy_stop(self) -> None:
+        """Останавливает анимацию и цикл опроса."""
+        self._dadata_flow.busy_stop()
+
+    def _cp_fetch_worker(self, inn: str, api_key: str, mode: str,
+                         result_queue: "queue.Queue") -> None:
         """Рабочий поток DaData: только HTTP и очередь — никаких вызовов Tk."""
-        try:
-            info = dadata.fetch_party(inn, api_key)
-        except Exception as exc:
-            result_queue.put(("error", str(exc)))
-            return
-        result_queue.put(("ok", mode, info))
+        self._dadata_flow.fetch_worker(inn, api_key, mode, result_queue)
 
-    def _cp_result_tick(self):
+    def _cp_result_tick(self) -> None:
         """Опрашивает очередь результата DaData из главного потока Tk."""
-        result_queue = getattr(self, "_cp_result_queue", None)
-        if result_queue is None:
-            return  # запрос завершён или окно закрывается
-        try:
-            item = result_queue.get_nowait()
-        except queue.Empty:
-            self.root.after(80, self._cp_result_tick)
-            return
-        except (tk.TclError, AttributeError):
-            return
-        kind = item[0]
-        if kind == "error":
-            self._cp_party_failed(item[1])
-        elif kind == "ok":
-            self._cp_party_loaded(item[1], item[2])
+        self._dadata_flow.result_tick()
 
-    def _cp_party_failed(self, message: str):
-        self._cp_busy_stop()
-        self._cp_status_var.set("")
-        ui.alert(self.root, "Не удалось заполнить реквизиты", message, "error")
+    def _cp_party_failed(self, message: str) -> None:
+        """Запрос не удался: стоп-анимация, ошибка пользователю."""
+        self._dadata_flow.party_failed(message)
 
-    def _cp_party_loaded(self, mode: str, info: dict):
-        self._cp_busy_stop()
-        self._cp_status_var.set("")
-
-        filled: list[str] = []
-
-        def put(key: str, value: str):
-            if not value:
-                return
-            widget = self._cp_entries[mode].get(key)
-            if widget is None:
-                return
-            widget.delete(0, tk.END)
-            widget.insert(0, value)
-            filled.append(key)
-
-        put(F.INN, info["inn"])
-        put(F.LEGAL_ADDRESS, info["legal_address"])
-        put(F.BANK, info["bank_name"])
-        put(F.BIK, info["bik"])
-        put(F.CORR_ACCOUNT, info["correspondent_account"])
-
-        if mode == "ooo":
-            put(F.FULL_NAME, info["full_name"])
-            put(F.SHORT_NAME, info["short_name"])
-            put(F.DIRECTOR, info["director"])
-            put(F.KPP, info["kpp"])
-            put(F.OGRN, info["ogrn"])
-            fact = self._cp_entries[mode].get(F.FACT_ADDRESS)
-            if fact is not None and not fact.get().strip():
-                put(F.FACT_ADDRESS, info["legal_address"])
-        else:
-            put(F.IP_NAME, info["director"])
-            put(F.OGRNIP, info["ogrn"])
-
-        if not filled:
-            ui.alert(
-                self.root, "Данных нет",
-                "Сервис вернул карточку без данных для подстановки.", "error",
-            )
-            return
-
-        self._cp_status_var.set("Реквизиты заполнены из ЕГРЮЛ/ЕГРИП")
+    def _cp_party_loaded(self, mode: str, info: dict) -> None:
+        """Карточка получена: подстановка реквизитов в поля формы."""
+        self._dadata_flow.party_loaded(mode, info)
 
     # ------------------------------------------------------------------ #
     #  Несохранённые данные (п. 4.4)

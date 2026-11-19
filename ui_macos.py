@@ -1841,3 +1841,153 @@ def confirm(parent: tk.Misc, title: str, message: str,
     dialog = Alert(parent, title, message, "question", ok_text, cancel_text)
     dialog.show(parent)
     return bool(dialog._result)
+
+
+def choice_dialog(parent: tk.Misc, title: str, message: str,
+                  options: Sequence[tuple[str, str, bool]],
+                  scale: float = 1.0) -> Optional[str]:
+    """Модальный диалог с N кнопками (примитив; перенос из main.py).
+
+    ``options``: список ``(ключ, подпись, главная_кнопка)`` слева направо.
+    Возвращает ключ выбранного варианта или ``None`` при закрытии окна.
+    """
+    result: dict[str, Optional[str]] = {"key": None}
+    win = ctk.CTkToplevel(parent)
+    win.title(title)
+    win.configure(fg_color=COLORS["window"])
+    win.transient(parent)
+    win.resizable(False, False)
+
+    body = ctk.CTkFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=int(24 * scale),
+              pady=int(20 * scale))
+    ctk.CTkLabel(
+        body, text=title, font=font(16, "bold", display=True),
+        text_color=COLORS["text"], anchor="w", justify="left",
+        wraplength=int(460 * scale),
+    ).pack(anchor="w")
+    ctk.CTkLabel(
+        body, text=message, font=font(12),
+        text_color=COLORS["text_secondary"], anchor="w", justify="left",
+        wraplength=int(460 * scale),
+    ).pack(anchor="w", pady=(int(10 * scale), int(16 * scale)))
+
+    buttons = ctk.CTkFrame(body, fg_color="transparent")
+    buttons.pack(fill="x")
+
+    def choose(key: Optional[str]) -> None:
+        result["key"] = key
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    for key, label, primary in options:
+        if primary:
+            button = primary_button(
+                buttons, label, lambda k=key: choose(k),
+                width=int(190 * scale), height=int(32 * scale),
+            )
+        else:
+            button = ghost_button(
+                buttons, label, lambda k=key: choose(k),
+                width=int(160 * scale), height=int(32 * scale),
+            )
+        button.pack(side="left", padx=(0, int(8 * scale)))
+
+    win.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+    win.update_idletasks()
+    try:
+        x = parent.winfo_rootx() + (parent.winfo_width() - win.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+    except Exception:
+        pass
+    try:
+        win.grab_set()
+    except Exception:
+        pass
+    win.wait_window()
+    return result["key"]
+
+
+def import_report_window(parent: tk.Misc, entries: list[dict], summary: str,
+                         scale: float = 1.0,
+                         kind_labels: Optional[dict] = None) -> None:
+    """Окно отчёта пакетного импорта (примитив; перенос из контроллера).
+
+    По каждому файлу видны тип, результат и причина (п. 3.5 плана).
+    Словарь подписей типов документов передаётся вызывающим кодом —
+    слой оформления не зависит от хранилища.
+    """
+    labels = kind_labels or {}
+    win = ctk.CTkToplevel(parent)
+    win.title("Отчёт об импорте")
+    win.configure(fg_color=COLORS["window"])
+    win.transient(parent)
+    win.resizable(True, True)
+
+    body = ctk.CTkFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=int(22 * scale),
+              pady=int(18 * scale))
+    ctk.CTkLabel(
+        body, text="Отчёт об импорте", font=font(16, "bold", display=True),
+        text_color=COLORS["text"], anchor="w",
+    ).pack(anchor="w")
+    ctk.CTkLabel(
+        body, text=summary, font=font(12), justify="left", anchor="w",
+        text_color=COLORS["text_secondary"], wraplength=int(660 * scale),
+    ).pack(anchor="w", pady=(int(6 * scale), int(10 * scale)))
+
+    textbox = ctk.CTkTextbox(
+        body, width=int(660 * scale), height=int(360 * scale),
+        font=font(12), wrap="word",
+    )
+    textbox.pack(fill="both", expand=True)
+
+    icons = {"added": "✓", "duplicate": "•", "skip": "✕"}
+    lines: list[str] = []
+    for entry in entries:
+        label = labels.get(entry.get("kind"), "Документ")
+        line = (
+            f"{icons.get(entry.get('status'), '•')} {entry.get('name')} — "
+            f"{label}"
+        )
+        if entry.get("detail"):
+            line += f": {entry['detail']}"
+        if entry.get("warning"):
+            line += f" ({entry['warning']})"
+        lines.append(line)
+    textbox.insert("1.0", "\n".join(lines) or "Файлы не выбраны")
+    textbox.configure(state="disabled")
+
+    buttons = ctk.CTkFrame(body, fg_color="transparent")
+    buttons.pack(fill="x", pady=(int(12 * scale), 0))
+    primary_button(
+        buttons, "Закрыть", win.destroy,
+        width=int(120 * scale), height=int(32 * scale),
+    ).pack(side="right")
+
+    win.update_idletasks()
+    width = int(720 * scale)
+    height = int(520 * scale)
+    try:
+        x = parent.winfo_rootx() + max(
+            0, (parent.winfo_width() - width) // 2
+        )
+        y = parent.winfo_rooty() + max(
+            0, (parent.winfo_height() - height) // 3
+        )
+        win.geometry(f"{width}x{height}+{x}+{y}")
+    except Exception:
+        pass
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+    try:
+        win.grab_set()
+    except tk.TclError:
+        pass
+    win.wait_window()

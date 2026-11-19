@@ -653,71 +653,13 @@ class ImportController:
     #  Отчёт
     # ------------------------------------------------------------------ #
     def show_report(self, entries: list[dict], summary: str) -> None:
-        """Окно отчёта: по каждому файлу тип, результат и причина (п. 3.5)."""
-        scale = self.app.scale
-        win = ctk.CTkToplevel(self.app.root)
-        win.title("Отчёт об импорте")
-        win.configure(fg_color=ui.COLORS["window"])
-        win.transient(self.app.root)
-        win.resizable(True, True)
+        """Окно отчёта: по каждому файлу тип, результат и причина (п. 3.5).
 
-        body = ctk.CTkFrame(win, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=int(22 * scale),
-                  pady=int(18 * scale))
-        ctk.CTkLabel(
-            body, text="Отчёт об импорте", font=ui.font(16, "bold", display=True),
-            text_color=ui.COLORS["text"], anchor="w",
-        ).pack(anchor="w")
-        ctk.CTkLabel(
-            body, text=summary, font=ui.font(12), justify="left", anchor="w",
-            text_color=ui.COLORS["text_secondary"], wraplength=int(660 * scale),
-        ).pack(anchor="w", pady=(int(6 * scale), int(10 * scale)))
-
-        textbox = ctk.CTkTextbox(
-            body, width=int(660 * scale), height=int(360 * scale),
-            font=ui.font(12), wrap="word",
+        Тело — в ui_macos.import_report_window (примитив слоя оформления,
+        перенос по рекомендации аудита 2.0.1); подписи типов документов
+        передаются параметром, чтобы слой оформления не зависел от storage.
+        """
+        ui.import_report_window(
+            self.app.root, entries, summary, self.app.scale,
+            kind_labels=storage.KIND_LABELS,
         )
-        textbox.pack(fill="both", expand=True)
-
-        icons = {"added": "✓", "duplicate": "•", "skip": "✕"}
-        lines: list[str] = []
-        for entry in entries:
-            label = storage.KIND_LABELS.get(entry.get("kind"), "Документ")
-            line = (
-                f"{icons.get(entry.get('status'), '•')} {entry.get('name')} — "
-                f"{label}"
-            )
-            if entry.get("detail"):
-                line += f": {entry['detail']}"
-            if entry.get("warning"):
-                line += f" ({entry['warning']})"
-            lines.append(line)
-        textbox.insert("1.0", "\n".join(lines) or "Файлы не выбраны")
-        textbox.configure(state="disabled")
-
-        buttons = ctk.CTkFrame(body, fg_color="transparent")
-        buttons.pack(fill="x", pady=(int(12 * scale), 0))
-        ui.primary_button(
-            buttons, "Закрыть", win.destroy,
-            width=int(120 * scale), height=int(32 * scale),
-        ).pack(side="right")
-
-        win.update_idletasks()
-        width = int(720 * scale)
-        height = int(520 * scale)
-        try:
-            x = self.app.root.winfo_rootx() + max(
-                0, (self.app.root.winfo_width() - width) // 2
-            )
-            y = self.app.root.winfo_rooty() + max(
-                0, (self.app.root.winfo_height() - height) // 3
-            )
-            win.geometry(f"{width}x{height}+{x}+{y}")
-        except Exception:
-            pass
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
-        try:
-            win.grab_set()
-        except tk.TclError:
-            pass
-        win.wait_window()

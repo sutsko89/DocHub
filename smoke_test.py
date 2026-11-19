@@ -14,6 +14,7 @@ import zipfile
 import applog
 import dadata_client as dadata
 import single_instance
+from datetime import datetime
 
 # Настройки приложения и база данных (контрагенты/документы) читаются из APPDATA:
 # изолируем тест от реальных данных пользователя, чтобы результат был детерминированным.
@@ -41,11 +42,21 @@ _real_open_file = m.open_file  # реальная функция до стаба
 m.open_file = lambda path: OPENED.append(path)
 
 
+# Аудит 2.0.1: check() больше не завершает процесс на первой же неудаче —
+# неудачи копятся и печатаются сводкой в конце (в CI видно всё сразу,
+# а не одну ошибку за прогон). Код возврата — числу неудач (до 100).
+FAILURES: list[str] = []
+_TOTAL_CHECKS = 0
+
+
 def check(condition, message):
-    if not condition:
+    global _TOTAL_CHECKS
+    _TOTAL_CHECKS += 1
+    if condition:
+        print(f"ok: {message}")
+    else:
+        FAILURES.append(message)
         print(f"FAIL: {message}")
-        sys.exit(1)
-    print(f"ok: {message}")
 
 
 # ---------- Чистая логика ----------
@@ -61,6 +72,8 @@ check(m.format_number_grouped("1500000") == "1 500 000", "разделители
 check(m.validate_day_input("31") and not m.validate_day_input("32"), "валидатор дня 1-31")
 check(m.validate_term_input("45") and not m.validate_term_input("abc"), "валидатор отсрочки")
 check(m.validate_limit_input("1 500") and not m.validate_limit_input("15a"), "валидатор лимита")
+check(m.get_spec_settings()["spec_year"] == datetime.now().year,
+      "настройки: год спецификации берётся на момент вызова, а не импорта модуля")
 
 errors = m.validate_party_fields({}, is_ip=False)
 check("ИНН" in errors and "Расчётный счёт" in errors, "валидация контрагента: пустые поля")
@@ -116,6 +129,15 @@ check(not dadata.save_api_key(""), "dadata: пустой ключ не сохр�
 check(not dadata.save_api_key("ключ с пробелом"), "dadata: ключ с пробелом отклонён")
 check(dadata.save_api_key("smoke-test-key"), "dadata: ключ сохранён")
 check(dadata.get_api_key() == "smoke-test-key", "dadata: сохранённый ключ читается")
+# Аудит 2.0.1: на Windows ключ на диске зашифрован (DPAPI); в dev/CI — открытый текст.
+with open(dadata.key_storage_path(), encoding="utf-8") as _kf:
+    _stored_key = _kf.read()
+if dadata._dpapi_available():
+    check(_stored_key.startswith(dadata.KEY_ENC_PREFIX),
+          "dadata: на Windows ключ хранится зашифрованным (DPAPI)")
+else:
+    check(not _stored_key.startswith(dadata.KEY_ENC_PREFIX),
+          "dadata: без DPAPI (dev/CI) ключ хранится открытым текстом")
 
 # Миграция ключа из прежнего расположения (DogovorPostavki).
 _appdata_backup = os.environ["APPDATA"]
@@ -251,12 +273,31 @@ check(not [n for n in os.listdir(storage.data_dir()) if n.endswith(".tmp")],
       "2.1: временные файлы после записи не остаются")
 os.environ["APPDATA"] = _appdata_p1
 
+# ---------- Уборка старых .bad-* копий (аудит 2.0.1) ----------
+_bad_old = storage.db_path() + ".bad-20200101-000000"
+_bad_fresh = storage.db_path() + ".bad-29991231-235959"
+for _bad_path in (_bad_old, _bad_fresh):
+    with open(_bad_path, "w", encoding="utf-8") as _fh:
+        _fh.write("{}")
+_bad_past = time.time() - (storage.BAD_COPY_RETENTION_DAYS + 10) * 86400
+os.utime(_bad_old, (_bad_past, _bad_past))
+storage.DataStore()  # загрузка запускает уборку
+check(not os.path.exists(_bad_old) and os.path.exists(_bad_fresh),
+      "хранилище: .bad-копии старше лимита убираются, свежие остаются")
+try:
+    os.remove(_bad_fresh)
+except OSError:
+    pass
+
 # ---------- Блокировка второго экземпляра (п. 2.2) ----------
 _lock = single_instance.InstanceLock()
 check(_lock.acquire(), "2.2: первый запуск захватывает блокировку")
 _lock.release()
 check(single_instance.InstanceLock().acquire(),
       "2.2: после release блокировка снова свободна")
+check(single_instance.mutex_name().startswith("Global\\")
+      and "EWDocHub" in single_instance.mutex_name(),
+      "2.2: мьютекс в Global-пространстве (защита и от второй RDP-сессии)")
 check(bool(single_instance.MUTEX_NAME) and "EWDocHub" in single_instance.MUTEX_NAME,
       "2.2: именованный mutex настроен")
 with open("main.py", encoding="utf-8") as _mf:
@@ -792,6 +833,51 @@ try:
             check(app._cp_type_var.get() == "Юр. лицо",
                   "контрагент: возврат на «Юр. лицо» обновляет тип")
 
+    # ---------- Аудит 2.0.1: re-entry импорта и повторные клики DaData ----------
+    _guard_thread_orig = m.threading.Thread
+    _guard_threads: list = []
+
+    class _CountingThread:
+        def __init__(self, target=None, args=(), daemon=None, **_kw):
+            _guard_threads.append(self)
+            self._target, self._args = target, args
+
+        def start(self):
+            pass  # в guard-проверках воркеры не должны даже стартовать
+
+    m.threading.Thread = _CountingThread
+    try:
+        _guard_docx = os.path.join(tempfile.gettempdir(), "smoke_guard.docx")
+        _Doc().save(_guard_docx)
+        _threads_before = len(_guard_threads)
+
+        # Первый импорт «выполняется»: второй запуск (как при drag-and-drop)
+        # обязан быть заблокирован, не сбрасывая состояние очереди.
+        app._import_running = True
+        app._import_queue = None
+        app._import_win = None
+        app._start_documents_import([_guard_docx])
+        check(len(_guard_threads) == _threads_before
+              and app._import_queue is None and app._import_win is None,
+              "импорт: повторный запуск во время первого заблокирован, "
+              "очередь первого не тронута")
+        app._import_running = False
+
+        app._start_documents_import([])
+        check(len(_guard_threads) == _threads_before,
+              "импорт: пустой список файлов не запускает воркер")
+
+        # Повторный клик «Заполнить по ИНН» при активном запросе игнорируется.
+        app._cp_busy = True
+        app._cp_fill_from_inn()
+        check(len(_guard_threads) == _threads_before and app._cp_busy,
+              "dadata: повторный клик при активном запросе не порождает воркера")
+        app._cp_busy = False
+    finally:
+        m.threading.Thread = _guard_thread_orig
+        ALERTS.clear()
+        app.root.update()
+
 
     # Контрагент появляется в списке страницы договора.
     app._refresh_party_combo_values()
@@ -1072,6 +1158,19 @@ try:
     app.spec_table.set_row_count(4)
     check(len(app._spec_rows) == 4, "таблица: лишние строки удаляются")
     check(app._spec_rows[-1]["num"].cget("text") == "4", "таблица: нумерация строк актуальна")
+
+    # Аудит 2.0.1: валидаторы ячеек включены флагом validate="key" — раньше
+    # Tk создавал validatecommand, но никогда его не вызывал, и в «Кол-во»/
+    # «Цена» можно было ввести буквы.
+    _qty_cell = app.spec_table.rows[0]["cells"]["qty"]
+    _price_cell = app.spec_table.rows[0]["cells"]["price"]
+    check(str(_qty_cell.cget("validate")) == "key"
+          and str(_price_cell.cget("validate")) == "key",
+          "таблица: валидаторы «Кол-во»/«Цена» включены (validate=key)")
+    check(m.SpecTable._sanitize_value("qty", "abc") == ""
+          and m.SpecTable._sanitize_value("qty", "12,5") == "12.5"
+          and m.SpecTable._sanitize_value("price", "1 000,50") == "1000.50",
+          "таблица: вставка мимо валидации (var.set) проходит санитизацию")
 
     # Применение количества строк по Enter в поле «Строк:».
     app.spec_table._count_var.set("6")
@@ -1376,7 +1475,8 @@ try:
     # 6.1/6.5: установщик — директивы, версия, вопрос деинсталлятора.
     with open("installer.iss", "r", encoding="utf-8") as _iss_f:
         _iss_src = _iss_f.read()
-    for _directive in ("AppMutex=Local\\EWDocHub_SingleInstance", "MinVersion=10.0",
+    for _directive in ("AppMutex=Global\\EWDocHub_InstallerMutex;Local\\EWDocHub_InstallerMutex",
+                       "MinVersion=10.0",
                        "ArchitecturesAllowed=x64compatible", "CloseApplications=yes",
                        "PrivilegesRequiredOverridesAllowed=dialog",
                        "LicenseFile=license.txt",
@@ -1384,10 +1484,19 @@ try:
         check(_directive in _iss_src, f"6.1: в установщике есть {_directive}")
     check("DelTree" in _iss_src and "DogovorGenerator" in _iss_src,
           "6.5: деинсталлятор спрашивает про данные и ключ DaData")
+    # Аудит 2.0.1: версии не должны «разъезжаться» — installer.iss обязан
+    # совпадать с APP_VERSION, spec обязан читать версию из main.py.
+    _iss_version = re.search(r'#define MyAppVersion "([^"]+)"', _iss_src)
+    check(_iss_version is not None and _iss_version.group(1) == m.APP_VERSION,
+          "6.1: версия установщика совпадает с APP_VERSION из main.py")
     with open("EWDochub.spec", "r", encoding="utf-8") as _spec_f:
         _spec_src = _spec_f.read()
     check("VSVersionInfo" in _spec_src and "version=exe_version" in _spec_src,
           "6.1: у exe есть VersionInfo в сборке")
+    check("filevers=FILEVERS" in _spec_src and "prodvers=FILEVERS" in _spec_src,
+          "6.1: бинарная версия exe вычисляется из APP_VERSION, а не захардкожена")
+    check(re.search(r'APP_VERSION\s*=\s*"\d+\.\d+\.\d+"', _spec_src) is None,
+          "6.1: в spec нет собственной копии версии (читается из main.py)")
     check(os.path.exists("license.txt"), "6.1: файл лицензии и уведомлений существует")
 
     # 6.2: сообщение соответствует действительности — открытие проверяется.
@@ -1526,4 +1635,12 @@ finally:
     except Exception:
         pass
 
-print("SMOKE OK")
+print("SMOKE OK" if not FAILURES else "SMOKE FAILED")
+
+# Аудит 2.0.1: сводка всех неудач в конце — в CI видно всё сразу.
+if FAILURES:
+    print(f"\n=== СВОДКА: {len(FAILURES)} из {_TOTAL_CHECKS} проверок не прошли ===")
+    for _message in FAILURES:
+        print(f"FAIL: {_message}")
+    sys.exit(min(len(FAILURES), 100))
+print(f"SMOKE OK: {_TOTAL_CHECKS} проверок")

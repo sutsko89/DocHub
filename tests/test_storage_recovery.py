@@ -105,20 +105,28 @@ def test_registry_recovered_from_tmp_file(appdata):
     assert store.load_warning  # «восстановлен из временного файла»
 
 
-# ---------- Запись в read-only папку ----------
+# ---------- Запись при отказе ОС ----------
 
-@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0,
-                    reason="chmod-блокировка не работает под root / не POSIX")
-def test_save_to_readonly_dir_returns_false(appdata):
+def test_save_returns_false_when_os_refuses_write(appdata, monkeypatch):
+    """save() возвращает False, когда ОС отказала в записи (аудит 2.0.1).
+
+    Прежний тест имитировал read-only папку через chmod — он не работает на
+    Windows (права каталога там не блокируют запись) и под root, поэтому в
+    CI приходилось пропускать тест. Контракт «save() честно сообщает об
+    отказе и заполняет last_error» проверяется платформонезависимо:
+    os.replace (финальный шаг атомарной записи) отказывает в доступе.
+    """
     store = storage.DataStore()
     store.add_counterparty("ooo", {"ИНН": "2540123456"})
-    db_dir = os.path.dirname(storage.db_path())
-    os.chmod(db_dir, stat.S_IREAD | stat.S_IEXEC)
-    try:
-        assert store.save() is False
-        assert store.last_error
-    finally:
-        os.chmod(db_dir, stat.S_IRWXU)
+
+    def denied_replace(src, dst, *args, **kwargs):
+        raise PermissionError(13, "Отказано в доступе")
+
+    monkeypatch.setattr(os, "replace", denied_replace)
+    assert store.save() is False
+    assert store.last_error  # причина доносится до пользователя
+    # Реестр в памяти не «пропал» из-за сбоя записи.
+    assert len(store.counterparties) == 1
 
 
 # ---------- Осиротевшие файлы и сверка с папкой ----------

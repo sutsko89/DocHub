@@ -37,6 +37,7 @@ import applog
 import dadata_client as dadata
 import dadata_controller
 import document_importer as importer
+import document_page_controller
 import document_save_controller
 import import_controller
 import lifecycle_controller
@@ -80,7 +81,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -547,6 +548,13 @@ class ContractApp:
         # Создаётся ДО построения страниц: _build_counterparty_page уже
         # идёт через контроллер.
         self._counterparty_flow = counterparty_controller.CounterpartyController(self)
+
+        # Страницы «Договор» и «Доп. соглашение» с отложенными
+        # предпросмотрами — тоже контроллер (шаг 7 декомпозиции ContractApp,
+        # аудит 2.0.1 P2). Создаётся ДО построения страниц:
+        # _build_contract_page / _build_additional_page уже идут через
+        # контроллер.
+        self._doc_page_flow = document_page_controller.DocumentPageController(self)
 
         # Единый «текущий контрагент» и защита несохранённых данных (п. 4.2, 4.4).
         self._current_party_id = None
@@ -1170,308 +1178,50 @@ class ContractApp:
     # ------------------------------------------------------------------ #
     #  Страница «Договор поставки»
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    #  Страницы «Договор» и «Доп. соглашение» — DocumentPageController
+    # ------------------------------------------------------------------ #
+    #  Сборка страниц, отложенные текстовые предпросмотры (п. 5.6), поиск
+    #  контрагента по ИНН, подстановка договора-основания (п. 5.1, 4.2)
+    #  и поля «сумма/срок прописью» переехали в document_page_controller.
+    #  DocumentPageController (седьмой шаг декомпозиции ContractApp, аудит
+    #  2.0.1 P2). Состояние страниц остаётся на приложении с прежними
+    #  именами (contract_party_var, addl_contract_var, _limit_var …,
+    #  таймеры _preview_*_after) — его читают защита несохранённых данных
+    #  (п. 4.2, 4.4), DocumentSaveController и smoke-тест; здесь остаются
+    #  фасады с прежними именами для внешних вызывающих.
     def _build_contract_page(self):
-        _page, left, _right, textbox = self._make_page(
-            "contract", "Договор поставки",
-            "Выберите контрагента, укажите номер и дату. «Сохранить договор» запишет его "
-            "в реестр и сразу откроет готовый документ в Word.",
-            with_text=True, text_title="Предпросмотр договора (только чтение)",
-        )
-        self.contract_preview = textbox
-
-        # -- Контрагент -------------------------------------------------- #
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=0, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("Контрагент")
-
-        self.contract_party_var = tk.StringVar(value="")
-        self.contract_party_combo = ui.option_menu(
-            card.body, ["— выберите контрагента —"],
-            width=int(ENTRY_WIDTH * self.scale), variable=self.contract_party_var,
-        )
-        card.wide(self.contract_party_combo, pady=(int(2 * self.scale), int(10 * self.scale)))
-
-        search_holder = ctk.CTkFrame(card.body, fg_color="transparent")
-        self.contract_search_var = tk.StringVar()
-        search_entry = ui.entry(
-            search_holder, width=int(180 * self.scale),
-            textvariable=self.contract_search_var,
-            validatecommand=self._digits_vcmd_for(12),
-        )
-        ui.enable_sanitized_paste(search_entry.entry, digits_only, max_len=12)
-        search_entry.pack(side="left")
-        try:  # Enter в поиске ищет, а не сохраняет договор
-            search_entry.bind_entry("<Return>", lambda _e: (self._find_party_by_inn(), "break")[1])
-            search_entry.bind_entry("<KP_Enter>", lambda _e: (self._find_party_by_inn(), "break")[1])
-        except Exception:
-            pass
-        ui.ghost_button(
-            search_holder, "Найти", self._find_party_by_inn,
-            width=int(92 * self.scale), height=int(28 * self.scale),
-        ).pack(side="left", padx=(int(10 * self.scale), 0))
-        card.row(
-            "Поиск по ИНН", search_holder, stretch=True,
-            hint="Найдёт контрагента в реестре программы.",
-        )
-
-        # -- Договор ----------------------------------------------------- #
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=1, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("Договор")
-
-        self.contract_number_var = tk.StringVar()
-        number = ui.entry(
-            card.body, width=int(SHORT_WIDTH * self.scale),
-            textvariable=self.contract_number_var,
-        )
-        self._page_widgets[("contract", F.NUMBER)] = number
-        card.row(F.NUMBER, number, required=True,
-                 error_var=self._error_var_for("contract", F.NUMBER))
-        self.contract_number_var.trace_add("write", lambda *_: self._on_doc_field_changed("contract", F.NUMBER))
-
-        self.contract_day_var = tk.StringVar()
-        self.contract_month_var = tk.StringVar(value=MONTHS_GENITIVE[datetime.now().month - 1])
-        self._add_date_row(card, "contract", self.contract_day_var, self.contract_month_var)
-        self.contract_day_var.trace_add("write", lambda *_: self._on_doc_field_changed("contract", F.DAY))
-        self.contract_month_var.trace_add("write", lambda *_: self._on_doc_field_changed("contract", F.MONTH))
-
-        self._refresh_party_combo_values()
-
-        # Предпросмотр обновляется при любом изменении полей договора.
-        self.contract_party_var.trace_add("write", self._preview_contract)
-        self.contract_party_var.trace_add("write", lambda *_: self._on_party_selected("contract"))
-        self.contract_number_var.trace_add("write", self._preview_contract)
-        self.contract_day_var.trace_add("write", self._preview_contract)
-        self.contract_month_var.trace_add("write", self._preview_contract)
-        self._preview_contract()
+        """Строит страницу «Договор поставки» (контроллер страниц документов)."""
+        self._doc_page_flow.build_contract_page()
 
     def _preview_contract(self, *_args):
-        """Откладывает перерисовку предпросмотра, чтобы не собирать .docx на каждый ввод."""
-        if getattr(self, "_preview_contract_after", None):
-            try:
-                self.root.after_cancel(self._preview_contract_after)
-            except Exception:
-                pass
-        self._preview_contract_after = self.root.after(120, self._render_contract_preview)
+        """Откладывает перерисовку предпросмотра договора (контроллер)."""
+        self._doc_page_flow.preview_contract(*_args)
 
     def _render_contract_preview(self):
-        self._preview_contract_after = None
-        rec = self._party_from_var(self.contract_party_var)
-        if rec is None:
-            self._set_text(
-                self.contract_preview,
-                "Выберите контрагента и заполните поля слева — здесь появится текст договора.",
-            )
-            return
-        data = dict(rec.get("fields", {}))
-        data[F.NUMBER] = self.contract_number_var.get().strip()
-        data[F.DAY] = self.contract_day_var.get().strip()
-        data[F.MONTH] = self.contract_month_var.get().strip()
-        is_ip = rec.get("type") == "ip"
-        try:
-            doc = self._render_contract_docx(data, is_ip)
-            self._set_text(self.contract_preview, docx_to_text(doc))
-        except Exception as exc:
-            self._set_text(self.contract_preview, f"Не удалось собрать предпросмотр: {exc}")
+        """Собирает текст предпросмотра договора (контроллер страниц)."""
+        self._doc_page_flow.render_contract_preview()
 
     def _find_party_by_inn(self):
-        """Ищет контрагента по ИНН в реестре и подставляет в выпадающий список."""
-        inn = digits_only(self.contract_search_var.get())
-        rec = self.store.find_by_inn(inn)
-        if rec is None:
-            ui.alert(
-                self.root, "Контрагент не найден",
-                f"В реестре программы нет контрагента с ИНН {inn or '—'}.\n"
-                "Добавьте его через кнопку «Добавить контрагента».",
-                "error",
-            )
-            return
-        self._set_current_party(rec)
-        self.contract_search_var.set("")
+        """Ищет контрагента по ИНН и подставляет выбор (контроллер страниц)."""
+        self._doc_page_flow.find_party_by_inn()
 
-    # ------------------------------------------------------------------ #
-    #  Страница «Доп. соглашение»
-    # ------------------------------------------------------------------ #
     def _build_additional_page(self):
-        _page, left, _right, textbox = self._make_page(
-            "additional", "Доп. соглашение",
-            "Выберите контрагента и договор-основание. «Сохранить» запишет документ "
-            "в реестр и сразу откроет его в Word.",
-            with_text=True, text_title="Предпросмотр доп. соглашения (только чтение)",
-        )
-        self.addl_preview = textbox
-
-        # -- Контрагент -------------------------------------------------- #
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=0, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("Контрагент")
-
-        self.addl_party_var = tk.StringVar(value="")
-        self.addl_party_combo = ui.option_menu(
-            card.body, ["— выберите контрагента —"],
-            width=int(ENTRY_WIDTH * self.scale), variable=self.addl_party_var,
-        )
-        card.wide(self.addl_party_combo, pady=(int(2 * self.scale), int(10 * self.scale)))
-        self.addl_party_var.trace_add("write", self._on_addl_party_changed)
-        self.addl_party_var.trace_add("write", lambda *_: self._on_party_selected("additional"))
-
-        # -- Договор-основание -------------------------------------------- #
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=1, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("Договор-основание")
-
-        self.addl_contract_var = tk.StringVar(value="")
-        self.addl_contract_combo = ui.option_menu(
-            card.body, ["— нет сохранённых договоров —"],
-            width=int(ENTRY_WIDTH * self.scale), variable=self.addl_contract_var,
-        )
-        card.wide(self.addl_contract_combo, pady=(int(2 * self.scale), int(4 * self.scale)))
-        self.addl_contract_info_var = tk.StringVar(value="Договор-основание не выбран.")
-        card.wide(
-            ctk.CTkLabel(
-                card.body, textvariable=self.addl_contract_info_var,
-                font=ui.font(11), text_color=ui.COLORS["text_secondary"],
-                anchor="w", justify="left",
-                wraplength=int((LEFT_PANEL_WIDTH - 40) * self.scale),
-            ),
-            pady=(int(2 * self.scale), int(2 * self.scale)),
-        )
-        card.wide(
-            ctk.CTkLabel(
-                card.body,
-                text="Договоры берутся из реестра: сначала создайте договор поставки.",
-                font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
-                anchor="w", justify="left", wraplength=int((LEFT_PANEL_WIDTH - 40) * self.scale),
-            ),
-            pady=(int(4 * self.scale), int(6 * self.scale)),
-        )
-
-        # -- Условия ------------------------------------------------------ #
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=2, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("Условия")
-
-        self.addl_number_var = tk.StringVar()
-        number = ui.entry(
-            card.body, width=int(SHORT_WIDTH * self.scale),
-            textvariable=self.addl_number_var,
-        )
-        card.row("Номер доп. соглашения", number,
-                 hint="Можно оставить пустым — сохранится как «б/н».")
-
-        self._limit_var = tk.StringVar()
-        self._limit_var.trace_add("write", self._format_limit)
-        limit_holder = ctk.CTkFrame(card.body, fg_color="transparent")
-        self.limit_entry = ui.entry(
-            limit_holder, width=int(220 * self.scale), textvariable=self._limit_var,
-            validatecommand=(self._limit_vcmd, "%P"),
-        )
-        self.limit_entry.pack(side="left")
-        ctk.CTkLabel(
-            limit_holder, text="руб.", font=ui.font(12), text_color=ui.COLORS["text_tertiary"],
-        ).pack(side="left", padx=(int(8 * self.scale), 0))
-        self._page_widgets[("additional", F.LIMIT)] = self.limit_entry
-        card.row(
-            F.LIMIT, limit_holder, stretch=True, required=True,
-            hint="Сумма по доп. соглашению к договору поставки.",
-            error_var=self._error_var_for("additional", F.LIMIT),
-        )
-
-        self.limit_words_label = ctk.CTkLabel(
-            card.body, text="Сумма прописью: —", font=ui.font(12),
-            text_color=ui.COLORS["text_secondary"], anchor="w", justify="left", height=18,
-        )
-        card.wide(self.limit_words_label, pady=(int(4 * self.scale), int(8 * self.scale)))
-
-        term_holder = ctk.CTkFrame(card.body, fg_color="transparent")
-        self.term_var = tk.StringVar()
-        self.term_entry = ui.entry(
-            term_holder, width=int(120 * self.scale), textvariable=self.term_var,
-            validatecommand=(self._term_vcmd, "%P"),
-        )
-        self.term_entry.pack(side="left")
-        ctk.CTkLabel(
-            term_holder, text="дней", font=ui.font(12), text_color=ui.COLORS["text_tertiary"],
-        ).pack(side="left", padx=(int(8 * self.scale), 0))
-        self._page_widgets[("additional", F.TERM)] = self.term_entry
-        card.row(
-            F.TERM, term_holder, required=True,
-            hint="Отсрочка платежа по доп. соглашению.",
-            error_var=self._error_var_for("additional", F.TERM),
-        )
-
-        self.words_label = ctk.CTkLabel(
-            card.body, text="Срок прописью: —", font=ui.font(12),
-            text_color=ui.COLORS["text_secondary"], anchor="w", justify="left", height=18,
-        )
-        card.wide(self.words_label, pady=(int(2 * self.scale), int(2 * self.scale)))
-
-        self.term_var.trace_add("write", self._update_words)
-        self._update_words()
-        self._update_limit_words()
-
-        # Предпросмотр обновляется при любом изменении данных доп. соглашения.
-        self.addl_party_var.trace_add("write", self._preview_additional)
-        self.addl_contract_var.trace_add("write", self._preview_additional)
-        self.addl_contract_var.trace_add("write", lambda *_: self._update_contract_info("additional"))
-        self.addl_number_var.trace_add("write", self._preview_additional)
-        self._limit_var.trace_add("write", self._preview_additional)
-        self.term_var.trace_add("write", self._preview_additional)
-        self._preview_additional()
+        """Строит страницу «Доп. соглашение» (контроллер страниц документов)."""
+        self._doc_page_flow.build_additional_page()
 
     def _preview_additional(self, *_args):
-        """Откладывает перерисовку предпросмотра, чтобы не собирать .docx на каждый ввод."""
-        if getattr(self, "_preview_additional_after", None):
-            try:
-                self.root.after_cancel(self._preview_additional_after)
-            except Exception:
-                pass
-        self._preview_additional_after = self.root.after(120, self._render_additional_preview)
+        """Откладывает перерисовку предпросмотра доп. соглашения (контроллер)."""
+        self._doc_page_flow.preview_additional(*_args)
 
     def _render_additional_preview(self):
-        self._preview_additional_after = None
-        party = self._party_from_var(self.addl_party_var)
-        contract = self._contract_from_var(self.addl_contract_var, party["id"]) if party else None
-        if party is None or contract is None:
-            self._set_text(
-                self.addl_preview,
-                "Выберите контрагента и договор-основание слева — здесь появится текст документа.",
-            )
-            return
-        data = dict(contract.get("data") or {})
-        is_ip = party.get("type") == "ip"
-        try:
-            doc = self._render_additional_docx(
-                data, is_ip,
-                self.addl_number_var.get().strip(),
-                self._limit_var.get().strip(),
-                self.term_var.get().strip(),
-            )
-            self._set_text(self.addl_preview, docx_to_text(doc))
-        except Exception as exc:
-            self._set_text(self.addl_preview, f"Не удалось собрать предпросмотр: {exc}")
+        """Собирает текст предпросмотра доп. соглашения (контроллер страниц)."""
+        self._doc_page_flow.render_additional_preview()
 
     def _on_addl_party_changed(self, *_args):
-        """Обновляет список договоров выбранного контрагента."""
-        rec = self._party_from_var(self.addl_party_var)
-        contracts = self.store.contracts_for(rec["id"]) if rec else []
-        if contracts:
-            values = [self._contract_display(c) for c in contracts]
-        else:
-            values = ["— нет сохранённых договоров —"]
-        self.addl_contract_combo.set_values(values)
-        self.addl_contract_var.set(values[0] if contracts else "")
-        # Явно сообщаем, что договор подставлен автоматически (п. 4.2).
-        if contracts:
-            self.addl_contract_info_var.set(
-                f"Договор-основание: {values[0]} — подставлен автоматически, проверьте."
-            )
-        else:
-            self.addl_contract_info_var.set(
-                "Договор-основание не выбран: сохраните договор поставки."
-            )
+        """Обновляет список договоров при выборе контрагента (контроллер)."""
+        self._doc_page_flow.on_addl_party_changed(*_args)
 
-    # ------------------------------------------------------------------ #
     #  Спецификация и сохранение документов — DocumentSaveController
     # ------------------------------------------------------------------ #
     #  Код страницы «Спецификация» — таблица позиций, договор-основание,
@@ -2754,42 +2504,19 @@ class ContractApp:
         )
 
     # ------------------------------------------------------------------ #
-    #  Доп. соглашение: суммы прописью и формат лимита
+    #  Доп. соглашение: суммы прописью и формат лимита — контроллер страниц
     # ------------------------------------------------------------------ #
     def _update_words(self, *_args):
-        value = self.term_var.get().strip()
-        if not value:
-            self.words_label.configure(text="Срок прописью: —")
-        elif value.isdigit():
-            self.words_label.configure(text=f"Срок прописью: {number_to_words_ru(int(value))}")
-        else:
-            self.words_label.configure(text="Срок прописью: введите целое число дней")
+        """«Срок прописью» под полем отсрочки (контроллер страниц документов)."""
+        self._doc_page_flow.update_words(*_args)
 
     def _format_limit(self, *_args):
-        """Форматирует лимит с разделителями разрядов и обновляет сумму прописью."""
-        raw = self._limit_var.get()
-        formatted = format_number_grouped(raw)
-        if raw != formatted:
-            entry = None
-            caret = None
-            try:
-                entry = self.limit_entry.entry
-                caret = entry.index(tk.INSERT)
-            except Exception:
-                pass
-            self._limit_var.set(formatted)
-            restore_caret_after_reformat(entry, caret, len(raw), len(formatted))
-        self._update_limit_words()
+        """Форматирует лимит разрядами и обновляет сумму прописью (контроллер)."""
+        self._doc_page_flow.format_limit(*_args)
 
     def _update_limit_words(self):
-        digits = digits_only(self._limit_var.get())
-        if not digits:
-            self.limit_words_label.configure(text="Сумма прописью: —")
-            return
-        try:
-            self.limit_words_label.configure(text=f"Сумма прописью: {amount_to_words_ru(int(digits))}")
-        except Exception:
-            self.limit_words_label.configure(text="Сумма прописью: —")
+        """«Сумма прописью» под полем лимита (контроллер страниц документов)."""
+        self._doc_page_flow.update_limit_words()
 
     def run(self):
         self.root.mainloop()

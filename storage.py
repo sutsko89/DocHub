@@ -38,6 +38,7 @@ BACKUP_COUNT = 5          # database.json.bak + .bak.1 … .bak.4
 SAVE_RETRIES = 3
 RETRY_DELAY_SECONDS = 0.25
 TRASH_RETENTION_DAYS = 30
+BAD_COPY_RETENTION_DAYS = 30   # сколько дней хранить database.json.bad-* (аудит 2.0.1)
 
 KIND_CONTRACT = "contract"
 KIND_ADDITIONAL = "additional"
@@ -107,6 +108,7 @@ class DataStore:
     def _load(self) -> None:
         log = applog.get_logger("storage")
         path = db_path()
+        self._purge_stale_bad_copies(path)
         try:
             with applog.timed("Чтение реестра", 500, "storage"):
                 with open(path, "r", encoding="utf-8") as fh:
@@ -240,6 +242,36 @@ class DataStore:
         )
         return None
 
+    def _purge_stale_bad_copies(self, path: str) -> None:
+        """Удаляет ``.bad-*``-копии старше BAD_COPY_RETENTION_DAYS (аудит 2.0.1).
+
+        Копии повреждённых файлов раньше копились без ограничения возраста
+        и не попадали ни в какую очистку — теперь уборка идёт при каждом
+        запуске, свежие копии не трогаются.
+        """
+        directory = os.path.dirname(path)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        prefix = os.path.basename(path) + ".bad-"
+        deadline = time.time() - BAD_COPY_RETENTION_DAYS * 86400
+        removed = 0
+        for name in names:
+            if not name.startswith(prefix):
+                continue
+            full = os.path.join(directory, name)
+            try:
+                if os.path.getmtime(full) < deadline:
+                    os.remove(full)
+                    removed += 1
+            except OSError:
+                continue
+        if removed:
+            applog.get_logger("storage").info(
+                "Убраны старые копии повреждённых файлов: %d", removed,
+            )
+
     @staticmethod
     def _remove_silent(path: str) -> None:
         try:
@@ -263,6 +295,13 @@ class DataStore:
                 os.replace(f"{path}.bak", f"{path}.bak.1")
             if os.path.exists(path):
                 shutil.copy2(path, f"{path}.bak")
+                try:
+                    # Бэкап — «вторая линия обороны»: он обязан пережить сбой
+                    # питания, поэтому сбрасывается на диск явно (аудит 2.0.1).
+                    with open(f"{path}.bak", "rb") as fh:
+                        os.fsync(fh.fileno())
+                except OSError:
+                    pass  # fsync недоступен — бэкап всё равно лучше, чем ничего
         except OSError as exc:
             # Бэкап — страховка, но не причина срывать сохранение.
             log.warning("Не удалось обновить резервные копии реестра: %s", exc)

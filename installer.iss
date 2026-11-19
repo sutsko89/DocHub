@@ -78,9 +78,9 @@ ReadyLabel2b=Нажмите «Установить», чтобы начать у
 FinishedHeadingLabel=Установка {#MyAppName} завершена
 
 [Code]
-; П. 6.5: деинсталлятор спрашивает про пользовательские данные и ключ DaData.
-; Раньше %APPDATA%\DogovorGenerator (настройки, реестр, журнал, ключ) оставался
-; на диске молча.
+// П. 6.5: деинсталлятор спрашивает про пользовательские данные и ключ DaData.
+// Раньше %APPDATA%\DogovorGenerator (настройки, реестр, журнал, ключ) оставался
+// на диске молча. В Pascal-скрипте Inno Setup комментарий — «//», не «;».
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then

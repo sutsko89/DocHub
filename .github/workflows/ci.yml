@@ -1,22 +1,29 @@
 name: CI
 
-# П. 7.9 плана: pytest без интерфейса + smoke под Xvfb на Linux,
-# pytest на Windows-раннере (там есть графическая сессия).
+# pytest без интерфейса + smoke: на Linux — под Xvfb, на Windows — в
+# графической сессии раннера. Аудит 2.0.1 (P1): целевая платформа продукта —
+# Windows — обязана проверять 280+ GUI-инвариантов до релиза, а не только pytest.
 
 on:
   push:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux:
     name: Linux — pytest + smoke (Xvfb)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
       - name: Xvfb для smoke-теста
         run: sudo apt-get update && sudo apt-get install -y xvfb
       - name: Зависимости
@@ -28,14 +35,21 @@ jobs:
         run: xvfb-run -a -s "-screen 0 1280x800x24" python smoke_test.py
 
   windows:
-    name: Windows — pytest
+    name: Windows — pytest + smoke (GUI-сессия)
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
       - name: Зависимости
         run: python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: pytest (без интерфейса)
         run: python -m pytest tests/
+      - name: smoke_test.py (графическая сессия Windows, без Xvfb)
+        run: python smoke_test.py
+
+# TODO (аудит 2.0.1, P2): закрепить actions/checkout и setup-python по SHA,
+# а не по major-тегу — проверить актуальные SHA и обновить оба jobs.

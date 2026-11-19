@@ -1,0 +1,74 @@
+name: Release
+
+# Сборка релизных артефактов (аудит 2.0.1, P1 «поставка не подписана, сборка
+# не в CI»): PyInstaller + Inno Setup на windows-latest, SHA-256 рядом с артефактами.
+# Триггеры: ручной запуск и теги вида v2.1.0.
+#
+# Подпись (организационный шаг — нужен OV/EV-сертификат):
+#   1. Добавьте шаг с signtool sign /fd SHA256 /tr <timestamp> /td SHA256
+#      для dist\EW.DocHub\EW.DocHub.exe и для installer\*-setup.exe.
+#   2. Раскомментируйте SignTool/SignedUninstaller в installer.iss
+#      (инструкции в шапке файла).
+# После этого SmartScreen перестанет показывать «неизвестный издатель».
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    name: Windows — exe + установщик + SHA-256
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Зависимости
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: pytest (без интерфейса)
+        run: python -m pytest tests/
+
+      - name: smoke_test.py (графическая сессия)
+        run: python smoke_test.py
+
+      - name: Сборка приложения (PyInstaller)
+        run: pyinstaller --noconfirm EWDochub.spec
+
+      - name: Сборка установщика (Inno Setup)
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "C:\Program Files (x86)\Inno Setup 7\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe не найден после установки Inno Setup" }
+          & $iscc installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup завершился с ошибкой $LASTEXITCODE" }
+
+      - name: SHA-256 артефактов
+        run: |
+          $setup = Get-ChildItem "installer\*-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "Установщик не найден в installer\" }
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($setup.Name)" | Out-File -Encoding ascii "installer\SHA256SUMS.txt"
+          Get-Content "installer\SHA256SUMS.txt"
+
+      - name: Артефакты релиза
+        uses: actions/upload-artifact@v4
+        with:
+          name: EW.DocHub-release
+          path: |
+            installer/*-setup.exe
+            installer/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+# Публикация в GitHub Releases (softprops/action-gh-release) — после начала
+# подписи сертификатом, чтобы релиз сразу содержал подписанный setup.exe.

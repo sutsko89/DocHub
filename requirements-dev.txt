@@ -7,3 +7,7 @@
 -r requirements.txt
 pytest>=8.0.0             # тестовый набор tests/
 pytest-cov>=5.0.0         # покрытие: storage/importer/services/document_builder
+# Сборка дистрибутива (README: pyinstaller EWDochub.spec). Аудит 2.0.1:
+# раньше pyinstaller отсутствовал в dev-зависимостях и команда из README
+# падала на чистой машине. Нужен только на Windows — там собирается exe.
+pyinstaller>=6.0.0; sys_platform == "win32"

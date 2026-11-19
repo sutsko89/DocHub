@@ -4,49 +4,67 @@
 # Итоговая папка dist/EW.DocHub упаковывается установщиком Inno Setup (installer.iss).
 # Сборка: pyinstaller EWDochub.spec --noconfirm
 
+import re
+import sys
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 # VersionInfo для exe — версия видна в свойствах файла (п. 6.1 плана).
-# Синхронизируется с APP_VERSION в main.py и MyAppVersion в installer.iss.
-APP_VERSION = "2.0.1"
-try:
-    from PyInstaller.utils.win32.versioninfo import (
-        VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,
-        VarFileInfo, StringStruct, VarStruct,
-    )
+# Аудит 2.0.1: версия больше НЕ дублируется в spec — она читается из
+# APP_VERSION в main.py (единый источник), и бинарные filevers/prodvers
+# вычисляются из неё же (раньше строка была 2.0.1, а filevers=(1,5,0,0)).
+_match = re.search(
+    r'APP_VERSION\s*=\s*"(\d+)\.(\d+)\.(\d+)"',
+    Path(__file__).with_name("main.py").read_text(encoding="utf-8"),
+)
+if not _match:
+    raise SystemExit("EWDochub.spec: не удалось прочитать APP_VERSION из main.py")
+APP_VERSION = ".".join(_match.groups())
+FILEVERS = tuple(int(group) for group in _match.groups()) + (0,)
 
-    exe_version = VSVersionInfo(
-        ffi=FixedFileInfo(
-            filevers=(1, 5, 0, 0),
-            prodvers=(1, 5, 0, 0),
-            mask=0x3F,
-            flags=0x0,
-            OS=0x40004,
-            fileType=0x1,
-            subtype=0x0,
-            date=(0, 0),
-        ),
-        kids=[
-            StringFileInfo([
-                StringTable(
-                    "041904B0",
-                    [
-                        StringStruct("CompanyName", "EW.DocHub"),
-                        StringStruct("FileDescription", "EW.DocHub — контрагенты и документы"),
-                        StringStruct("FileVersion", APP_VERSION),
-                        StringStruct("InternalName", "EW.DocHub"),
-                        StringStruct("LegalCopyright", "© EW.DocHub"),
-                        StringStruct("OriginalFilename", "EW.DocHub.exe"),
-                        StringStruct("ProductName", "EW.DocHub"),
-                        StringStruct("ProductVersion", APP_VERSION),
-                    ],
-                )
-            ]),
-            VarFileInfo([VarStruct("Translation", [1049, 1200, 1033, 1200])]),
-        ],
-    )
-except Exception:  # сборка не на Windows — exe без VersionInfo
-    exe_version = None
+exe_version = None
+if sys.platform == "win32":
+    # VersionInfo осмыслен только для Windows-сборки; вне Windows блок не
+    # выполняется вовсе (аудит 2.0.1: не «глотать» исключение, а не заходить).
+    try:
+        from PyInstaller.utils.win32.versioninfo import (
+            VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,
+            VarFileInfo, StringStruct, VarStruct,
+        )
+
+        exe_version = VSVersionInfo(
+            ffi=FixedFileInfo(
+                filevers=FILEVERS,
+                prodvers=FILEVERS,
+                mask=0x3F,
+                flags=0x0,
+                OS=0x40004,
+                fileType=0x1,
+                subtype=0x0,
+                date=(0, 0),
+            ),
+            kids=[
+                StringFileInfo([
+                    StringTable(
+                        "041904B0",
+                        [
+                            StringStruct("CompanyName", "EW.DocHub"),
+                            StringStruct("FileDescription", "EW.DocHub — контрагенты и документы"),
+                            StringStruct("FileVersion", APP_VERSION),
+                            StringStruct("InternalName", "EW.DocHub"),
+                            StringStruct("LegalCopyright", "© EW.DocHub"),
+                            StringStruct("OriginalFilename", "EW.DocHub.exe"),
+                            StringStruct("ProductName", "EW.DocHub"),
+                            StringStruct("ProductVersion", APP_VERSION),
+                        ],
+                    )
+                ]),
+                VarFileInfo([VarStruct("Translation", [1049, 1200, 1033, 1200])]),
+            ],
+        )
+    except Exception:
+        exe_version = None  # сборка без versioninfo — лучше, чем падение сборки
 
 customtkinter_datas = collect_data_files("customtkinter")
 customtkinter_imports = collect_submodules("customtkinter")

@@ -153,13 +153,21 @@ class SpecTable(ctk.CTkFrame):
         row: dict = {"num": num, "cells": {}}
         for col, key in enumerate(self.KEYS, start=1):
             var = tk.StringVar(value=str(values.get(key, "") or ""))
-            entry = tk.Entry(
-                self.body, textvariable=var, font=ui.font(12),
+            # Валидатор «Кол-во»/«Цена» включён флагом validate="key": без него
+            # Tk создаёт validatecommand, но НИКОГДА его не вызывает (аудит
+            # 2.0.1, P2 «Мёртвые валидаторы») — в поля можно было ввести буквы.
+            entry_kwargs = dict(
+                textvariable=var, font=ui.font(12),
                 relief="flat", justify="left" if key == "name" else "center",
                 highlightthickness=1, state="readonly",  # правка — по двойному клику
-                validatecommand=(self._digits_vcmd, "%P") if key == "qty"
-                else (self._price_vcmd, "%P") if key == "price" else None,
             )
+            if key == "qty":
+                entry_kwargs["validate"] = "key"
+                entry_kwargs["validatecommand"] = (self._digits_vcmd, "%P")
+            elif key == "price":
+                entry_kwargs["validate"] = "key"
+                entry_kwargs["validatecommand"] = (self._price_vcmd, "%P")
+            entry = tk.Entry(self.body, **entry_kwargs)
             if col in self.COL_WIDTHS:  # ширина синхронизирована со шапкой
                 entry.configure(width=self._entry_width_chars(self.COL_WIDTHS[col]))
             entry.grid(row=index, column=col, sticky="ew",
@@ -502,7 +510,11 @@ class SpecTable(ctk.CTkFrame):
                     col = c0 + dc
                     if col >= len(self.KEYS):
                         break
-                    self._rows[r0 + dr][self.KEYS[col]].set(value)
+                    key = self.KEYS[col]
+                    # Вставка идёт мимо validate="key" (var.set), поэтому каждое
+                    # значение дополнительно прогоняется через правила ячейки
+                    # (аудит 2.0.1, P2): мусор в «Кол-во»/«Цена» не попадает.
+                    self._rows[r0 + dr][key].set(self._sanitize_value(key, value))
         finally:
             self._batch = False
         self._notify()
@@ -593,15 +605,26 @@ class SpecTable(ctk.CTkFrame):
         return "break"
 
     # -- Служебное ------------------------------------------------------------ #
-    def _validate_digits(self, new_value: str) -> bool:
+    @staticmethod
+    def _validate_digits(new_value: str) -> bool:
         """Кол-во: цифры и запятая/точка (может быть дробным)."""
         return new_value == "" or all(ch.isdigit() or ch in ",." for ch in new_value)
 
-    def _validate_price(self, new_value: str) -> bool:
+    @staticmethod
+    def _validate_price(new_value: str) -> bool:
         """Цена: цифры, разряды и запятая/точка (копейки)."""
         return new_value == "" or all(
             ch.isdigit() or ch in " .," for ch in new_value
         )
+
+    @classmethod
+    def _sanitize_value(cls, key: str, value: str) -> str:
+        """Приводит значение к правилам ячейки (вставка мимо validate="key")."""
+        if key in ("qty", "price"):
+            value = cls._normalize_number(value)
+            validator = cls._validate_digits if key == "qty" else cls._validate_price
+            return value if validator(value) else ""
+        return value
 
     def _cell_changed(self):
         self._notify()

@@ -12,10 +12,8 @@
 
 from __future__ import annotations
 
-import calendar
 import copy
 import ctypes
-import hashlib
 import json
 import os
 import platform
@@ -25,16 +23,15 @@ import shutil
 import subprocess
 import sys
 import threading
-import zipfile
 from datetime import datetime
 
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP
 
 import customtkinter as ctk
 import tkinter as tk
 from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker
 from docx import Document
-from tkinter import filedialog, font as tkfont
+from tkinter import filedialog
 
 import applog
 import dadata_client as dadata
@@ -78,7 +75,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.1.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -186,13 +183,16 @@ def write_settings(settings: dict) -> bool:
 # Магические значения печатной формы спецификации вынесены в settings.json:
 # поставщик, подписант, город, год, ставка НДС и номер приложения меняются
 # без правки кода. Отсутствующие или битые значения заменяются дефолтами.
+# Год здесь НЕ фиксируется: раньше datetime.now().year вычислялся при импорте
+# модуля, и приложение, пережившее Новый год в запущенном виде, ставило в
+# спецификации прошлый год (аудит 2.0.1). Актуальный год берётся на момент
+# вызова get_spec_settings().
 DEFAULT_SPEC_SETTINGS = {
     "spec_supplier": "ООО «Эдельвейс»",
     "spec_supplier_signatory": "А.Н. Верещагин",
     "spec_city": "Хабаровск",
     "spec_vat_rate": SPEC_VAT_RATE,
     "spec_appendix_number": SPEC_APPENDIX_NUMBER,
-    "spec_year": datetime.now().year,
 }
 
 
@@ -200,6 +200,7 @@ def get_spec_settings() -> dict:
     """Печатная форма спецификации: дефолты, перекрытые settings.json."""
     saved = load_settings()
     out = dict(DEFAULT_SPEC_SETTINGS)
+    out["spec_year"] = datetime.now().year  # на момент вызова, не импорта
     for key in out:
         value = saved.get(key)
         if value is None:
@@ -525,12 +526,16 @@ class ContractApp:
         self._cp_busy = False
         self._cp_busy_after = None
         self._cp_busy_phase = 0
+        # Результат DaData приходит через очередь и опрашивается только
+        # из главного потока Tk — root.after() из рабочего потока запрещён
+        # (аудит 2.0.1): тот же паттерн, что у пакетного импорта.
+        self._cp_result_queue = None
 
         # Единый «текущий контрагент» и защита несохранённых данных (п. 4.2, 4.4).
         self._current_party_id = None
         self._current_party_vars: dict[str, tk.StringVar] = {}
         self._syncing_party = False
-        self._form_baseline: dict[str, tuple] = {}
+        self._form_baseline: dict[str, tuple | None] = {}
         self._registry_search_after = None
         self._toast_after = None
         self._toast_path: str | None = None
@@ -3630,7 +3635,10 @@ class ContractApp:
             ctk.CTkLabel(
                 card.body,
                 text="Ключ не входит в поставку — укажите свой ключ с dadata.ru. "
-                     "Без ключа доступен только ручной ввод реквизитов.",
+                     "Без ключа доступен только ручной ввод реквизитов. При "
+                     "автозаполнении сервису отправляется только ИНН — публичный "
+                     "идентификатор организации/ИП; реквизиты карточки и документы "
+                     "никуда не отправляются.",
                 font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
                 anchor="w", justify="left",
                 wraplength=int((LEFT_PANEL_WIDTH - 48) * self.scale),
@@ -3642,9 +3650,19 @@ class ContractApp:
             self._dadata_key_entry.entry.configure(show="•")
         except Exception:
             pass
-        current_key = dadata.load_api_key()
-        if current_key:
-            self._dadata_key_entry.insert(0, current_key)
+        # Аудит 2.0.1: сохранённый ключ НЕ подставляется в поле — реальное
+        # значение не показывается и не копируется по Ctrl+C. Поле остаётся
+        # пустым, пока пользователь не решит сменить ключ; состояние — строкой ниже.
+        self._dadata_key_status_var = tk.StringVar(value=self._dadata_key_status_text())
+        card.wide(
+            ctk.CTkLabel(
+                card.body, textvariable=self._dadata_key_status_var,
+                font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
+                anchor="w", justify="left",
+                wraplength=int((LEFT_PANEL_WIDTH - 48) * self.scale),
+            ),
+            pady=(int(2 * self.scale), int(4 * self.scale)),
+        )
         card.row(
             "API-ключ", self._dadata_key_entry, stretch=True,
             hint="Ключ хранится в профиле пользователя отдельно от реестра.",
@@ -3660,6 +3678,14 @@ class ContractApp:
             width=int(130 * self.scale), height=int(28 * self.scale),
         ).pack(side="left", padx=(int(10 * self.scale), 0))
 
+    def _dadata_key_status_text(self) -> str:
+        """Статус сохранённого ключа — без подстановки самого значения."""
+        if dadata.load_api_key():
+            if dadata.dpapi_available():
+                return "Ключ сохранён и зашифрован (DPAPI, профиль пользователя)."
+            return "Ключ сохранён в профиле пользователя."
+        return "Ключ не задан."
+
     def _save_dadata_key(self):
         """Сохраняет введённый пользователем ключ DaData."""
         key = self._dadata_key_entry.get().strip()
@@ -3668,9 +3694,16 @@ class ContractApp:
                      "Введите API-ключ DaData или оставьте поле пустым.", "error")
             return
         if dadata.save_api_key(key):
+            try:
+                self._dadata_key_entry.delete(0, "end")
+            except Exception:
+                pass
+            self._dadata_key_status_var.set(self._dadata_key_status_text())
             ui.alert(
                 self.root, "Ключ сохранён",
-                "Автозаполнение по ИНН будет использовать этот ключ.", "success",
+                "Автозаполнение по ИНН будет использовать этот ключ."
+                + (" Значение зашифровано (DPAPI)." if dadata.dpapi_available() else ""),
+                "success",
             )
         else:
             ui.alert(
@@ -3692,6 +3725,7 @@ class ContractApp:
             self._dadata_key_entry.delete(0, "end")
         except Exception:
             pass
+        self._dadata_key_status_var.set(self._dadata_key_status_text())
         ui.alert(self.root, "Ключ удалён",
                  "Ключ DaData удалён из профиля пользователя.", "success")
 
@@ -3739,7 +3773,14 @@ class ContractApp:
         До запуска отклоняются: слишком большой пакет, слишком большой
         суммарный объём и ситуация «на диске не хватит места» (п. 3.4).
         Размер каждого файла дополнительно проверяется в analyze_file().
+
+        Аудит 2.0.1: guard перенесён сюда из диалога — drag-and-drop вызывает
+        метод напрямую, и раньше второй запуск сбрасывал очередь/результаты
+        работающего первого (риск порчи отчёта и задвоения записей).
         """
+        if getattr(self, "_import_running", False):
+            self._notify("Импорт уже выполняется — дождитесь завершения.")
+            return
         files = [str(path) for path in files if path]
         if not files:
             return
@@ -3790,7 +3831,10 @@ class ContractApp:
             return
 
         self._import_running = True
-        self._import_queue = queue.Queue()
+        # Очередь у каждого запуска своя и передаётся воркеру через args:
+        # воркер не зависит от того, что лежит в self._import_queue (аудит 2.0.1).
+        result_queue: queue.Queue = queue.Queue()
+        self._import_queue = result_queue
         self._import_results: list[dict] = []
         self._import_total = max(1, len(files))
         self._import_cancelled = False
@@ -3842,7 +3886,9 @@ class ContractApp:
         except tk.TclError:
             pass
 
-        threading.Thread(target=self._import_worker, args=(files,), daemon=True).start()
+        threading.Thread(
+            target=self._import_worker, args=(files, result_queue), daemon=True,
+        ).start()
         self.root.after(80, self._import_tick)
 
     def _cancel_import(self):
@@ -3856,22 +3902,24 @@ class ContractApp:
         except Exception:
             pass
 
-    def _import_worker(self, files: list[str]):
+    def _import_worker(self, files: list[str], result_queue: "queue.Queue") -> None:
         """Фоновый поток: анализ каждого файла и копирование в папку контрагента.
 
         После нажатия «Отменить» остаток пакета не анализируется (п. 5.3).
+        Результаты кладутся в свою очередь (args), а не в общий атрибут —
+        повторный запуск импорта не может смешать два пакета (аудит 2.0.1).
         """
         for index, path in enumerate(files):
             if self._import_cancelled:
                 break
             name = os.path.basename(path)
-            self._import_queue.put(
+            result_queue.put(
                 ("status", f"Анализ файла {index + 1} из {len(files)}:\n{name}")
             )
             ext = os.path.splitext(path)[1].lower()
             if ext not in IMPORT_ALLOWED_EXTENSIONS:
                 # Allowlist: .exe/.bat/.lnk и прочее не анализируем и не копируем.
-                self._import_queue.put(("file", {
+                result_queue.put(("file", {
                     "path": path,
                     "name": name,
                     "kind": storage.KIND_UNKNOWN,
@@ -3893,8 +3941,8 @@ class ContractApp:
                 result["copied"] = ""
                 if not result.get("error"):
                     result["error"] = f"Не удалось скопировать файл: {exc}"
-            self._import_queue.put(("file", result))
-        self._import_queue.put(("done",))
+            result_queue.put(("file", result))
+        result_queue.put(("done",))
 
     def _copy_imported_file(self, result: dict) -> str:
         """Копирует в папку контрагента только разобранные .docx/.xlsx.
@@ -4508,13 +4556,26 @@ class ContractApp:
         mode = "ip" if value == "ИП" else "ooo"
         self._cp_frames[mode].tkraise()
 
-    def _cp_collect(self, mode: str) -> dict:
+    def _cp_collect(self, mode: str) -> dict | None:
+        """Собирает данные карточки в словарь.
+
+        Аудит 2.0.1: раньше ошибка чтения виджета молча превращалась в пустую
+        строку — сбойное поле обнулялось, валидация честно сообщала
+        «Заполните поле» о поле, которое пользователь заполнил. Теперь при
+        любой ошибке чтения возвращается None (явный маркер сбоя), тип
+        исключения попадает в журнал, а вызывающий код обязан сообщить
+        пользователю о проблеме вместо тихой записи пустых значений.
+        """
         data = {}
         for key, widget in self._cp_entries[mode].items():
             try:
                 data[key] = widget.get().strip()
-            except Exception:
-                data[key] = ""
+            except Exception as exc:
+                self._log.warning(
+                    "Не удалось прочитать поле карточки «%s»: %s",
+                    key, type(exc).__name__,
+                )
+                return None
         if mode == "ip":
             data[F.FACT_ADDRESS] = data.get(F.LEGAL_ADDRESS, "")
         return data
@@ -4523,6 +4584,16 @@ class ContractApp:
         mode = "ip" if self._cp_type_var.get() == "ИП" else "ooo"
         is_ip = mode == "ip"
         data = self._cp_collect(mode)
+        if data is None:
+            # Сбор данных сломался — тихо сохранять «пустую» карточку нельзя.
+            ui.alert(
+                self.root, "Не удалось прочитать поля формы",
+                "Часть полей карточки недоступна (ошибка интерфейса).\n\n"
+                "Переоткройте страницу «Добавить контрагента» и попробуйте "
+                "ещё раз. Подробности — в журнале (%APPDATA%\\DogovorGenerator\\logs).",
+                "error",
+            )
+            return
 
         errors = validate_party_fields(data, is_ip)
         if errors:
@@ -4599,6 +4670,11 @@ class ContractApp:
     #  DaData: автозаполнение карточки контрагента
     # ------------------------------------------------------------------ #
     def _cp_fill_from_inn(self):
+        # Защита от повторных кликов (аудит 2.0.1): пока запрос выполняется,
+        # новый воркер не запускается — раньше два параллельных запроса
+        # гонялись за одними полями формы.
+        if self._cp_busy:
+            return
         mode = "ip" if self._cp_type_var.get() == "ИП" else "ooo"
         widget = self._cp_entries[mode].get(F.INN)
         inn = widget.get().strip() if widget is not None else ""
@@ -4621,11 +4697,18 @@ class ContractApp:
 
         self._cp_busy = True
         self._cp_busy_phase = 0
+        # Очередь результата + опрос из главного потока (как у пакетного
+        # импорта): рабочий поток не трогает Tk и не вызывает root.after()
+        # (аудит 2.0.1 — гарантий потокобезопасности Tcl нет).
+        result_queue: queue.Queue = queue.Queue()
+        self._cp_result_queue = result_queue
         self._cp_busy_tick()
         worker = threading.Thread(
-            target=self._cp_fetch_worker, args=(inn, api_key, mode), daemon=True,
+            target=self._cp_fetch_worker, args=(inn, api_key, mode, result_queue),
+            daemon=True,
         )
         worker.start()
+        self.root.after(80, self._cp_result_tick)
 
     def _cp_busy_tick(self):
         if not self._cp_busy:
@@ -4643,14 +4726,34 @@ class ContractApp:
             except Exception:
                 pass
             self._cp_busy_after = None
+        self._cp_result_queue = None  # цикл опроса останавливается
 
-    def _cp_fetch_worker(self, inn: str, api_key: str, mode: str):
+    def _cp_fetch_worker(self, inn: str, api_key: str, mode: str, result_queue: "queue.Queue"):
+        """Рабочий поток DaData: только HTTP и очередь — никаких вызовов Tk."""
         try:
             info = dadata.fetch_party(inn, api_key)
         except Exception as exc:
-            self.root.after(0, lambda: self._cp_party_failed(str(exc)))
+            result_queue.put(("error", str(exc)))
             return
-        self.root.after(0, lambda: self._cp_party_loaded(mode, info))
+        result_queue.put(("ok", mode, info))
+
+    def _cp_result_tick(self):
+        """Опрашивает очередь результата DaData из главного потока Tk."""
+        result_queue = getattr(self, "_cp_result_queue", None)
+        if result_queue is None:
+            return  # запрос завершён или окно закрывается
+        try:
+            item = result_queue.get_nowait()
+        except queue.Empty:
+            self.root.after(80, self._cp_result_tick)
+            return
+        except (tk.TclError, AttributeError):
+            return
+        kind = item[0]
+        if kind == "error":
+            self._cp_party_failed(item[1])
+        elif kind == "ok":
+            self._cp_party_loaded(item[1], item[2])
 
     def _cp_party_failed(self, message: str):
         self._cp_busy_stop()
@@ -4713,11 +4816,16 @@ class ContractApp:
             "counterparty": "Карточка контрагента",
         }.get(key, key)
 
-    def _form_signature(self, key: str) -> tuple:
+    def _form_signature(self, key: str) -> tuple | None:
         """Данные формы, потеря которых требует подтверждения.
 
         Выбор контрагента/договора намеренно не входит в подпись: он
         переносится между страницами (п. 4.2) и не является введёнными данными.
+
+        Аудит 2.0.1: при сбое чтения возвращается None, а не пустой кортеж —
+        None не совпадает ни с каким baseline, поэтому защита несохранённых
+        данных считает страницу «грязной» и просит подтверждение, вместо
+        того чтобы молча решить, что терять нечего.
         """
         try:
             if key == "contract":
@@ -4749,10 +4857,18 @@ class ContractApp:
                 )
             if key == "counterparty":
                 mode = "ip" if self._cp_type_var.get() == "ИП" else "ooo"
-                return tuple(sorted(self._cp_collect(mode).items()))
-        except Exception:
-            return ()
-        return ()
+                data = self._cp_collect(mode)
+                if data is None:
+                    return None
+                return tuple(sorted(data.items()))
+        except Exception as exc:
+            # Сбой чтения формы — повод предположить несохранённые данные,
+            # а не «чистоту» страницы (аудит 2.0.1).
+            self._log.warning(
+                "Не удалось снять подпись формы «%s»: %s", key, type(exc).__name__,
+            )
+            return None
+        return None
 
     def _reset_form_baseline(self, key: str) -> None:
         self._form_baseline[key] = self._form_signature(key)

@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -479,20 +480,33 @@ class DataStore:
             destination = f"{path}.bad-{stamp}{suffix}"
             moved_ok = False
             last_exc: OSError | None = None
-            # На Windows только что записанный файл может быть на короткое
-            # время заблокирован антивирусным сканом (Defender): os.replace
-            # падает с PermissionError. Замена ретраится с растущей паузой
-            # (суммарно ~0,4 с) — операция разовая, старт приложения это не
-            # тормозит. 2.15.0: без ретраев CI-сборка на Windows-раннере
-            # стабильно теряла .bad-копию (файл занят сразу после записи).
-            for attempt in range(5):
+            # На Windows только что записанный файл может быть несколько
+            # секунд заблокирован антивирусным сканом (Defender): os.replace
+            # падает с PermissionError / WinError 32. Замена ретраится с
+            # растущей паузой (суммарно ~2,75 с) — операция разовая, старт
+            # приложения это не тормозит. 2.15.0: без ретраев CI-сборка на
+            # Windows-раннере стабильно теряла .bad-копию (файл занят сразу
+            # после записи).
+            for attempt in range(10):
                 try:
                     os.replace(src, destination)
                     moved_ok = True
                     break
                 except OSError as replace_exc:
                     last_exc = replace_exc
-                    time.sleep(0.02 * (attempt + 1))
+                    time.sleep(0.05 * (attempt + 1))
+            if not moved_ok:
+                # Последний шанс: чтение не требует эксклюзивной блокировки —
+                # копируем содержимое в .bad-копию и удаляем оригинал.
+                try:
+                    shutil.copyfile(src, destination)
+                    moved_ok = True
+                    try:
+                        os.remove(src)
+                    except OSError as remove_exc:
+                        last_exc = remove_exc  # копия уже создана — не критично
+                except OSError as copy_exc:
+                    last_exc = copy_exc
             if moved_ok:
                 moved.append(os.path.basename(src))
             else:

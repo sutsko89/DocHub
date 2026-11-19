@@ -43,6 +43,7 @@ import import_controller
 import lifecycle_controller
 import reconcile
 import registry_controller
+import settings_controller
 import single_instance
 import storage
 import ui_macos as ui
@@ -81,7 +82,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -555,6 +556,12 @@ class ContractApp:
         # _build_contract_page / _build_additional_page уже идут через
         # контроллер.
         self._doc_page_flow = document_page_controller.DocumentPageController(self)
+
+        # Страница «Настройки», ключ DaData и папка документов — тоже
+        # контроллер (шаг 8 декомпозиции ContractApp, аудит 2.0.1 P2).
+        # Создаётся ДО построения страниц: _build_settings_page уже идёт
+        # через контроллер.
+        self._settings_flow = settings_controller.SettingsController(self)
 
         # Единый «текущий контрагент» и защита несохранённых данных (п. 4.2, 4.4).
         self._current_party_id = None
@@ -1549,145 +1556,40 @@ class ContractApp:
                 pass
 
     # -- Печатная форма: сборка .docx напрямую из шаблонов ---------------- #
+    # ------------------------------------------------------------------ #
+    #  Папка документов — SettingsController
+    # ------------------------------------------------------------------ #
+    #  Папка по умолчанию (п. 6.2), честное решение при недоступной папке
+    #  (п. 2.8), фоновый вариант для импорта и проверка выхода за пределы
+    #  папки (п. 2.7) переехали в settings_controller.SettingsController
+    #  (восьмой шаг декомпозиции ContractApp, аудит 2.0.1 P2) вместе со
+    #  страницей «Настройки» и ключом DaData. Настройки и счётчики ретраев
+    #  остаются на приложении (_settings, _docs_dir_retry_count, флаги
+    #  fallback/dialog); здесь — фасады с прежними именами: их вызывают
+    #  DocumentSaveController, ImportController, LifecycleController,
+    #  RegistryController и smoke-тест (в том числе как staticmethod —
+    #  подмена route сохранена).
     def _default_documents_dir(self, interactive: bool = True) -> str:
-        """Папка документов по умолчанию: «Документы/EW.DocHub» (п. 6.2).
-
-        Раньше по умолчанию использовался скрытый %APPDATA%\\DogovorGenerator\\documents:
-        пользователь не видел, где лежат его файлы. Теперь — видимая папка
-        «Документы», которая не исчезает при переустановке системы и попадает
-        в обычные резервные копии. Если «Документы» недоступны — возврат
-        к прежнему месту в профиле пользователя.
-        """
-        base = os.path.join(_user_documents_dir(), "EW.DocHub")
-        try:
-            os.makedirs(base, exist_ok=True)
-            return base
-        except OSError as exc:
-            self._log.error(
-                "Папка документов по умолчанию недоступна: %s", type(exc).__name__,
-            )
-            if interactive:
-                ui.alert(
-                    self.root, "Папка документов недоступна",
-                    "Не удалось создать папку документов по умолчанию:\n"
-                    f"{base}\n\n{exc}\n\n"
-                    "Выберите другую папку в «Настройках» или проверьте права доступа.",
-                    "error",
-                )
-        base = os.path.join(
-            os.environ.get("APPDATA") or os.path.expanduser("~"),
-            SETTINGS_DIR_NAME, "documents",
-        )
-        try:
-            os.makedirs(base, exist_ok=True)
-        except OSError:
-            pass
-        return base
+        """Папка документов по умолчанию (контроллер настроек)."""
+        return self._settings_flow.default_documents_dir(interactive=interactive)
 
     def _resolve_unavailable_documents_dir(self, custom: str, exc: OSError) -> str:
-        """Спрашивает, куда сохранять, если выбранная папка недоступна (п. 2.8)."""
-        self._log.warning("Папка документов недоступна: %s", type(exc).__name__)
-        if self._docs_dir_fallback_active or self._docs_dir_dialog_active:
-            return self._default_documents_dir()
-        if self._docs_dir_retry_count >= 2:
-            self._docs_dir_fallback_active = True
-            return self._default_documents_dir()
-
-        self._docs_dir_dialog_active = True
-        try:
-            choice = self._choice_dialog(
-                "Папка документов недоступна",
-                f"Не удалось открыть папку:\n{custom}\n\n{exc}\n\n"
-                "Куда сохранять новые документы?",
-                [
-                    ("default", "Папка по умолчанию", False),
-                    ("choose", "Выбрать другую", False),
-                    ("retry", "Повторить", True),
-                ],
-            )
-        finally:
-            self._docs_dir_dialog_active = False
-
-        if choice == "retry":
-            self._docs_dir_retry_count += 1
-            return self._documents_dir(interactive=True)
-        if choice == "choose":
-            chosen = filedialog.askdirectory(
-                parent=self.root, title="Выберите папку для документов",
-            )
-            if chosen:
-                self._settings["documents_dir"] = chosen
-                self._docs_dir_retry_count = 0
-                self._docs_dir_fallback_active = False
-                self._persist_settings()
-                return chosen
-        self._docs_dir_fallback_active = True
-        return self._default_documents_dir()
+        """Диалог «куда сохранять» при недоступной папке (контроллер настроек)."""
+        return self._settings_flow.resolve_unavailable_documents_dir(custom, exc)
 
     def _documents_dir(self, interactive: bool = True) -> str:
-        """Папка для готовых документов: выбранная в настройках либо %APPDATA%.
-
-        Недоступная папка больше не подменяется молча (п. 2.8): пользователь
-        выбирает «повторить / выбрать другую / по умолчанию» и видит, куда
-        реально сохранится документ.
-        """
-        custom = str(self._settings.get("documents_dir") or "").strip()
-        if custom:
-            try:
-                os.makedirs(custom, exist_ok=True)
-                self._docs_dir_retry_count = 0
-                return custom
-            except OSError as exc:
-                if interactive:
-                    return self._resolve_unavailable_documents_dir(custom, exc)
-                self._log.warning(
-                    "Папка документов недоступна (фоновая задача): %s",
-                    type(exc).__name__,
-                )
-        return self._default_documents_dir(interactive=interactive)
+        """Папка для готовых документов (контроллер настроек)."""
+        return self._settings_flow.documents_dir(interactive=interactive)
 
     def _documents_dir_for_import(self) -> str:
-        """Папка документов для фонового импорта: без Tk-диалогов.
-
-        Импорт выполняется в отдельном потоке, где нельзя показывать окна.
-        Если выбранная пользователем папка недоступна, возвращается ошибка —
-        она попадёт в отчёт импорта, а не приведёт к молчаливой подмене пути.
-        """
-        custom = str(self._settings.get("documents_dir") or "").strip()
-        if custom:
-            try:
-                os.makedirs(custom, exist_ok=True)
-                return custom
-            except OSError as exc:
-                raise OSError(
-                    "Папка документов недоступна:\n"
-                    f"{custom}\n{exc}\n\n"
-                    "Выберите другую папку в «Настройках» и повторите импорт."
-                ) from exc
-        return self._default_documents_dir(interactive=False)
+        """Папка документов для фонового импорта (контроллер настроек)."""
+        return self._settings_flow.documents_dir_for_import()
 
     @staticmethod
     def _is_inside_directory(base: str, path: str) -> bool:
-        """Проверяет, что ``path`` не выходит за пределы ``base`` (п. 2.7)."""
-        try:
-            base_norm = os.path.normcase(os.path.normpath(base))
-            path_norm = os.path.normcase(os.path.normpath(path))
-            return os.path.commonpath([base_norm, path_norm]) == base_norm
-        except (ValueError, OSError):
-            return False
+        """path не выходит за пределы base (контроллер настроек)."""
+        return settings_controller.SettingsController.is_inside_directory(base, path)
 
-    # ------------------------------------------------------------------ #
-    #  Сохранение документов — запись и сценарии в DocumentSaveController
-    # ------------------------------------------------------------------ #
-    #  Папки контрагентов, транзакция «файл + запись реестра» (п. 9.2),
-    #  печатные формы из шаблонов и записей, предпросмотр спецификации,
-    #  подтверждение повтора номера (п. 4.1) и save_contract /
-    #  save_additional / save_spec переехали в
-    #  document_save_controller.DocumentSaveController (пятый шаг
-    #  декомпозиции ContractApp, аудит 2.0.1 P2); здесь остаются фасады
-    #  с прежними именами — страницы форм, Ctrl+S и smoke-тест продолжают
-    #  работать как раньше. Открытие файла после сохранения идёт через
-    #  фасад _open_file: smoke-тест подменяет модульное main.open_file.
     def _persist_document(self, draft: dict) -> dict:
         """Пишет .docx и регистрирует запись (контроллер сохранения)."""
         return self._doc_save_flow.persist_document(draft)
@@ -1835,186 +1737,36 @@ class ContractApp:
     # ------------------------------------------------------------------ #
     #  Страница «Настройки»
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    #  Страница «Настройки», ключ DaData — SettingsController
+    # ------------------------------------------------------------------ #
+    #  Сборка страницы, сохранение/удаление ключа DaData (аудит 2.0.1:
+    #  сохранённый ключ не подставляется в поле) и выбор папки документов
+    #  переехали в settings_controller.SettingsController (восьмой шаг
+    #  декомпозиции ContractApp, аудит 2.0.1 P2). Настройки и состояние
+    #  страницы остаются на приложении (_settings, _documents_dir_var,
+    #  _dadata_key_entry, _dadata_key_status_var); здесь — фасады с
+    #  прежними именами для кнопок страницы и smoke-теста.
     def _build_settings_page(self):
-        _page, left, _right, _textbox = self._make_page(
-            "settings", "Настройки",
-            "Тема оформления, папка документов и ключ DaData.",
-        )
-
-        # -- Тема -------------------------------------------------------- #
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=0, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("Тема оформления")
-        theme_toggle = ui.ThemeToggle(
-            card.body,
-            command=self._on_theme_change,
-            mode="dark" if ctk.get_appearance_mode().lower() == "dark" else "light",
-        )
-        card.wide(theme_toggle, pady=(int(2 * self.scale), int(6 * self.scale)))
-        # Переключатель — по ширине двух иконок, не растягиваем на всю карточку.
-        theme_toggle.grid_configure(sticky="w")
-
-        # -- Папка документов -------------------------------------------- #
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=1, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("Папка для сохранения документов")
-        self._documents_dir_var = tk.StringVar(value=self._documents_dir())
-        card.wide(
-            ctk.CTkLabel(
-                card.body, textvariable=self._documents_dir_var,
-                font=ui.font(12), text_color=ui.COLORS["text"],
-                anchor="w", justify="left",
-                wraplength=int((LEFT_PANEL_WIDTH - 48) * self.scale),
-            ),
-            pady=(int(2 * self.scale), int(6 * self.scale)),
-        )
-        buttons = ctk.CTkFrame(card.body, fg_color="transparent")
-        card.wide(buttons)
-        ui.secondary_button(
-            buttons, "Выбрать папку…", self._choose_documents_dir,
-            width=int(170 * self.scale), height=int(30 * self.scale),
-        ).pack(side="left")
-        ui.secondary_button(
-            buttons, "Открыть папку", lambda: open_file(self._documents_dir()),
-            width=int(150 * self.scale), height=int(30 * self.scale),
-        ).pack(side="left", padx=(int(10 * self.scale), 0))
-        card.wide(
-            ctk.CTkLabel(
-                card.body,
-                text="Здесь сохраняются договоры и доп. соглашения, созданные в программе. "
-                     "Для каждого контрагента заводится своя папка с его документами.",
-                font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
-                anchor="w", justify="left",
-                wraplength=int((LEFT_PANEL_WIDTH - 48) * self.scale),
-            ),
-            pady=(int(4 * self.scale), int(2 * self.scale)),
-        )
-
-        # Добавление документов перенесено в раздел «Реестр» (п. 4.5).
-
-        # -- DaData ------------------------------------------------------ #
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=2, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("DaData: автозаполнение по ИНН")
-        card.wide(
-            ctk.CTkLabel(
-                card.body,
-                text="Ключ не входит в поставку — укажите свой ключ с dadata.ru. "
-                     "Без ключа доступен только ручной ввод реквизитов. При "
-                     "автозаполнении сервису отправляется только ИНН — публичный "
-                     "идентификатор организации/ИП; реквизиты карточки и документы "
-                     "никуда не отправляются.",
-                font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
-                anchor="w", justify="left",
-                wraplength=int((LEFT_PANEL_WIDTH - 48) * self.scale),
-            ),
-            pady=(int(2 * self.scale), int(6 * self.scale)),
-        )
-        self._dadata_key_entry = ui.entry(card.body, width=int(ENTRY_WIDTH * self.scale))
-        try:
-            self._dadata_key_entry.entry.configure(show="•")
-        except Exception:
-            pass
-        # Аудит 2.0.1: сохранённый ключ НЕ подставляется в поле — реальное
-        # значение не показывается и не копируется по Ctrl+C. Поле остаётся
-        # пустым, пока пользователь не решит сменить ключ; состояние — строкой ниже.
-        self._dadata_key_status_var = tk.StringVar(value=self._dadata_key_status_text())
-        card.wide(
-            ctk.CTkLabel(
-                card.body, textvariable=self._dadata_key_status_var,
-                font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
-                anchor="w", justify="left",
-                wraplength=int((LEFT_PANEL_WIDTH - 48) * self.scale),
-            ),
-            pady=(int(2 * self.scale), int(4 * self.scale)),
-        )
-        card.row(
-            "API-ключ", self._dadata_key_entry, stretch=True,
-            hint="Ключ хранится в профиле пользователя отдельно от реестра.",
-        )
-        key_buttons = ctk.CTkFrame(card.body, fg_color="transparent")
-        card.wide(key_buttons)
-        ui.secondary_button(
-            key_buttons, "Сохранить ключ", self._save_dadata_key,
-            width=int(160 * self.scale), height=int(30 * self.scale),
-        ).pack(side="left")
-        ui.ghost_button(
-            key_buttons, "Удалить ключ", self._clear_dadata_key,
-            width=int(130 * self.scale), height=int(28 * self.scale),
-        ).pack(side="left", padx=(int(10 * self.scale), 0))
+        """Строит страницу «Настройки» (контроллер настроек)."""
+        self._settings_flow.build_settings_page()
 
     def _dadata_key_status_text(self) -> str:
-        """Статус сохранённого ключа — без подстановки самого значения."""
-        if dadata.load_api_key():
-            if dadata.dpapi_available():
-                return "Ключ сохранён и зашифрован (DPAPI, профиль пользователя)."
-            return "Ключ сохранён в профиле пользователя."
-        return "Ключ не задан."
+        """Статус ключа DaData без подстановки значения (контроллер)."""
+        return self._settings_flow.dadata_key_status_text()
 
     def _save_dadata_key(self):
-        """Сохраняет введённый пользователем ключ DaData."""
-        key = self._dadata_key_entry.get().strip()
-        if not key:
-            ui.alert(self.root, "Ключ не указан",
-                     "Введите API-ключ DaData или оставьте поле пустым.", "error")
-            return
-        if dadata.save_api_key(key):
-            try:
-                self._dadata_key_entry.delete(0, "end")
-            except Exception:
-                pass
-            self._dadata_key_status_var.set(self._dadata_key_status_text())
-            ui.alert(
-                self.root, "Ключ сохранён",
-                "Автозаполнение по ИНН будет использовать этот ключ."
-                + (" Значение зашифровано (DPAPI)." if dadata.dpapi_available() else ""),
-                "success",
-            )
-        else:
-            ui.alert(
-                self.root, "Не удалось сохранить ключ",
-                "Проверьте права на запись в профиль пользователя:\n"
-                f"{dadata.key_storage_path()}", "error",
-            )
+        """Сохраняет ключ DaData (контроллер настроек)."""
+        self._settings_flow.save_dadata_key()
 
     def _clear_dadata_key(self):
-        """Удаляет сохранённый ключ DaData."""
-        if not ui.confirm(
-            self.root, "Удалить ключ DaData",
-            "Удалить сохранённый ключ? Автозаполнение по ИНН перестанет работать.",
-            ok_text="Удалить",
-        ):
-            return
-        dadata.clear_api_key()
-        try:
-            self._dadata_key_entry.delete(0, "end")
-        except Exception:
-            pass
-        self._dadata_key_status_var.set(self._dadata_key_status_text())
-        ui.alert(self.root, "Ключ удалён",
-                 "Ключ DaData удалён из профиля пользователя.", "success")
+        """Удаляет ключ DaData с подтверждением (контроллер настроек)."""
+        self._settings_flow.clear_dadata_key()
 
     def _choose_documents_dir(self):
-        current = self._documents_dir()
-        chosen = filedialog.askdirectory(
-            parent=self.root, initialdir=current,
-            title="Папка для сохранения договоров и документов",
-        )
-        if not chosen:
-            return
-        self._settings["documents_dir"] = chosen
-        self._documents_dir_var.set(chosen)
-        # Сохраняем сразу, а не только при закрытии: иначе при аварийном
-        # завершении выбранная папка теряется.
-        if self._persist_settings():
-            ui.alert(
-                self.root, "Папка сохранена",
-                f"Документы будут сохраняться в:\n{chosen}", "success",
-            )
+        """Выбор папки документов с немедленным сохранением (контроллер)."""
+        self._settings_flow.choose_documents_dir()
 
-    # ------------------------------------------------------------------ #
-    #  Добавление готовых документов (фоновый импорт)
-    # ------------------------------------------------------------------ #
     def _import_documents_dialog(self):
         """Выбор файлов для загрузки в реестр."""
         if getattr(self, "_import_running", False):

@@ -83,7 +83,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.11.0"
+APP_VERSION = "2.12.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -536,32 +536,29 @@ class ContractApp:
         # (шаг декомпозиции ContractApp, аудит 2.0.1 P2): busy-анимация,
         # воркер и опрос очереди живут в dadata_controller.DadataController.
         self._dadata_flow = dadata_controller.DadataController(self)
-        # Страница «Реестр»: рендер, поиск, выбор, сверка — контроллер (шаг 4
-        # декомпозиции ContractApp, аудит 2.0.1 P2). Создаётся ДО построения
-        # страниц: _build_registry_page уже идёт через контроллер.
+        # Страница «Реестр»: рендер, поиск, выбор, сверка — RegistryController
+        # (v2.4.0). Создаётся ДО построения страниц: build_page вызывается
+        # напрямую у контроллера.
         self._registry_flow = registry_controller.RegistryController(self)
-        # Спецификация и сохранение документов — тоже контроллер (шаг 5
-        # декомпозиции ContractApp, аудит 2.0.1 P2). Создаётся ДО построения
-        # страниц: _build_spec_page уже идёт через контроллер.
+        # Спецификация и сохранение документов — DocumentSaveController
+        # (v2.5.0). Создаётся ДО построения страниц: build_spec_page
+        # вызывается напрямую у контроллера.
         self._doc_save_flow = document_save_controller.DocumentSaveController(self)
 
-        # Страница «Добавить контрагента» и редактирование карточки — тоже
-        # контроллер (шаг 6 декомпозиции ContractApp, аудит 2.0.1 P2).
-        # Создаётся ДО построения страниц: _build_counterparty_page уже
-        # идёт через контроллер.
+        # Страница «Добавить контрагента» и редактирование карточки —
+        # CounterpartyController (v2.6.0). Создаётся ДО построения страниц:
+        # build_counterparty_page вызывается напрямую у контроллера.
         self._counterparty_flow = counterparty_controller.CounterpartyController(self)
 
         # Страницы «Договор» и «Доп. соглашение» с отложенными
-        # предпросмотрами — тоже контроллер (шаг 7 декомпозиции ContractApp,
-        # аудит 2.0.1 P2). Создаётся ДО построения страниц:
-        # _build_contract_page / _build_additional_page уже идут через
-        # контроллер.
+        # предпросмотрами — DocumentPageController (v2.7.0). Создаётся ДО
+        # построения страниц: build_contract_page / build_additional_page
+        # вызываются напрямую у контроллера.
         self._doc_page_flow = document_page_controller.DocumentPageController(self)
 
-        # Страница «Настройки», ключ DaData и папка документов — тоже
-        # контроллер (шаг 8 декомпозиции ContractApp, аудит 2.0.1 P2).
-        # Создаётся ДО построения страниц: _build_settings_page уже идёт
-        # через контроллер.
+        # Страница «Настройки», ключ DaData и папка документов —
+        # SettingsController (v2.8.0). Создаётся ДО построения страниц:
+        # build_settings_page вызывается напрямую у контроллера.
         self._settings_flow = settings_controller.SettingsController(self)
 
         # Единый «текущий контрагент» и защита несохранённых данных (п. 4.2, 4.4).
@@ -569,11 +566,10 @@ class ContractApp:
         self._current_party_vars: dict[str, tk.StringVar] = {}
         self._syncing_party = False
         self._form_baseline: dict[str, tuple | None] = {}
-        # Оркестрация контекста — тоже контроллер (шаг 9 декомпозиции
-        # ContractApp, аудит 2.0.1 P2): списки контрагентов, перенос выбора
-        # между страницами и подтверждение потери изменений. Создаётся ДО
-        # построения страниц: _refresh_party_combo_values уже идёт через
-        # контроллер.
+        # Оркестрация контекста — DocumentContextController (v2.9.0):
+        # списки контрагентов, перенос выбора между страницами и
+        # подтверждение потери изменений. Создаётся ДО построения страниц:
+        # refresh_party_combo_values вызывается напрямую у контроллера.
         self._doc_context_flow = document_context_controller.DocumentContextController(self)
         self._registry_search_after = None
         self._toast_after = None
@@ -585,7 +581,7 @@ class ContractApp:
         self._build_titlebar()
         self._build_body()
         self._build_pages()
-        self._reset_all_form_baselines()
+        self._doc_context_flow.reset_all_form_baselines()
         self._install_resize_handles()
         self._select_page("contract")
         # Первый запуск: сразу открываем добавление контрагента (п. 4.5).
@@ -595,7 +591,7 @@ class ContractApp:
         self.root.after(600, self._cleanup_temp_documents)
         # Автоочистка старой корзины и сверка «реестр ↔ папка документов».
         self.root.after(900, self._cleanup_expired_trash)
-        self.root.after(1500, self._scan_documents_consistency)
+        self.root.after(1500, self._registry_flow.scan_consistency)
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Escape>", self._on_escape)
@@ -870,7 +866,7 @@ class ContractApp:
         return {"width": width, "height": height, "x": x, "y": y, "maximized": bool(self._zoomed)}
 
     def close(self):
-        dirty = [self._form_label(key) for key in self._dirty_pages()]
+        dirty = [self._doc_context_flow.form_label(key) for key in self._doc_context_flow.dirty_pages()]
         if dirty and not ui.confirm(
             self.root, "Несохранённые данные",
             "Есть несохранённые изменения:\n"
@@ -898,7 +894,7 @@ class ContractApp:
     def _cleanup_temp_documents(self) -> None:
         """Удаляет *.docx.tmp, оставшиеся после аварийного завершения записи."""
         try:
-            base = self._documents_dir(interactive=False)
+            base = self._settings_flow.documents_dir(interactive=False)
             directories = [base]
             with os.scandir(base) as entries:
                 directories.extend(
@@ -930,7 +926,7 @@ class ContractApp:
             self._log.warning("Автоочистка корзины не удалась: %s", type(exc).__name__)
             return
         if removed:
-            self.refresh_registry()
+            self._registry_flow.refresh()
             self._update_status()
 
     # ------------------------------------------------------------------ #
@@ -1058,7 +1054,7 @@ class ContractApp:
         inner.pack(fill="both", expand=True, padx=int(20 * self.scale))
 
         self.save_button = ui.primary_button(
-            inner, "Сохранить договор", self.save_contract,
+            inner, "Сохранить договор", self._doc_save_flow.save_contract,
             width=int(186 * self.scale), height=int(32 * self.scale),
         )
         self.save_button.pack(side="right", pady=int(15 * self.scale))
@@ -1072,10 +1068,10 @@ class ContractApp:
     def _update_footer(self):
         """Кнопка футера и её подпись зависят от открытой страницы."""
         commands = {
-            "counterparty": ("Сохранить контрагента", self._cp_save),
-            "contract": ("Сохранить договор", self.save_contract),
-            "additional": ("Сохранить доп. соглашение", self.save_additional),
-            "spec": ("Сохранить спецификацию", self.save_spec),
+            "counterparty": ("Сохранить контрагента", self._counterparty_flow.save_card),
+            "contract": ("Сохранить договор", self._doc_save_flow.save_contract),
+            "additional": ("Сохранить доп. соглашение", self._doc_save_flow.save_additional),
+            "spec": ("Сохранить спецификацию", self._doc_save_flow.save_spec),
         }
         if self.current_page in commands:
             text, command = commands[self.current_page]
@@ -1089,15 +1085,15 @@ class ContractApp:
     #  Страницы: общий каркас «параметры слева — документ справа»
     # ------------------------------------------------------------------ #
     def _build_pages(self):
-        self._build_contract_page()
-        self._build_additional_page()
-        self._build_spec_page()
-        self._build_counterparty_page()
-        self._build_registry_page()
-        self._build_settings_page()
+        self._doc_page_flow.build_contract_page()
+        self._doc_page_flow.build_additional_page()
+        self._doc_save_flow.build_spec_page()
+        self._counterparty_flow.build_counterparty_page()
+        self._registry_flow.build_page()
+        self._settings_flow.build_settings_page()
         # Обновляем списки только после того, как все страницы созданы:
         # иначе в «Доп. соглашении» и «Спецификации» не будет контрагентов.
-        self._refresh_party_combo_values()
+        self._doc_context_flow.refresh_party_combo_values()
 
     def _make_page(self, key: str, title: str, subtitle: str, with_text: bool = False,
                    text_title: str = "Текст документа (только чтение)"):
@@ -1195,118 +1191,19 @@ class ContractApp:
     # ------------------------------------------------------------------ #
     #  Страницы «Договор» и «Доп. соглашение» — DocumentPageController
     # ------------------------------------------------------------------ #
-    #  Сборка страниц, отложенные текстовые предпросмотры (п. 5.6), поиск
-    #  контрагента по ИНН, подстановка договора-основания (п. 5.1, 4.2)
-    #  и поля «сумма/срок прописью» переехали в document_page_controller.
-    #  DocumentPageController (седьмой шаг декомпозиции ContractApp, аудит
-    #  2.0.1 P2). Состояние страниц остаётся на приложении с прежними
-    #  именами (contract_party_var, addl_contract_var, _limit_var …,
-    #  таймеры _preview_*_after) — его читают защита несохранённых данных
-    #  (п. 4.2, 4.4), DocumentSaveController и smoke-тест; здесь остаются
-    #  фасады с прежними именами для внешних вызывающих.
-    def _build_contract_page(self):
-        """Строит страницу «Договор поставки» (контроллер страниц документов)."""
-        self._doc_page_flow.build_contract_page()
-
-    def _preview_contract(self, *_args):
-        """Откладывает перерисовку предпросмотра договора (контроллер)."""
-        self._doc_page_flow.preview_contract(*_args)
-
-    def _render_contract_preview(self):
-        """Собирает текст предпросмотра договора (контроллер страниц)."""
-        self._doc_page_flow.render_contract_preview()
-
-    def _find_party_by_inn(self):
-        """Ищет контрагента по ИНН и подставляет выбор (контроллер страниц)."""
-        self._doc_page_flow.find_party_by_inn()
-
-    def _build_additional_page(self):
-        """Строит страницу «Доп. соглашение» (контроллер страниц документов)."""
-        self._doc_page_flow.build_additional_page()
-
-    def _preview_additional(self, *_args):
-        """Откладывает перерисовку предпросмотра доп. соглашения (контроллер)."""
-        self._doc_page_flow.preview_additional(*_args)
-
-    def _render_additional_preview(self):
-        """Собирает текст предпросмотра доп. соглашения (контроллер страниц)."""
-        self._doc_page_flow.render_additional_preview()
-
-    def _on_addl_party_changed(self, *_args):
-        """Обновляет список договоров при выборе контрагента (контроллер)."""
-        self._doc_page_flow.on_addl_party_changed(*_args)
+    #  Сборка страниц, отложенные предпросмотры (п. 5.6), поиск по ИНН,
+    #  подстановка договора-основания (п. 5.1, 4.2) и поля «прописью» —
+    #  в document_page_controller.DocumentPageController (v2.7.0). Фасады
+    #  ContractApp удалены (v2.12.0): вызовы идут через
+    #  self.app._doc_page_flow, состояние страниц осталось на приложении.
 
     #  Спецификация и сохранение документов — DocumentSaveController
-    # ------------------------------------------------------------------ #
-    #  Код страницы «Спецификация» — таблица позиций, договор-основание,
-    #  предпросмотр — переехал в document_save_controller.DocumentSave-
-    #  Controller (пятый шаг декомпозиции ContractApp, аудит 2.0.1 P2).
-    #  Состояние страницы остаётся на приложении с прежними именами — его
-    #  читают защита несохранённых данных (п. 4.2, 4.4), страницы договора
-    #  и доп. соглашения и smoke-тест; здесь остаются фасады с прежними
-    #  именами для внешних вызывающих.
-    def _build_spec_page(self):
-        """Строит страницу «Спецификация» (контроллер сохранения документов)."""
-        self._doc_save_flow.build_spec_page()
+    #  (document_save_controller, v2.5.0). Фасады ContractApp удалены
+    #  (v2.12.0): вызовы идут через self.app._doc_save_flow.
 
-    @property
-    def _spec_rows(self) -> list[dict]:
-        """Строки позиций страницы «Спецификация» (контроллер сохранения)."""
-        return self._doc_save_flow.spec_rows
-
-    def _add_spec_row(self, name="", qty="", price="", unit=""):
-        """Добавляет строку в таблицу позиций (контроллер сохранения)."""
-        return self._doc_save_flow.add_spec_row(name=name, qty=qty, price=price, unit=unit)
-
-    def _remove_spec_row(self):
-        """Удаляет последнюю строку таблицы позиций (контроллер сохранения)."""
-        self._doc_save_flow.remove_spec_row()
-
-    def _spec_items(self) -> list[dict]:
-        """Позиции с заполненным наименованием (контроллер сохранения)."""
-        return self._doc_save_flow.spec_items()
-
-    def _spec_total(self) -> Decimal:
-        """Сумма позиций спецификации (контроллер сохранения)."""
-        return self._doc_save_flow.spec_total()
-
-    def _on_spec_item_changed(self, *_args):
-        """Пересобирает предпросмотр после правки ячейки таблицы (контроллер)."""
-        self._doc_save_flow.on_spec_item_changed(*_args)
-
-    def _on_spec_party_changed(self, *_args):
-        """Подставляет договор-основание при выборе контрагента (контроллер)."""
-        self._doc_save_flow.on_spec_party_changed(*_args)
-
-    # ------------------------------------------------------------------ #
-    #  Страница «Реестр» — рендер и сверки в RegistryController
-    # ------------------------------------------------------------------ #
-    #  Построение страницы, поиск, выбор контрагента, рендер секций
-    #  (документы / «unknown» / корзина) и сверка реестра с папкой
-    #  документов переехали в registry_controller.RegistryController
-    #  (четвёртый шаг декомпозиции ContractApp, аудит 2.0.1 P2). Состояние
-    #  страницы остаётся на приложении с прежними именами — его читают
-    #  другие страницы, сценарии сохранения и smoke-тест; здесь остаются
-    #  фасады с прежними именами для внешних вызывающих.
-    def _build_registry_page(self):
-        """Строит страницу «Реестр» (контроллер реестра)."""
-        self._registry_flow.build_page()
-
-    def refresh_registry(self):
-        """Перерисовывает реестр целиком (контроллер реестра)."""
-        self._registry_flow.refresh()
-
-    def _registry_apply_filter(self):
-        """Применяет поиск и перерисовывает реестр (контроллер реестра)."""
-        self._registry_flow.apply_filter()
-
-    def _select_registry_party(self, rec: dict):
-        """Клик по контрагенту: показать/скрыть его документы (контроллер)."""
-        self._registry_flow.select_party(rec)
-
-    def _scan_documents_consistency(self) -> None:
-        """Фоновая сверка реестра с папкой документов (контроллер реестра)."""
-        self._registry_flow.scan_consistency()
+    #  Страница «Реестр» — RegistryController (registry_controller,
+    #  v2.4.0). Фасады ContractApp удалены (v2.12.0): вызовы идут через
+    #  self.app._registry_flow.
 
     # ------------------------------------------------------------------ #
     #  Помощники страниц
@@ -1382,65 +1279,12 @@ class ContractApp:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------ #
-    #  Контрагенты и договоры на страницах — DocumentContextController
-    # ------------------------------------------------------------------ #
-    #  Выпадающие списки контрагентов, единый «текущий контрагент» с
-    #  переносом выбора между страницами (п. 4.2), подсказка о договоре-
-    #  основании и явное имя договора переехали в
-    #  document_context_controller.DocumentContextController (девятый шаг
-    #  декомпозиции ContractApp, аудит 2.0.1 P2). Состояние контекста
-    #  (_current_party_id, _syncing_party, _current_party_vars) остаётся на
-    #  приложении; здесь — фасады с прежними именами: их вызывают
-    #  DocumentPageController, DocumentSaveController, RegistryController,
-    #  CounterpartyController и smoke-тест.
-    def _party_duplicate_bases(self) -> set[str]:
-        """Названия, встречающиеся у нескольких карточек (контроллер)."""
-        return self._doc_context_flow.party_duplicate_bases()
-
-    def _party_display(self, rec: dict, duplicates: set[str] | None = None) -> str:
-        """Имя в списке; при совпадении добавляется ID (контроллер)."""
-        return self._doc_context_flow.party_display(rec, duplicates)
-
-    def _party_display_values(self) -> list[str]:
-        """Имена всех активных контрагентов для списков (контроллер)."""
-        return self._doc_context_flow.party_display_values()
-
-    def _refresh_party_combo_values(self):
-        """Обновляет списки и сбрасывает устаревший выбор (контроллер)."""
-        self._doc_context_flow.refresh_party_combo_values()
-
-    def _party_from_var(self, var: tk.StringVar) -> dict | None:
-        """Запись контрагента по значению списка (контроллер)."""
-        return self._doc_context_flow.party_from_var(var)
-
-    def _current_party_label(self) -> str:
-        """Подпись «Документ для: …» (контроллер контекста)."""
-        return self._doc_context_flow.current_party_label()
-
-    def _update_current_party_labels(self) -> None:
-        """Обновляет подписи на всех страницах документов (контроллер)."""
-        self._doc_context_flow.update_current_party_labels()
-
-    def _set_current_party(self, rec: dict | None, source: str | None = None) -> None:
-        """Запоминает контрагента и переносит выбор (контроллер контекста)."""
-        self._doc_context_flow.set_current_party(rec, source=source)
-
-    def _on_party_selected(self, key: str) -> None:
-        """Пользователь выбрал контрагента на странице (контроллер)."""
-        self._doc_context_flow.on_party_selected(key)
-
-    def _update_contract_info(self, page: str) -> None:
-        """Показывает договор-основание явно (п. 4.2, контроллер)."""
-        self._doc_context_flow.update_contract_info(page)
-
-    def _contract_display(self, rec: dict) -> str:
-        """Имя договора в списке основания (контроллер контекста)."""
-        return self._doc_context_flow.contract_display(rec)
-
-    def _contract_from_var(self, var: tk.StringVar, party_id) -> dict | None:
-        """Запись договора по значению списка (контроллер контекста)."""
-        return self._doc_context_flow.contract_from_var(var, party_id)
+    #  Контрагенты/договоры на страницах, единый «текущий контрагент»
+    #  (п. 4.2) и защита несохранённых данных (п. 4.4) —
+    #  DocumentContextController (document_context_controller, v2.9.0).
+    #  Фасады ContractApp удалены (v2.12.0): вызовы идут через
+    #  self.app._doc_context_flow; состояние контекста (_current_party_id,
+    #  _syncing_party, _current_party_vars, _form_baseline) на приложении.
 
     @staticmethod
     def _set_text(textbox, text: str):
@@ -1458,151 +1302,10 @@ class ContractApp:
                 pass
 
     # -- Печатная форма: сборка .docx напрямую из шаблонов ---------------- #
-    # ------------------------------------------------------------------ #
-    #  Папка документов — SettingsController
-    # ------------------------------------------------------------------ #
-    #  Папка по умолчанию (п. 6.2), честное решение при недоступной папке
-    #  (п. 2.8), фоновый вариант для импорта и проверка выхода за пределы
-    #  папки (п. 2.7) переехали в settings_controller.SettingsController
-    #  (восьмой шаг декомпозиции ContractApp, аудит 2.0.1 P2) вместе со
-    #  страницей «Настройки» и ключом DaData. Настройки и счётчики ретраев
-    #  остаются на приложении (_settings, _docs_dir_retry_count, флаги
-    #  fallback/dialog); здесь — фасады с прежними именами: их вызывают
-    #  DocumentSaveController, ImportController, LifecycleController,
-    #  RegistryController и smoke-тест (в том числе как staticmethod —
-    #  подмена route сохранена).
-    def _default_documents_dir(self, interactive: bool = True) -> str:
-        """Папка документов по умолчанию (контроллер настроек)."""
-        return self._settings_flow.default_documents_dir(interactive=interactive)
 
-    def _resolve_unavailable_documents_dir(self, custom: str, exc: OSError) -> str:
-        """Диалог «куда сохранять» при недоступной папке (контроллер настроек)."""
-        return self._settings_flow.resolve_unavailable_documents_dir(custom, exc)
-
-    def _documents_dir(self, interactive: bool = True) -> str:
-        """Папка для готовых документов (контроллер настроек)."""
-        return self._settings_flow.documents_dir(interactive=interactive)
-
-    def _documents_dir_for_import(self) -> str:
-        """Папка документов для фонового импорта (контроллер настроек)."""
-        return self._settings_flow.documents_dir_for_import()
-
-    @staticmethod
-    def _is_inside_directory(base: str, path: str) -> bool:
-        """path не выходит за пределы base (контроллер настроек)."""
-        return settings_controller.SettingsController.is_inside_directory(base, path)
-
-    def _persist_document(self, draft: dict) -> dict:
-        """Пишет .docx и регистрирует запись (контроллер сохранения)."""
-        return self._doc_save_flow.persist_document(draft)
-
-    def _party_documents_dir(self, party_rec: dict | None,
-                             interactive: bool = True) -> str:
-        """Индивидуальная папка контрагента (контроллер сохранения)."""
-        return self._doc_save_flow.party_documents_dir(party_rec, interactive=interactive)
-
-    def _render_contract_docx(self, data: dict, is_ip: bool) -> "Document":
-        """Договор из шаблона (контроллер сохранения)."""
-        return self._doc_save_flow.render_contract_docx(data, is_ip)
-
-    def _render_additional_docx(self, data: dict, is_ip: bool, number: str,
-                                limit_display: str, term: str) -> "Document":
-        """Доп. соглашение из шаблона (контроллер сохранения)."""
-        return self._doc_save_flow.render_additional_docx(
-            data, is_ip, number, limit_display, term)
-
-    def _render_spec_docx(self, rec: dict) -> "Document":
-        """Спецификация из шаблона (контроллер сохранения)."""
-        return self._doc_save_flow.render_spec_docx(rec)
-
-    def _rec_is_ip(self, rec: dict) -> bool:
-        """Признак ИП у сохранённой записи (контроллер сохранения)."""
-        return self._doc_save_flow.rec_is_ip(rec)
-
-    def _build_record_docx(self, rec: dict) -> "Document":
-        """Собирает .docx записи реестра по её типу (контроллер сохранения)."""
-        return self._doc_save_flow.build_record_docx(rec)
-
-    def _write_docx(self, doc, rec: dict) -> str:
-        """Пишет .docx в папку контрагента атомарно (контроллер сохранения)."""
-        return self._doc_save_flow.write_docx(doc, rec)
-
-    def _save_and_open_document(self, rec: dict) -> str:
-        """Готовит .docx и открывает его в Word (контроллер сохранения)."""
-        return self._doc_save_flow.save_and_open_document(rec)
-
-    def _persist_document_result_alert(self, result: dict):
-        """Сообщение при сбое транзакции сохранения (контроллер сохранения)."""
-        self._doc_save_flow.persist_document_result_alert(result)
-
-    def _regenerate_spec(self, *_args):
-        """Откладывает пересборку предпросмотра спецификации (контроллер)."""
-        self._doc_save_flow.regenerate_spec(*_args)
-
-    def _flush_spec_preview(self):
-        """Синхронно дособирает отложенный предпросмотр (контроллер)."""
-        self._doc_save_flow.flush_spec_preview()
-
-    def _render_spec_preview(self):
-        """Собирает текст предпросмотра спецификации (контроллер)."""
-        self._doc_save_flow.render_spec_preview()
-
-    def _confirm_document_duplicate(
-        self, party_id, kind: str, number: str, date_text: str
-    ) -> bool:
-        """Предупреждает о повторе номера документа (контроллер сохранения)."""
-        return self._doc_save_flow.confirm_document_duplicate(party_id, kind, number, date_text)
-
-    def save_contract(self):
-        """Сохраняет договор поставки (контроллер сохранения)."""
-        self._doc_save_flow.save_contract()
-
-    def save_additional(self):
-        """Сохраняет доп. соглашение (контроллер сохранения)."""
-        self._doc_save_flow.save_additional()
-
-    def save_spec(self):
-        """Сохраняет спецификацию (контроллер сохранения)."""
-        self._doc_save_flow.save_spec()
-
-    # ------------------------------------------------------------------ #
-    #  Реестр: экспорт и удаление — оркестрация в LifecycleController
-    # ------------------------------------------------------------------ #
-    #  Сценарии экспорта/открытия документа и корзины переехали в
-    #  lifecycle_controller.LifecycleController (третий шаг декомпозиции
-    #  ContractApp, аудит 2.0.1 P2); здесь остаются фасады с прежними
-    #  именами — кнопки реестра и smoke-тест продолжают работать как раньше.
-    def export_document(self, rec: dict):
-        """Открывает/экспортирует документ из реестра (контроллер жизненного цикла)."""
-        self._lifecycle_flow.export_document(rec)
-
-    def _delete_document(self, rec: dict):
-        """Перемещает документ в корзину после подтверждения (п. 2.5, 2.6)."""
-        self._lifecycle_flow.delete_document(rec)
-
-    def _delete_counterparty(self, rec: dict):
-        """Перемещает контрагента и его документы в корзину (п. 2.5, 2.6)."""
-        self._lifecycle_flow.delete_counterparty(rec)
-
-    def _restore_document(self, rec: dict):
-        """Возвращает документ из корзины (п. 2.6)."""
-        self._lifecycle_flow.restore_document(rec)
-
-    def _restore_counterparty(self, rec: dict):
-        """Возвращает контрагента и его документы из корзины (п. 2.6)."""
-        self._lifecycle_flow.restore_counterparty(rec)
-
-    def _purge_document(self, rec: dict):
-        """Удаляет запись документа из корзины окончательно (контроллер)."""
-        self._lifecycle_flow.purge_document(rec)
-
-    def _purge_counterparty(self, rec: dict):
-        """Удаляет контрагента и его документы окончательно (контроллер)."""
-        self._lifecycle_flow.purge_counterparty(rec)
-
-    def _empty_trash(self):
-        """Полностью очищает корзину (записи; файлы на диске остаются)."""
-        self._lifecycle_flow.empty_trash()
+    #  Экспорт/открытие документов и корзина — LifecycleController
+    #  (lifecycle_controller, v2.3.0). Фасады ContractApp удалены
+    #  (v2.12.0): вызовы идут через self.app._lifecycle_flow.
 
     # -- Оболочка: открытие файлов для контроллера жизненного цикла -------- #
     def _open_file(self, file_path) -> bool:
@@ -1623,55 +1326,14 @@ class ContractApp:
         """
         show_in_folder(file_path)
 
-    # ------------------------------------------------------------------ #
-    #  Редактирование контрагента — оркестрация в CounterpartyController
-    # ------------------------------------------------------------------ #
-    #  Шаг декомпозиции «бог-класса» ContractApp (аудит 2.0.1, P2): окно
-    #  редактирования карточки живёт в counterparty_controller.
-    #  CounterpartyController; здесь — фасад с прежним именем. Изменяется
-    #  только карточка: документы хранят собственную копию реквизитов
-    #  на момент создания.
 
-    def _edit_counterparty(self, rec: dict):
-        """Окно редактирования контрагента (контроллер карточки)."""
-        self._counterparty_flow.edit_counterparty(rec)
-
-    # ------------------------------------------------------------------ #
-    #  Страница «Настройки»
-    # ------------------------------------------------------------------ #
-    # ------------------------------------------------------------------ #
-    #  Страница «Настройки», ключ DaData — SettingsController
-    # ------------------------------------------------------------------ #
-    #  Сборка страницы, сохранение/удаление ключа DaData (аудит 2.0.1:
-    #  сохранённый ключ не подставляется в поле) и выбор папки документов
-    #  переехали в settings_controller.SettingsController (восьмой шаг
-    #  декомпозиции ContractApp, аудит 2.0.1 P2). Настройки и состояние
-    #  страницы остаются на приложении (_settings, _documents_dir_var,
-    #  _dadata_key_entry, _dadata_key_status_var); здесь — фасады с
-    #  прежними именами для кнопок страницы и smoke-теста.
-    def _build_settings_page(self):
-        """Строит страницу «Настройки» (контроллер настроек)."""
-        self._settings_flow.build_settings_page()
-
-    def _dadata_key_status_text(self) -> str:
-        """Статус ключа DaData без подстановки значения (контроллер)."""
-        return self._settings_flow.dadata_key_status_text()
-
-    def _save_dadata_key(self):
-        """Сохраняет ключ DaData (контроллер настроек)."""
-        self._settings_flow.save_dadata_key()
-
-    def _clear_dadata_key(self):
-        """Удаляет ключ DaData с подтверждением (контроллер настроек)."""
-        self._settings_flow.clear_dadata_key()
-
-    def _choose_documents_dir(self):
-        """Выбор папки документов с немедленным сохранением (контроллер)."""
-        self._settings_flow.choose_documents_dir()
+    #  Страница «Настройки», ключ DaData и папка документов —
+    #  SettingsController (settings_controller, v2.8.0). Фасады ContractApp
+    #  удалены (v2.12.0): вызовы идут через self.app._settings_flow.
 
     def _import_documents_dialog(self):
         """Выбор файлов для загрузки в реестр."""
-        if getattr(self, "_import_running", False):
+        if self._import_flow.running:
             return
         files = filedialog.askopenfilenames(
             parent=self.root,
@@ -1684,254 +1346,34 @@ class ContractApp:
         )
         if not files:
             return
-        self._start_documents_import(list(files))
+        self._import_flow.start(list(files))
 
-    # ------------------------------------------------------------------ #
-    #  Импорт документов: оркестрация в ImportController
-    # ------------------------------------------------------------------ #
-    #  Шаг декомпозиции «бог-класса» ContractApp (аудит 2.0.1, P2 — «по
-    #  одному контроллеру за итерацию»): логика пакетного импорта живёт в
-    #  import_controller.ImportController, здесь остаются фасады с прежними
-    #  именами — smoke-тест, drag-and-drop-хук и внутренние вызовы продолжают
-    #  работать как раньше. Состояние потока импорта публикуется свойствами:
-    #  smoke-тест читает и подменяет его через прежние имена атрибутов.
+    #  Импорт документов — ImportController (import_controller, v2.1.0).
+    #  Фасады и свойства состояния ContractApp удалены (v2.12.0):
+    #  состояние потока читается и подменяется через self._import_flow
+    #  (running / queue / win / cancelled).
 
-    @property
-    def _import_running(self) -> bool:
-        """Выполняется ли сейчас пакетный импорт (состояние контроллера)."""
-        return self._import_flow.running
+    #  Страница «Добавить контрагента» и окно редактирования карточки —
+    #  CounterpartyController (counterparty_controller, v2.6.0). Фасады
+    #  ContractApp удалены (v2.12.0): вызовы идут через
+    #  self.app._counterparty_flow; состояние страницы (_cp_entries,
+    #  _cp_error_vars, _cp_frames, _cp_type_var, _cp_status_var) —
+    #  на приложении, его читают DadataController, защита несохранённых
+    #  данных и smoke-тест.
 
-    @_import_running.setter
-    def _import_running(self, value) -> None:
-        self._import_flow.running = bool(value)
+    #  DaData: автозаполнение — DadataController (dadata_controller,
+    #  v2.2.0). Фасады ContractApp удалены (v2.12.0): вызовы идут через
+    #  self.app._dadata_flow; очередь результата опрашивается только из
+    #  главного потока Tk — root.after() из рабочего потока запрещён
+    #  (аудит 2.0.1).
 
-    @property
-    def _import_queue(self):
-        """Очередь результатов текущего импорта (или None между запусками)."""
-        return self._import_flow.queue
-
-    @_import_queue.setter
-    def _import_queue(self, value) -> None:
-        self._import_flow.queue = value
-
-    @property
-    def _import_win(self):
-        """Окно прогресса импорта (или None между запусками)."""
-        return self._import_flow.win
-
-    @_import_win.setter
-    def _import_win(self, value) -> None:
-        self._import_flow.win = value
-
-    @property
-    def _import_cancelled(self) -> bool:
-        """Запрошена ли отмена остатка пакета (п. 5.3)."""
-        return self._import_flow.cancelled
-
-    @_import_cancelled.setter
-    def _import_cancelled(self, value) -> None:
-        self._import_flow.cancelled = bool(value)
-
-    def _start_documents_import(self, files: list[str]) -> None:
-        """Проверяет лимиты пакета и запускает фоновый анализ файлов.
-
-        Guard повторного входа и проверки пакета — в ImportController.start;
-        drag-and-drop вызывает метод напрямую, поэтому защита стоит в начале
-        запуска (аудит 2.0.1, P1). Фабрика потока передаётся из main на
-        каждый вызов: smoke-тест подменяет main.threading.Thread синхронным
-        исполнителем, и подмена должна действовать в момент вызова.
-        """
-        self._import_flow.start(files, thread_factory=threading.Thread)
-
-    def _cancel_import(self) -> None:
-        """Отменяет импорт: остаток пакета не анализируется и не регистрируется (п. 5.3)."""
-        self._import_flow.cancel()
-
-    def _import_worker(self, files: list[str], result_queue: "queue.Queue") -> None:
-        """Фоновый поток: анализ каждого файла и копирование в папку контрагента."""
-        self._import_flow.worker(files, result_queue)
-
-    def _copy_imported_file(self, result: dict) -> str:
-        """Копирует в папку контрагента только разобранные .docx/.xlsx."""
-        return self._import_flow.copy_imported_file(result)
-
-    def _import_tick(self) -> None:
-        """Опрос очереди фонового потока из главного потока Tk."""
-        self._import_flow.tick()
-
-    def _finish_documents_import(self, results: list[dict]) -> None:
-        """Регистрирует результаты анализа в реестре и показывает отчёт."""
-        self._import_flow.finish(results)
-
-    @staticmethod
-    def _new_import_entry(result: dict) -> dict:
-        """Заготовка строки отчёта импорта для одного файла."""
-        return import_controller.ImportController.new_entry(result)
-
-    def _register_import_result(self, result: dict, entry: dict, stats: dict) -> bool:
-        """Регистрирует один результат разбора; True — если реестр менялся."""
-        return self._import_flow.register_result(result, entry, stats)
-
-    def _ask_import_party(self, result: dict) -> "tuple[dict | None, str]":
-        """Диалог: к какому контрагенту отнести документ без ИНН (п. 3.3)."""
-        return self._import_flow.ask_party(result)
-
-    def _import_document_is_duplicate(self, party_id, result: dict) -> bool:
-        """Такой документ уже есть у контрагента (тип + номер + дата)."""
-        return self._import_flow.document_is_duplicate(party_id, result)
-
-    def _move_import_to_unknown(self, path: str) -> str:
-        """Переносит отклонённый файл в папку «unknown» (п. 3.5)."""
-        return self._import_flow.move_to_unknown(path)
-
-    def _show_import_report(self, entries: list[dict], summary: str) -> None:
-        """Окно отчёта: по каждому файлу тип, результат и причина (п. 3.5)."""
-        self._import_flow.show_report(entries, summary)
-
-    # ------------------------------------------------------------------ #
-    #  Окно «Добавить контрагента»
-    # ------------------------------------------------------------------ #
-    # ------------------------------------------------------------------ #
-    #  Страница «Добавить контрагента» — оркестрация в CounterpartyController
-    # ------------------------------------------------------------------ #
-    #  Шаг декомпозиции «бог-класса» ContractApp (аудит 2.0.1, P2): сборка
-    #  страницы и полей, сбор данных, валидация с подсветкой ошибок, выбор
-    #  при дубликате ИНН и сохранение карточки живут в
-    #  counterparty_controller.CounterpartyController; здесь — фасады с
-    #  прежними именами. Состояние страницы (_cp_entries, _cp_error_vars,
-    #  _cp_frames, _cp_type_var, _cp_status_var) остаётся на приложении:
-    #  его читают DadataController, защита несохранённых данных и smoke-тест.
-
-    def _build_counterparty_page(self):
-        """Страница «Добавить контрагента» (контроллер карточки)."""
-        self._counterparty_flow.build_counterparty_page()
-
-    def _build_cp_fields(self, card, mode: str):
-        """Поля карточки одного режима (юридическое лицо / ИП)."""
-        self._counterparty_flow.build_cp_fields(card, mode)
-
-    def _cp_add_field(self, card, mode: str, key: str, label: str, kind="text",
-                      width=None, required=False, stretch=True, max_len=None,
-                      hint: str | None = None):
-        """Одно поле карточки с валидатором и санитизацией вставки."""
-        return self._counterparty_flow.add_field(
-            card, mode, key, label, kind=kind, width=width, required=required,
-            stretch=stretch, max_len=max_len, hint=hint,
-        )
-
-    def _cp_error_var_for(self, mode: str):
-        """Переменная ошибки поля карточки (создаётся лениво)."""
-        return self._counterparty_flow.error_var_for(mode)
-
-    def _on_cp_type_change(self, value: str):
-        """Переключение «Юр. лицо / ИП»: поднимаем соответствующий кадр."""
-        self._counterparty_flow.on_type_change(value)
-
-    def _cp_collect(self, mode: str) -> dict | None:
-        """Собирает данные карточки; None — сбой чтения (аудит 2.0.1)."""
-        return self._counterparty_flow.collect(mode)
-
-    def _cp_save(self):
-        """Сохраняет карточку контрагента в реестр (контроллер карточки)."""
-        self._counterparty_flow.save_card()
-
-    # ------------------------------------------------------------------ #
-    #  DaData: автозаполнение — оркестрация в DadataController
-    # ------------------------------------------------------------------ #
-    #  Шаг декомпозиции «бог-класса» ContractApp (аудит 2.0.1, P2): guard
-    #  повторных кликов, busy-анимация, воркер и опрос очереди живут в
-    #  dadata_controller.DadataController; здесь — фасады с прежними именами.
-    #  Результат приходит через очередь и опрашивается только из главного
-    #  потока Tk — root.after() из рабочего потока запрещён (аудит 2.0.1).
-
-    @property
-    def _cp_busy(self) -> bool:
-        """Выполняется ли сейчас запрос реквизитов по ИНН."""
-        return self._dadata_flow.busy
-
-    @_cp_busy.setter
-    def _cp_busy(self, value) -> None:
-        self._dadata_flow.busy = bool(value)
-
-    def _cp_fill_from_inn(self) -> None:
-        """Заполняет карточку контрагента из ЕГРЮЛ/ЕГРИП по ИНН.
-
-        Guard повторных кликов — в DadataController.fill_from_inn (аудит
-        2.0.1). Фабрика потока передаётся из main на каждый вызов:
-        smoke-тест подменяет main.threading.Thread синхронным исполнителем.
-        """
-        self._dadata_flow.fill_from_inn(thread_factory=threading.Thread)
-
-    def _cp_busy_tick(self) -> None:
-        """Кадр анимации «Загружаю реквизиты…»."""
-        self._dadata_flow.busy_tick()
-
-    def _cp_busy_stop(self) -> None:
-        """Останавливает анимацию и цикл опроса."""
-        self._dadata_flow.busy_stop()
-
-    def _cp_fetch_worker(self, inn: str, api_key: str, mode: str,
-                         result_queue: "queue.Queue") -> None:
-        """Рабочий поток DaData: только HTTP и очередь — никаких вызовов Tk."""
-        self._dadata_flow.fetch_worker(inn, api_key, mode, result_queue)
-
-    def _cp_result_tick(self) -> None:
-        """Опрашивает очередь результата DaData из главного потока Tk."""
-        self._dadata_flow.result_tick()
-
-    def _cp_party_failed(self, message: str) -> None:
-        """Запрос не удался: стоп-анимация, ошибка пользователю."""
-        self._dadata_flow.party_failed(message)
-
-    def _cp_party_loaded(self, mode: str, info: dict) -> None:
-        """Карточка получена: подстановка реквизитов в поля формы."""
-        self._dadata_flow.party_loaded(mode, info)
-
-    # ------------------------------------------------------------------ #
-    #  Несохранённые данные (п. 4.4) — DocumentContextController
-    # ------------------------------------------------------------------ #
-    #  Подписи форм, baseline, «грязные» страницы, подтверждение при уходе
-    #  и сохранение текущей страницы переехали в
-    #  document_context_controller.DocumentContextController (девятый шаг
-    #  декомпозиции ContractApp, аудит 2.0.1 P2); здесь — фасады с
-    #  прежними именами. Подпись карточки идёт через _cp_collect
-    #  (контроллер карточки), сохранение — через фасады контроллера
-    #  сохранения; базовые подписи (_form_baseline) остаются на приложении.
-    @staticmethod
-    def _form_label(key: str) -> str:
-        """Человекочитаемое имя страницы (контроллер контекста)."""
-        return document_context_controller.DocumentContextController.form_label(key)
-
-    def _form_signature(self, key: str) -> tuple | None:
-        """Снимок введённых данных страницы (контроллер контекста)."""
-        return self._doc_context_flow.form_signature(key)
-
-    def _reset_form_baseline(self, key: str) -> None:
-        """Фиксирует baseline страницы (контроллер контекста)."""
-        self._doc_context_flow.reset_form_baseline(key)
-
-    def _reset_all_form_baselines(self) -> None:
-        """Фиксирует baseline всех страниц (контроллер контекста)."""
-        self._doc_context_flow.reset_all_form_baselines()
-
-    def _is_form_dirty(self, key: str) -> bool:
-        """Страница отличается от baseline (контроллер контекста)."""
-        return self._doc_context_flow.is_form_dirty(key)
-
-    def _dirty_pages(self) -> list[str]:
-        """Список страниц с несохранёнными данными (контроллер)."""
-        return self._doc_context_flow.dirty_pages()
-
-    def _confirm_leave_page(self) -> bool:
-        """Подтверждение потери изменений при уходе (контроллер)."""
-        return self._doc_context_flow.confirm_leave_page()
-
-    def _save_current_page(self) -> None:
-        """Ctrl+S / сохранение текущей страницы (контроллер контекста)."""
-        self._doc_context_flow.save_current_page()
+    #  Подписи форм, baseline, «грязные» страницы, подтверждение при
+    #  уходе и сохранение текущей страницы — DocumentContextController
+    #  (document_context_controller, v2.9.0); базовые подписи
+    #  (_form_baseline) остаются на приложении.
 
     def _on_save_shortcut(self, _event=None):
-        self._save_current_page()
+        self._doc_context_flow.save_current_page()
         return "break"
 
     @staticmethod
@@ -1961,7 +1403,7 @@ class ContractApp:
                 return None
         except Exception:
             pass
-        self._save_current_page()
+        self._doc_context_flow.save_current_page()
         return "break"
 
     # ------------------------------------------------------------------ #
@@ -2027,7 +1469,7 @@ class ContractApp:
                         shell32.DragFinish(ctypes.c_void_p(wparam))
                         if files:
                             self.root.after(
-                                0, lambda f=list(files): self._start_documents_import(f)
+                                0, lambda f=list(files): self._import_flow.start(f)
                             )
                         return 0
                     except Exception:
@@ -2048,7 +1490,7 @@ class ContractApp:
     #  Навигация и статус
     # ------------------------------------------------------------------ #
     def _select_page(self, key: str):
-        if key != self.current_page and not self._confirm_leave_page():
+        if key != self.current_page and not self._doc_context_flow.confirm_leave_page():
             return
         self.current_page = key
         self._update_footer()
@@ -2058,7 +1500,7 @@ class ContractApp:
         for nav_key, item in self.nav_items.items():
             item.set_selected(nav_key == key)
         if key == "registry":
-            self.refresh_registry()
+            self._registry_flow.refresh()
         self.root.after(60, self._refresh_scrollbars)
 
     def _refresh_scrollbars(self):
@@ -2094,20 +1536,9 @@ class ContractApp:
             text_color=ui.resolve(ui.COLORS["text_secondary"]),
         )
 
-    # ------------------------------------------------------------------ #
-    #  Доп. соглашение: суммы прописью и формат лимита — контроллер страниц
-    # ------------------------------------------------------------------ #
-    def _update_words(self, *_args):
-        """«Срок прописью» под полем отсрочки (контроллер страниц документов)."""
-        self._doc_page_flow.update_words(*_args)
-
-    def _format_limit(self, *_args):
-        """Форматирует лимит разрядами и обновляет сумму прописью (контроллер)."""
-        self._doc_page_flow.format_limit(*_args)
-
-    def _update_limit_words(self):
-        """«Сумма прописью» под полем лимита (контроллер страниц документов)."""
-        self._doc_page_flow.update_limit_words()
+    #  «Сумма/срок прописью» и формат лимита — методы
+    #  DocumentPageController (update_words / format_limit /
+    #  update_limit_words).
 
     def run(self):
         self.root.mainloop()

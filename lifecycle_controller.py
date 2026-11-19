@@ -86,13 +86,13 @@ class LifecycleController:
                 defaultextension=".docx",
                 filetypes=[("Документы Word", "*.docx"), ("Все файлы", "*.*")],
                 initialfile=default_filename,
-                initialdir=self.app._party_documents_dir(party_rec),
+                initialdir=self.app._doc_save_flow.party_documents_dir(party_rec),
                 title="Сохранить документ Word",
             )
             if not file_path:
                 return
 
-            doc = self.app._build_record_docx(rec)
+            doc = self.app._doc_save_flow.build_record_docx(rec)
             services.save_docx_atomic(doc, file_path)
             self.app._open_file(file_path)
             if extra.get("imported"):
@@ -130,7 +130,7 @@ class LifecycleController:
             ],
         )
         if choice == "folder":
-            self.app._show_in_folder(source or self.app._documents_dir())
+            self.app._show_in_folder(source or self.app._settings_flow.documents_dir())
             return False
         return choice == "rebuild"
 
@@ -160,17 +160,17 @@ class LifecycleController:
                 self.app.store.last_error or "Запись не найдена.", "error",
             )
             return
-        self.app.refresh_registry()
+        self.app._registry_flow.refresh()
         self.app._update_status()
-        self.app._preview_contract()
-        self.app._preview_additional()
+        self.app._doc_page_flow.preview_contract()
+        self.app._doc_page_flow.preview_additional()
 
     def delete_counterparty(self, rec: dict):
         """Перемещает контрагента и его документы в корзину (п. 2.5, 2.6)."""
         party_id = rec.get("id")
         name = storage.display_name(rec)
         docs = self.app.store.documents_for(party_id)
-        folder = self.app._party_documents_dir(rec, interactive=False)
+        folder = self.app._doc_save_flow.party_documents_dir(rec, interactive=False)
         lines = []
         for doc in docs[:10]:
             kind_label = storage.KIND_LABELS.get(doc.get("kind"), "Документ")
@@ -213,10 +213,10 @@ class LifecycleController:
         if self.app._registry_selected_id == party_id:
             self.app._registry_selected_id = None
         # Списки контрагентов в выпадающих меню и предпросмотры устарели.
-        self.app._refresh_party_combo_values()
-        self.app._preview_contract()
-        self.app._preview_additional()
-        self.app.refresh_registry()
+        self.app._doc_context_flow.refresh_party_combo_values()
+        self.app._doc_page_flow.preview_contract()
+        self.app._doc_page_flow.preview_additional()
+        self.app._registry_flow.refresh()
         self.app._update_status()
 
     def restore_document(self, rec: dict):
@@ -227,10 +227,10 @@ class LifecycleController:
                 self.app.store.last_error or "Запись не найдена.", "error",
             )
             return
-        self.app._refresh_party_combo_values()
-        self.app._preview_contract()
-        self.app._preview_additional()
-        self.app.refresh_registry()
+        self.app._doc_context_flow.refresh_party_combo_values()
+        self.app._doc_page_flow.preview_contract()
+        self.app._doc_page_flow.preview_additional()
+        self.app._registry_flow.refresh()
         self.app._update_status()
 
     def restore_counterparty(self, rec: dict):
@@ -246,10 +246,10 @@ class LifecycleController:
             "Контрагент восстановлен из корзины: id=%s, документов=%d",
             rec.get("id"), restored,
         )
-        self.app._refresh_party_combo_values()
-        self.app._preview_contract()
-        self.app._preview_additional()
-        self.app.refresh_registry()
+        self.app._doc_context_flow.refresh_party_combo_values()
+        self.app._doc_page_flow.preview_contract()
+        self.app._doc_page_flow.preview_additional()
+        self.app._registry_flow.refresh()
         self.app._update_status()
 
     def purge_document(self, rec: dict):
@@ -272,7 +272,7 @@ class LifecycleController:
                 self.app.store.last_error or "Запись не найдена.", "error",
             )
             return
-        self.app.refresh_registry()
+        self.app._registry_flow.refresh()
         self.app._update_status()
 
     def purge_counterparty(self, rec: dict):
@@ -295,8 +295,8 @@ class LifecycleController:
                 self.app.store.last_error, "error",
             )
             return
-        self.app._refresh_party_combo_values()
-        self.app.refresh_registry()
+        self.app._doc_context_flow.refresh_party_combo_values()
+        self.app._registry_flow.refresh()
         self.app._update_status()
 
     def empty_trash(self):
@@ -319,6 +319,6 @@ class LifecycleController:
                 self.app.store.last_error, "error",
             )
             return
-        self.app._refresh_party_combo_values()
-        self.app.refresh_registry()
+        self.app._doc_context_flow.refresh_party_combo_values()
+        self.app._registry_flow.refresh()
         self.app._update_status()

@@ -18,8 +18,9 @@
   * сбой записи реестра не оставляет «фантом» в памяти (п. 9.2);
   * успешное сохранение сбрасывает baseline карточки, обновляет списки и
     сразу переходит к договору с уже выбранным контрагентом;
-  * фасады ContractApp с прежними именами делегируют контроллеру, а защита
-    несохранённых данных (п. 4.4) видит карточку через тот же конвейер.
+  * соседние контроллеры вызываются напрямую через ``app._flow.*``
+    (фасады ContractApp удалены, v2.12.0), а защита несохранённых данных
+    (п. 4.4) видит карточку через тот же конвейер подписи.
 """
 from __future__ import annotations
 
@@ -30,7 +31,6 @@ import pytest
 
 import counterparty_controller as cc
 import document_context_controller
-import main
 import storage
 from document_builder import F
 from render_helpers import IP_FIELDS, OOO_FIELDS
@@ -115,39 +115,36 @@ class FakeApp:
         self._cp_error_vars: dict[str, dict] = {"ooo": {}, "ip": {}}
         self._cp_type_var = FakeVar("Юр. лицо")
         self._cp_frames = {"ooo": FakeFrame("ooo"), "ip": FakeFrame("ip")}
-        # Контроллеры создаются здесь же, как в ContractApp.__init__:
-        # карточка (шаг 6) и подписи форм (шаг 9).
+        # Карточка живёт в контроллере (шаг 6 декомпозиции), как и в
+        # ContractApp.__init__.
         self._counterparty_flow = CounterpartyController(self)
-        self._doc_context_flow = document_context_controller.DocumentContextController(self)
+        # Соседние контроллеры вызываются напрямую (v2.12.0, фасады
+        # ContractApp удалены): записывающие фейки проверяют и порядок
+        # вызовов при сохранении карточки.
+        self._doc_context_flow = SimpleNamespace(
+            reset_form_baseline=lambda page: self.calls.append(("baseline", page)),
+            set_current_party=lambda rec, source=None: (
+                self.calls.append(("set_party", rec)),
+                setattr(self, "current_party", rec))[-1],
+            refresh_party_combo_values=lambda: self.calls.append("combo"),
+        )
+        self._registry_flow = SimpleNamespace(
+            refresh=lambda: self.calls.append("registry"))
+        self._doc_page_flow = SimpleNamespace(
+            preview_contract=lambda *a: None,
+            preview_additional=lambda *a: None,
+        )
 
     # -- хуки, оставшиеся на приложении ------------------------------------- #
-    def _cp_collect(self, mode):
-        # Фасад ContractApp._cp_collect: FakeApp — не наследник ContractApp,
-        # для _form_signature нужен тот же маршрут через контроллер.
-        return self._counterparty_flow.collect(mode)
-
     def _choice_dialog(self, title, message, options):
         self.choice_calls.append((title, message, options))
         return self.choice_result
 
-    def _reset_form_baseline(self, page):
-        self.calls.append(("baseline", page))
-
-    def _set_current_party(self, rec, source=None):
-        self.current_party = rec
-        self.calls.append(("set_party", rec))
-
     def _select_page(self, key):
         self.calls.append(("page", key))
 
-    def _refresh_party_combo_values(self):
-        self.calls.append("combo")
-
     def _update_status(self):
         self.calls.append("status")
-
-    def refresh_registry(self):
-        self.calls.append("registry")
 
     def _notify(self, message, path=None):
         self.notifications.append(message)
@@ -360,11 +357,12 @@ def test_save_card_ip_mode_writes_fact_address(app, flow):
 
 
 # --------------------------------------------------------------------------- #
-#  Фасады ContractApp и защита несохранённых данных (п. 4.4)
+#  Подпись карточки — DocumentContextController (п. 4.4)
 # --------------------------------------------------------------------------- #
 def test_form_signature_reads_card_through_controller(app, flow):
     seed_entries(app, "ooo", ooo_card())
-    signature = main.ContractApp._form_signature(app, "counterparty")
+    signature = document_context_controller.DocumentContextController(
+        app).form_signature("counterparty")
     expected = tuple(sorted(flow.collect("ooo").items()))
     assert signature == expected
 
@@ -372,61 +370,5 @@ def test_form_signature_reads_card_through_controller(app, flow):
 def test_form_signature_degrades_to_none_on_widget_failure(app, flow):
     seed_entries(app, "ooo", ooo_card())
     app._cp_entries["ooo"][F.INN] = BrokenEntry()
-    assert main.ContractApp._form_signature(app, "counterparty") is None
-
-
-class RecordingFlow:
-    """Контроллер-двойник: записывает вызовы фасадов."""
-
-    def __init__(self):
-        self.calls = []
-
-    def build_counterparty_page(self, *args, **kwargs):
-        self.calls.append(("build_counterparty_page", args, kwargs))
-
-    def build_cp_fields(self, *args, **kwargs):
-        self.calls.append(("build_cp_fields", args, kwargs))
-
-    def add_field(self, *args, **kwargs):
-        self.calls.append(("add_field", args, kwargs))
-
-    def error_var_for(self, *args, **kwargs):
-        self.calls.append(("error_var_for", args, kwargs))
-
-    def on_type_change(self, *args, **kwargs):
-        self.calls.append(("on_type_change", args, kwargs))
-
-    def collect(self, *args, **kwargs):
-        self.calls.append(("collect", args, kwargs))
-
-    def save_card(self, *args, **kwargs):
-        self.calls.append(("save_card", args, kwargs))
-
-    def edit_counterparty(self, *args, **kwargs):
-        self.calls.append(("edit_counterparty", args, kwargs))
-
-
-def test_facade_delegates():
-    flow = RecordingFlow()
-    app = SimpleNamespace(_counterparty_flow=flow)
-
-    main.ContractApp._build_counterparty_page(app)
-    main.ContractApp._build_cp_fields(app, "card", "ooo")
-    main.ContractApp._cp_add_field(app, "card", "ooo", F.INN, "ИНН *",
-                                   kind="digits", max_len=12)
-    main.ContractApp._cp_error_var_for(app, "ooo")
-    main.ContractApp._on_cp_type_change(app, "ИП")
-    main.ContractApp._cp_collect(app, "ooo")
-    main.ContractApp._cp_save(app)
-    main.ContractApp._edit_counterparty(app, {"id": "cp-1"})
-
-    names = [call[0] for call in flow.calls]
-    assert names == [
-        "build_counterparty_page", "build_cp_fields", "add_field",
-        "error_var_for", "on_type_change", "collect", "save_card",
-        "edit_counterparty",
-    ]
-    assert flow.calls[2][2] == {
-        "kind": "digits", "width": None, "required": False,
-        "stretch": True, "max_len": 12, "hint": None,
-    }, "ключевые аргументы переданы как есть"
+    assert document_context_controller.DocumentContextController(
+        app).form_signature("counterparty") is None

@@ -30,13 +30,14 @@
 
 * ``ui.confirm`` — атрибут общего модуля ui_macos: подмена ``m.ui.confirm``
   видна контроллеру напрямую;
-* сохранение текущей страницы идёт через фасады приложения
-  (``app.save_contract`` / ``app.save_additional`` / ``app.save_spec`` /
-  ``app._cp_save``), разрешаемые на каждый вызов, — маршруты подмен
-  контроллеров сохранения и карточки не обходятся;
-* подпись карточки контрагента снимается через фасад ``app._cp_collect``
-  (контроллер карточки, шаг 6), строки спецификации — через property
-  ``app._spec_rows`` (контроллер сохранения, шаг 5).
+* сохранение текущей страницы идёт через контроллеры напрямую
+  (``app._doc_save_flow.save_contract`` / ``save_additional`` /
+  ``save_spec`` / ``app._counterparty_flow.save_card``), разрешаемые
+  на каждый вызов, — маршруты подмен сохранения и карточки не обходятся;
+* подпись карточки контрагента снимается через
+  ``app._counterparty_flow.collect`` (контроллер карточки, шаг 6),
+  строки спецификации — через ``app._doc_save_flow.spec_rows``
+  (контроллер сохранения, шаг 5).
 
 Поведение один в один повторяет код, вынесенный из main.py версии 2.9.0.
 """
@@ -275,7 +276,7 @@ class DocumentContextController:
             if key == "spec":
                 items = tuple(
                     (row["name"].get(), row["qty"].get(), row["unit"].get(), row["price"].get())
-                    for row in app._spec_rows
+                    for row in app._doc_save_flow.spec_rows
                 )
                 return (
                     app.spec_number_var.get(),
@@ -289,7 +290,7 @@ class DocumentContextController:
                 )
             if key == "counterparty":
                 mode = "ip" if app._cp_type_var.get() == "ИП" else "ooo"
-                data = app._cp_collect(mode)
+                data = app._counterparty_flow.collect(mode)
                 if data is None:
                     return None
                 return tuple(sorted(data.items()))
@@ -337,10 +338,10 @@ class DocumentContextController:
     def save_current_page(self) -> None:
         app = self.app
         commands = {
-            "contract": app.save_contract,
-            "additional": app.save_additional,
-            "spec": app.save_spec,
-            "counterparty": app._cp_save,
+            "contract": app._doc_save_flow.save_contract,
+            "additional": app._doc_save_flow.save_additional,
+            "spec": app._doc_save_flow.save_spec,
+            "counterparty": app._counterparty_flow.save_card,
         }
         command = commands.get(app.current_page)
         if command is not None:

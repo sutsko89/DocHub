@@ -25,7 +25,6 @@ from types import SimpleNamespace
 import pytest
 
 import document_context_controller as dcc
-import main
 import storage
 from document_builder import F
 from render_helpers import OOO_FIELDS
@@ -105,28 +104,27 @@ class FakeApp:
         self.pages = {"contract": object(), "additional": object(),
                       "spec": object(), "counterparty": object()}
 
-    # -- фасады приложения, разрешаемые контроллером на каждый вызов ------- #
-    def _cp_collect(self, mode):
-        self.calls.append(("cp_collect", mode))
-        return {"name": "ООО «Ромашка»", "type": "ooo"}
-
-    def save_contract(self):
-        self.calls.append("save_contract")
-
-    def save_additional(self):
-        self.calls.append("save_additional")
-
-    def save_spec(self):
-        self.calls.append("save_spec")
-
-    def _cp_save(self):
-        self.calls.append("cp_save")
+    # -- соседние контроллеры: записывающие фейки (v2.12.0, фасады удалены) - #
+    def _make_flow_fakes(self):
+        self._counterparty_flow = SimpleNamespace(
+            collect=lambda mode: (
+                self.calls.append(("cp_collect", mode)),
+                {"name": "ООО «Ромашка»", "type": "ooo"})[-1],
+            save_card=lambda *a, **kw: self.calls.append("cp_save"),
+        )
+        self._doc_save_flow = SimpleNamespace(
+            spec_rows=[],
+            save_contract=lambda *a, **kw: self.calls.append("save_contract"),
+            save_additional=lambda *a, **kw: self.calls.append("save_additional"),
+            save_spec=lambda *a, **kw: self.calls.append("save_spec"),
+        )
 
 
 @pytest.fixture()
 def app(store):
     a = FakeApp(store)
     a._doc_context_flow = DocumentContextController(a)
+    a._make_flow_fakes()
     return a
 
 
@@ -354,8 +352,6 @@ def test_form_label_static_mapping():
     assert DocumentContextController.form_label("contract") == "Договор поставки"
     assert DocumentContextController.form_label("counterparty") == "Карточка контрагента"
     assert DocumentContextController.form_label("unknown") == "unknown"
-    # Фасад на ContractApp — тоже staticmethod (вызов без экземпляра).
-    assert main.ContractApp._form_label("spec") == "Спецификация"
 
 
 def test_form_signature_contract(app, flow):
@@ -374,8 +370,8 @@ def test_form_signature_additional(app, flow):
 
 def test_form_signature_spec_includes_items(app, flow):
     app.spec_number_var.set("3")
-    app._spec_rows = [{"name": FakeVar("Болт"), "qty": FakeVar("5"),
-                       "unit": FakeVar("шт."), "price": FakeVar("200")}]
+    app._doc_save_flow.spec_rows = [{"name": FakeVar("Болт"), "qty": FakeVar("5"),
+                                     "unit": FakeVar("шт."), "price": FakeVar("200")}]
     signature = flow.form_signature("spec")
     assert signature[0] == "3"
     assert signature[-1] == (("Болт", "5", "шт.", "200"),)
@@ -466,127 +462,3 @@ def test_save_current_page_unknown_page_noop(app, flow):
     app.current_page = "registry"
     flow.save_current_page()
     assert app.calls == []
-
-
-# --------------------------------------------------------------------------- #
-#  Фасады ContractApp делегируют контроллеру
-# --------------------------------------------------------------------------- #
-class RecordingFlow:
-    def __init__(self):
-        self.calls: list = []
-
-    def _record(self, name, *args, **kwargs):
-        self.calls.append((name, args, kwargs))
-        return "recorded"
-
-    def party_duplicate_bases(self):
-        return self._record("party_duplicate_bases")
-
-    def party_display(self, *args, **kwargs):
-        return self._record("party_display", *args, **kwargs)
-
-    def party_display_values(self):
-        return self._record("party_display_values")
-
-    def refresh_party_combo_values(self):
-        return self._record("refresh_party_combo_values")
-
-    def party_from_var(self, *args):
-        return self._record("party_from_var", *args)
-
-    def current_party_label(self):
-        return self._record("current_party_label")
-
-    def update_current_party_labels(self):
-        return self._record("update_current_party_labels")
-
-    def set_current_party(self, *args, **kwargs):
-        return self._record("set_current_party", *args, **kwargs)
-
-    def on_party_selected(self, *args):
-        return self._record("on_party_selected", *args)
-
-    def update_contract_info(self, *args):
-        return self._record("update_contract_info", *args)
-
-    def contract_display(self, *args):
-        return self._record("contract_display", *args)
-
-    def contract_from_var(self, *args):
-        return self._record("contract_from_var", *args)
-
-    def form_signature(self, *args):
-        return self._record("form_signature", *args)
-
-    def reset_form_baseline(self, *args):
-        return self._record("reset_form_baseline", *args)
-
-    def reset_all_form_baselines(self):
-        return self._record("reset_all_form_baselines")
-
-    def is_form_dirty(self, *args):
-        return self._record("is_form_dirty", *args)
-
-    def dirty_pages(self):
-        return self._record("dirty_pages")
-
-    def confirm_leave_page(self):
-        return self._record("confirm_leave_page")
-
-    def save_current_page(self):
-        return self._record("save_current_page")
-
-
-def make_facade_app():
-    flow = RecordingFlow()
-    return SimpleNamespace(_doc_context_flow=flow), flow
-
-
-def test_facade_party_context_delegates():
-    app, flow = make_facade_app()
-
-    main.ContractApp._party_duplicate_bases(app)
-    main.ContractApp._party_display(app, {"id": 1}, set())
-    main.ContractApp._party_display_values(app)
-    main.ContractApp._refresh_party_combo_values(app)
-    main.ContractApp._party_from_var(app, "var")
-    main.ContractApp._current_party_label(app)
-    main.ContractApp._update_current_party_labels(app)
-    main.ContractApp._set_current_party(app, {"id": 2}, source="spec")
-    main.ContractApp._on_party_selected(app, "contract")
-    main.ContractApp._update_contract_info(app, "additional")
-    main.ContractApp._contract_display(app, {"number": "5"})
-    main.ContractApp._contract_from_var(app, "var", 7)
-
-    assert [call[0] for call in flow.calls] == [
-        "party_duplicate_bases", "party_display", "party_display_values",
-        "refresh_party_combo_values", "party_from_var", "current_party_label",
-        "update_current_party_labels", "set_current_party",
-        "on_party_selected", "update_contract_info", "contract_display",
-        "contract_from_var",
-    ]
-    assert flow.calls[7][2] == {"source": "spec"}
-    assert flow.calls[8][1] == ("contract",)
-
-
-def test_facade_form_state_delegates():
-    app, flow = make_facade_app()
-
-    main.ContractApp._form_signature(app, "contract")
-    main.ContractApp._reset_form_baseline(app, "contract")
-    main.ContractApp._reset_all_form_baselines(app)
-    main.ContractApp._is_form_dirty(app, "contract")
-    main.ContractApp._dirty_pages(app)
-    main.ContractApp._confirm_leave_page(app)
-    main.ContractApp._save_current_page(app)
-
-    assert [call[0] for call in flow.calls] == [
-        "form_signature", "reset_form_baseline", "reset_all_form_baselines",
-        "is_form_dirty", "dirty_pages", "confirm_leave_page", "save_current_page",
-    ]
-    assert flow.calls[0][1] == ("contract",)
-
-
-def test_facade_form_label_is_static():
-    """Фасад _form_label — staticmethod, как исходный метод ContractApp."""
-    assert main.ContractApp._form_label("contract") == "Договор поставки"

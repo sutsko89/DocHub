@@ -17,9 +17,9 @@
 
 Вызовы, которые подменяет smoke-тест, всегда идут через ``self.app.*``:
 ``_choice_dialog`` подменяется как instance-атрибут, кнопки действий
-вызывают фасады приложения с прежними именами (``_edit_counterparty``,
-``_delete_document``, ``export_document``, ``_restore_*`` …), а показ папки
-для неопознанных файлов — через фасад ``ContractApp._show_in_folder``,
+вызывают контроллеры напрямую (``app._counterparty_flow.edit_counterparty``,
+``app._lifecycle_flow.delete_document``, ``export_document``, …), а показ
+папки для неопознанных файлов — через ``app._show_in_folder``,
 тело которого резолвит модульный ``main.show_in_folder`` на каждый вызов.
 ``ui.confirm`` / ``ui.alert`` — атрибуты общего модуля ui_macos, подмена
 ``m.ui.confirm`` видна контроллеру напрямую.
@@ -74,7 +74,7 @@ class RegistryController:
             text_color=ui.COLORS["text"], anchor="w", height=26,
         ).pack(side="left")
         ui.ghost_button(
-            title_row, "Обновить", app.refresh_registry,
+            title_row, "Обновить", app._registry_flow.refresh,
             width=int(110 * app.scale), height=int(28 * app.scale),
         ).pack(side="right")
         ui.ghost_button(
@@ -97,7 +97,7 @@ class RegistryController:
         )
         search_entry.pack(side="left")
         ui.ghost_button(
-            search_bar, "Найти", app._registry_apply_filter,
+            search_bar, "Найти", app._registry_flow.apply_filter,
             width=int(92 * app.scale), height=int(28 * app.scale),
         ).pack(side="left", padx=(int(10 * app.scale), 0))
         ui.ghost_button(
@@ -157,7 +157,7 @@ class RegistryController:
                 self.app.root.after_cancel(pending)
             except Exception:
                 pass
-        self.app._registry_search_after = self.app.root.after(200, self.app.refresh_registry)
+        self.app._registry_search_after = self.app.root.after(200, self.refresh)
 
     def apply_filter(self):
         pending = getattr(self.app, "_registry_search_after", None)
@@ -167,7 +167,7 @@ class RegistryController:
             except Exception:
                 pass
             self.app._registry_search_after = None
-        self.app.refresh_registry()
+        self.refresh()
 
     def reset_filter(self):
         self.app.registry_search_var.set("")
@@ -184,10 +184,10 @@ class RegistryController:
         else:
             self.app._registry_selected_id = rec.get("id")
             # Выбор из реестра переносится на страницы документов (п. 4.2).
-            self.app._set_current_party(rec)
+            self.app._doc_context_flow.set_current_party(rec)
         if not self.app._registry_rows:
             # Страница ещё не отрисована (ленивый рендер) — рисуем целиком.
-            self.app.refresh_registry()
+            self.refresh()
             return
         self.refresh_selection()
 
@@ -321,11 +321,11 @@ class RegistryController:
             )
             btn.grid(row=0, column=0, sticky="ew")
             ui.ghost_button(
-                row, "Редактировать", lambda r=rec: app._edit_counterparty(r),
+                row, "Редактировать", lambda r=rec: app._counterparty_flow.edit_counterparty(r),
                 width=int(110 * app.scale), height=int(26 * app.scale),
             ).grid(row=0, column=1, padx=(int(6 * app.scale), 0))
             ui.ghost_button(
-                row, "Удалить", lambda r=rec: app._delete_counterparty(r),
+                row, "Удалить", lambda r=rec: app._lifecycle_flow.delete_counterparty(r),
                 width=int(92 * app.scale), height=int(26 * app.scale),
             ).grid(row=0, column=2, padx=(int(6 * app.scale), 0))
             app._registry_rows[rec.get("id")] = {"rec": rec, "frame": row, "btn": btn}
@@ -385,11 +385,11 @@ class RegistryController:
                 row, text=text, font=ui.font(12), text_color=ui.COLORS["text"], anchor="w",
             ).grid(row=0, column=0, sticky="ew")
             ui.ghost_button(
-                row, "Открыть Word", lambda d=rec: app.export_document(d),
+                row, "Открыть Word", lambda d=rec: app._lifecycle_flow.export_document(d),
                 width=int(120 * app.scale), height=int(26 * app.scale),
             ).grid(row=0, column=1, padx=(int(8 * app.scale), 0))
             ui.ghost_button(
-                row, "Удалить", lambda d=rec: app._delete_document(d),
+                row, "Удалить", lambda d=rec: app._lifecycle_flow.delete_document(d),
                 width=int(92 * app.scale), height=int(26 * app.scale),
             ).grid(row=0, column=2, padx=(int(6 * app.scale), 0))
         return row_index + 1
@@ -438,7 +438,7 @@ class RegistryController:
                 width=int(140 * app.scale), height=int(26 * app.scale),
             ).grid(row=0, column=1, padx=(int(8 * app.scale), 0))
             ui.ghost_button(
-                row, "Удалить", lambda d=rec: app._delete_document(d),
+                row, "Удалить", lambda d=rec: app._lifecycle_flow.delete_document(d),
                 width=int(92 * app.scale), height=int(26 * app.scale),
             ).grid(row=0, column=2, padx=(int(6 * app.scale), 0))
         return row_index + 1
@@ -464,7 +464,7 @@ class RegistryController:
             font=ui.font(14, "bold"), text_color=ui.COLORS["text"], anchor="w",
         ).grid(row=0, column=0, sticky="ew")
         ui.ghost_button(
-            holder, "Очистить корзину", app._empty_trash,
+            holder, "Очистить корзину", app._lifecycle_flow.empty_trash,
             width=int(150 * app.scale), height=int(26 * app.scale),
         ).grid(row=0, column=1, padx=(int(8 * app.scale), 0))
         ctk.CTkLabel(
@@ -488,11 +488,11 @@ class RegistryController:
                 font=ui.font(12), text_color=ui.COLORS["text_secondary"], anchor="w",
             ).grid(row=0, column=0, sticky="ew")
             ui.ghost_button(
-                row, "Восстановить", lambda r=party: app._restore_counterparty(r),
+                row, "Восстановить", lambda r=party: app._lifecycle_flow.restore_counterparty(r),
                 width=int(120 * app.scale), height=int(26 * app.scale),
             ).grid(row=0, column=1, padx=(int(8 * app.scale), 0))
             ui.ghost_button(
-                row, "Удалить навсегда", lambda r=party: app._purge_counterparty(r),
+                row, "Удалить навсегда", lambda r=party: app._lifecycle_flow.purge_counterparty(r),
                 width=int(140 * app.scale), height=int(26 * app.scale),
             ).grid(row=0, column=2, padx=(int(6 * app.scale), 0))
             offset += 1
@@ -514,11 +514,11 @@ class RegistryController:
                 text_color=ui.COLORS["text_secondary"], anchor="w",
             ).grid(row=0, column=0, sticky="ew")
             ui.ghost_button(
-                row, "Восстановить", lambda d=rec: app._restore_document(d),
+                row, "Восстановить", lambda d=rec: app._lifecycle_flow.restore_document(d),
                 width=int(120 * app.scale), height=int(26 * app.scale),
             ).grid(row=0, column=1, padx=(int(8 * app.scale), 0))
             ui.ghost_button(
-                row, "Удалить навсегда", lambda d=rec: app._purge_document(d),
+                row, "Удалить навсегда", lambda d=rec: app._lifecycle_flow.purge_document(d),
                 width=int(140 * app.scale), height=int(26 * app.scale),
             ).grid(row=0, column=2, padx=(int(6 * app.scale), 0))
             offset += 1
@@ -531,7 +531,7 @@ class RegistryController:
         """Фоновая сверка: ищет файлы документов вне реестра (п. 2.4)."""
         app = self.app
         try:
-            base = app._documents_dir(interactive=False)
+            base = app._settings_flow.documents_dir(interactive=False)
             orphans = reconcile.find_orphans(base, app.store)
         except Exception as exc:  # noqa: BLE001 — фоновая задача не должна падать
             app._log.warning("Сверка реестра с папкой не удалась: %s", type(exc).__name__)
@@ -540,12 +540,12 @@ class RegistryController:
         if orphans:
             app._log.info("Файлов вне реестра: %d", len(orphans))
         if "registry" in app.pages:
-            app.refresh_registry()
+            self.refresh()
 
     def open_reconcile_dialog(self) -> None:
         """Диалог разбора файлов вне реестра: восстановить или убрать в _trash."""
         app = self.app
-        base = app._documents_dir()
+        base = app._settings_flow.documents_dir()
         orphans = reconcile.find_orphans(base, app.store)
         app._orphans = orphans
         if not orphans:
@@ -553,7 +553,7 @@ class RegistryController:
                 app.root, "Файлы вне реестра",
                 "Все файлы документов учтены в реестре.", "info",
             )
-            app.refresh_registry()
+            self.refresh()
             return
 
         preview = "\n".join(f"• {os.path.basename(path)}" for path in orphans[:8])
@@ -588,8 +588,8 @@ class RegistryController:
                     "success",
                 )
             app._orphans = reconcile.find_orphans(base, app.store)
-            app._refresh_party_combo_values()
-            app.refresh_registry()
+            app._doc_context_flow.refresh_party_combo_values()
+            self.refresh()
             app._update_status()
         elif choice == "trash":
             moved = reconcile.move_orphans_to_trash(base, orphans)
@@ -600,4 +600,4 @@ class RegistryController:
                 "info",
             )
             app._orphans = reconcile.find_orphans(base, app.store)
-            app.refresh_registry()
+            self.refresh()

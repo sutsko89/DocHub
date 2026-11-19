@@ -107,18 +107,6 @@ def app(tmp_path):
     a = FakeApp(tmp_path)
     flow = SettingsController(a)
     a._settings_flow = flow
-    # Фасады ContractApp (с подчёркиванием, как в настоящем приложении):
-    # контроллер зовёт их повторно — тот же маршрут «фасад → контроллер».
-    a._documents_dir = lambda interactive=True: flow.documents_dir(interactive=interactive)
-    a._default_documents_dir = lambda interactive=True: flow.default_documents_dir(
-        interactive=interactive)
-    a._resolve_unavailable_documents_dir = flow.resolve_unavailable_documents_dir
-    a._documents_dir_for_import = flow.documents_dir_for_import
-    a._dadata_key_status_text = flow.dadata_key_status_text
-    a._save_dadata_key = flow.save_dadata_key
-    a._clear_dadata_key = flow.clear_dadata_key
-    a._choose_documents_dir = flow.choose_documents_dir
-    a._build_settings_page = flow.build_settings_page
     return a
 
 
@@ -273,11 +261,11 @@ def test_choose_documents_dir_persist_failure_no_success_alert(app, flow, alerts
 
 
 def test_open_folder_button_routes_through_app_facade(app):
-    """Кнопка «Открыть папку» идёт через фасады _open_file и _documents_dir."""
+    """Кнопка «Открыть папку» идёт через _open_file и папку контроллера."""
     import inspect
 
     src = inspect.getsource(scc.SettingsController.build_settings_page)
-    assert "app._open_file(app._documents_dir())" in src
+    assert "app._open_file(app._settings_flow.documents_dir())" in src
 
 
 # --------------------------------------------------------------------------- #
@@ -350,7 +338,7 @@ def test_resolve_dialog_retry_calls_documents_dir(app, flow, tmp_path):
     app._settings["documents_dir"] = broken_dir_path(tmp_path)
     app.choice_result = "retry"
     retried = []
-    app._documents_dir = lambda interactive=True: retried.append(interactive) or "RETRY"
+    flow.documents_dir = lambda interactive=True: retried.append(interactive) or "RETRY"
 
     result = flow.resolve_unavailable_documents_dir(app._settings["documents_dir"],
                                                    OSError("нет доступа"))
@@ -466,92 +454,9 @@ def test_is_inside_directory_empty_path():
 
 
 # --------------------------------------------------------------------------- #
-#  Фасады ContractApp делегируют контроллеру
+#  is_inside_directory: staticmethod контроллера (маршрут smoke-теста)
 # --------------------------------------------------------------------------- #
-class RecordingFlow:
-    def __init__(self):
-        self.calls: list = []
-
-    def _record(self, name, *args, **kwargs):
-        self.calls.append((name, args, kwargs))
-        return "recorded"
-
-    def build_settings_page(self):
-        return self._record("build_settings_page")
-
-    def dadata_key_status_text(self):
-        return self._record("dadata_key_status_text")
-
-    def save_dadata_key(self):
-        return self._record("save_dadata_key")
-
-    def clear_dadata_key(self):
-        return self._record("clear_dadata_key")
-
-    def choose_documents_dir(self):
-        return self._record("choose_documents_dir")
-
-    def default_documents_dir(self, *args, **kwargs):
-        return self._record("default_documents_dir", *args, **kwargs)
-
-    def resolve_unavailable_documents_dir(self, *args, **kwargs):
-        return self._record("resolve_unavailable_documents_dir", *args, **kwargs)
-
-    def documents_dir(self, *args, **kwargs):
-        return self._record("documents_dir", *args, **kwargs)
-
-    def documents_dir_for_import(self):
-        return self._record("documents_dir_for_import")
-
-
-def make_facade_app():
-    flow = RecordingFlow()
-    return SimpleNamespace(_settings_flow=flow), flow
-
-
-def test_facade_settings_page_delegates():
-    app, flow = make_facade_app()
-
-    main.ContractApp._build_settings_page(app)
-    main.ContractApp._dadata_key_status_text(app)
-    main.ContractApp._save_dadata_key(app)
-    main.ContractApp._clear_dadata_key(app)
-    main.ContractApp._choose_documents_dir(app)
-
-    assert [call[0] for call in flow.calls] == [
-        "build_settings_page", "dadata_key_status_text", "save_dadata_key",
-        "clear_dadata_key", "choose_documents_dir",
-    ]
-
-
-def test_facade_documents_dir_delegates():
-    app, flow = make_facade_app()
-
-    main.ContractApp._default_documents_dir(app, interactive=False)
-    main.ContractApp._resolve_unavailable_documents_dir(app, "custom", OSError("x"))
-    main.ContractApp._documents_dir(app)
-    main.ContractApp._documents_dir_for_import(app)
-
-    assert [call[0] for call in flow.calls] == [
-        "default_documents_dir", "resolve_unavailable_documents_dir",
-        "documents_dir", "documents_dir_for_import",
-    ]
-    assert flow.calls[0][2] == {"interactive": False}
-
-
-def test_facade_is_inside_directory_static():
-    """Фасад — staticmethod: smoke-тест зовёт его без экземпляра."""
-    assert main.ContractApp._is_inside_directory("base", os.path.join("base", "f.docx"))
-    assert not main.ContractApp._is_inside_directory("base", os.path.join("out", "f.docx"))
-    # Привязка как instance-атрибут (так делает тест ImportController) работает.
-    holder = SimpleNamespace()
-    holder._is_inside_directory = main.ContractApp._is_inside_directory
-    assert holder._is_inside_directory("base", os.path.join("base", "f.docx"))
-
-
-def test_facade_delegates_to_controller():
-    """Фасад _is_inside_directory идёт в контроллер, а не дублирует код."""
-    import inspect
-
-    src = inspect.getsource(main.ContractApp._is_inside_directory)
-    assert "settings_controller.SettingsController.is_inside_directory" in src
+def test_is_inside_directory_static_route():
+    """Smoke зовёт SettingsController.is_inside_directory без экземпляра."""
+    assert SettingsController.is_inside_directory("base", os.path.join("base", "f.docx"))
+    assert not SettingsController.is_inside_directory("base", os.path.join("out", "f.docx"))

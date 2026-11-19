@@ -16,7 +16,7 @@ smoke-тест, всегда идут через ``self.app.*``:
   (instance-атрибут приложения, его подменяют smoke-тест и тесты);
 * сохранение и поиск дубликатов — через ``self.app.store`` (настоящий
   DataStore);
-* кнопка «Заполнить по ИНН» привязана к фасаду ``ContractApp._cp_fill_from_inn``:
+* кнопка «Заполнить по ИНН» привязана к ``app._dadata_flow.fill_from_inn``:
   он передаёт фабрику потока из main на каждый вызов, а smoke-тест подменяет
   именно ``main.threading.Thread`` (шаг 2 декомпозиции).
 
@@ -139,7 +139,7 @@ class CounterpartyController:
         inn.pack(side="left")
         app._cp_entries[mode][F.INN] = inn
         ui.ghost_button(
-            inn_holder, "Заполнить по ИНН", app._cp_fill_from_inn,
+            inn_holder, "Заполнить по ИНН", app._dadata_flow.fill_from_inn,
             width=int(152 * app.scale), height=int(28 * app.scale),
         ).pack(side="left", padx=(int(12 * app.scale), 0))
         card.row(
@@ -333,8 +333,8 @@ class CounterpartyController:
                 if choice == "open":
                     # Пользователь явно выбрал существующего — введённые
                     # значения карточки больше не нужны.
-                    app._reset_form_baseline("counterparty")
-                    app._set_current_party(duplicate)
+                    app._doc_context_flow.reset_form_baseline("counterparty")
+                    app._doc_context_flow.set_current_party(duplicate)
                     app._select_page("contract")
                 return
 
@@ -350,11 +350,11 @@ class CounterpartyController:
                 app.store.last_error, "error",
             )
             return
-        app._reset_form_baseline("counterparty")
-        app._refresh_party_combo_values()
+        app._doc_context_flow.reset_form_baseline("counterparty")
+        app._doc_context_flow.refresh_party_combo_values()
         app._update_status()
-        app.refresh_registry()
-        app._set_current_party(rec)
+        app._registry_flow.refresh()
+        app._doc_context_flow.set_current_party(rec)
         app._notify(f"{storage.display_name(rec)} добавлен в реестр программы.")
         # Сразу переходим к договору с уже выбранным контрагентом.
         app._select_page("contract")
@@ -571,13 +571,13 @@ class CounterpartyController:
             name = storage.display_name(updated or rec)
             # Переименование не должно «терять» выбранного контрагента (п. 4.2).
             if app._current_party_id == rec.get("id"):
-                app._set_current_party(updated or rec)
+                app._doc_context_flow.set_current_party(updated or rec)
             else:
-                app._update_current_party_labels()
-            app._refresh_party_combo_values()
-            app.refresh_registry()
-            app._preview_contract()
-            app._preview_additional()
+                app._doc_context_flow.update_current_party_labels()
+            app._doc_context_flow.refresh_party_combo_values()
+            app._registry_flow.refresh()
+            app._doc_page_flow.preview_contract()
+            app._doc_page_flow.preview_additional()
             app._update_status()
             win.destroy()
             app._notify(

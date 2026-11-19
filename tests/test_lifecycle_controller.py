@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 import os
 
 import pytest
@@ -59,23 +60,28 @@ class FakeApp:
         os.makedirs(self.docs_dir, exist_ok=True)
         self.asksave_calls: list = []
 
-    # -- обновления UI ----------------------------------------------------- #
-    def refresh_registry(self):
-        self.calls.append("registry")
+    # Соседние контроллеры вызываются напрямую (v2.12.0, фасады удалены):
+    # записывающие фейки.
+        self._doc_page_flow = SimpleNamespace(
+            preview_contract=lambda *a: self.calls.append("preview_contract"),
+            preview_additional=lambda *a: self.calls.append("preview_additional"),
+        )
+        self._doc_context_flow = SimpleNamespace(
+            refresh_party_combo_values=lambda: self.calls.append("combo"),
+        )
+        self._doc_save_flow = SimpleNamespace(
+            build_record_docx=lambda rec: Document(),
+            party_documents_dir=lambda party_rec, interactive=True: self.docs_dir,
+        )
+        self._settings_flow = SimpleNamespace(
+            documents_dir=lambda interactive=True: self.docs_dir)
+        self._registry_flow = SimpleNamespace(
+            refresh=lambda: self.calls.append("registry"))
 
+    # -- оболочка приложения (остаётся на ContractApp) ---------------------- #
     def _update_status(self):
         self.calls.append("status")
 
-    def _preview_contract(self):
-        self.calls.append("preview_contract")
-
-    def _preview_additional(self):
-        self.calls.append("preview_additional")
-
-    def _refresh_party_combo_values(self):
-        self.calls.append("combo")
-
-    # -- зависимые фасады приложения --------------------------------------- #
     def _open_file(self, path):
         self.opened.append(("open", path))
         return True
@@ -86,15 +92,6 @@ class FakeApp:
     def _choice_dialog(self, *args):
         self.choice_calls.append(args)
         return self.choice_result
-
-    def _build_record_docx(self, rec):
-        return Document()
-
-    def _party_documents_dir(self, party_rec, interactive=True):
-        return self.docs_dir
-
-    def _documents_dir(self):
-        return self.docs_dir
 
 
 @pytest.fixture()
@@ -536,52 +533,3 @@ def test_facade_show_in_folder_routes_through_main(monkeypatch):
     assert seen == ["документ.docx"]
 
 
-class RecordingFlow:
-    def __init__(self):
-        self.calls: list = []
-
-    def export_document(self, rec):
-        self.calls.append("export_document")
-
-    def delete_document(self, rec):
-        self.calls.append("delete_document")
-
-    def delete_counterparty(self, rec):
-        self.calls.append("delete_counterparty")
-
-    def restore_document(self, rec):
-        self.calls.append("restore_document")
-
-    def restore_counterparty(self, rec):
-        self.calls.append("restore_counterparty")
-
-    def purge_document(self, rec):
-        self.calls.append("purge_document")
-
-    def purge_counterparty(self, rec):
-        self.calls.append("purge_counterparty")
-
-    def empty_trash(self):
-        self.calls.append("empty_trash")
-
-
-def test_facades_delegate_to_controller():
-    """Фасады с прежними именами передают вызовы контроллеру."""
-    app = object.__new__(main.ContractApp)
-    flow = RecordingFlow()
-    app._lifecycle_flow = flow
-
-    app.export_document({})
-    app._delete_document({})
-    app._delete_counterparty({})
-    app._restore_document({})
-    app._restore_counterparty({})
-    app._purge_document({})
-    app._purge_counterparty({})
-    app._empty_trash()
-
-    assert flow.calls == [
-        "export_document", "delete_document", "delete_counterparty",
-        "restore_document", "restore_counterparty", "purge_document",
-        "purge_counterparty", "empty_trash",
-    ]

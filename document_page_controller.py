@@ -18,13 +18,13 @@
 
 Связность минимальна и идёт через фасады приложения:
 
-* единый «текущий контрагент» — ``self.app._party_from_var`` /
-  ``self.app._set_current_party`` / ``self.app._on_party_selected`` /
-  ``self.app._contract_from_var``: выбор, сделанный на одной странице
+* единый «текущий контрагент» — ``app._doc_context_flow`` (party_from_var,
+  set_current_party, on_party_selected, contract_from_var): выбор,
+  сделанный на одной странице
   документов, переносится на остальные (п. 4.2), а трассы переменных
   привязаны к фасадам ContractApp, чтобы подмена маршрута сохранялась;
-* печать предпросмотра — ``self.app._render_contract_docx`` /
-  ``self.app._render_additional_docx`` (контроллер сохранения, шаг 5);
+* печать предпросмотра — ``app._doc_save_flow.render_contract_docx`` /
+  ``render_additional_docx`` (контроллер сохранения, шаг 5);
   сам предпросмотр — ``docx_to_text`` из document_builder, печатные формы
   живут в services/document_builder (п. 9.1, 9.2);
 * ``ui.alert`` — атрибут общего модуля ui_macos: подмена ``m.ui.alert``
@@ -112,13 +112,13 @@ class DocumentPageController:
         search_entry.pack(side="left")
         try:  # Enter в поиске ищет, а не сохраняет договор
             search_entry.bind_entry(
-                "<Return>", lambda _e: (app._find_party_by_inn(), "break")[1])
+                "<Return>", lambda _e: (self.find_party_by_inn(), "break")[1])
             search_entry.bind_entry(
-                "<KP_Enter>", lambda _e: (app._find_party_by_inn(), "break")[1])
+                "<KP_Enter>", lambda _e: (self.find_party_by_inn(), "break")[1])
         except Exception:
             pass
         ui.ghost_button(
-            search_holder, "Найти", app._find_party_by_inn,
+            search_holder, "Найти", self.find_party_by_inn,
             width=int(92 * app.scale), height=int(28 * app.scale),
         ).pack(side="left", padx=(int(10 * app.scale), 0))
         card.row(
@@ -151,16 +151,16 @@ class DocumentPageController:
         app.contract_month_var.trace_add(
             "write", lambda *_: app._on_doc_field_changed("contract", F.MONTH))
 
-        app._refresh_party_combo_values()
+        app._doc_context_flow.refresh_party_combo_values()
 
         # Предпросмотр обновляется при любом изменении полей договора.
-        app.contract_party_var.trace_add("write", app._preview_contract)
+        app.contract_party_var.trace_add("write", self.preview_contract)
         app.contract_party_var.trace_add(
-            "write", lambda *_: app._on_party_selected("contract"))
-        app.contract_number_var.trace_add("write", app._preview_contract)
-        app.contract_day_var.trace_add("write", app._preview_contract)
-        app.contract_month_var.trace_add("write", app._preview_contract)
-        app._preview_contract()
+            "write", lambda *_: app._doc_context_flow.on_party_selected("contract"))
+        app.contract_number_var.trace_add("write", self.preview_contract)
+        app.contract_day_var.trace_add("write", self.preview_contract)
+        app.contract_month_var.trace_add("write", self.preview_contract)
+        self.preview_contract()
 
     def preview_contract(self, *_args):
         """Откладывает перерисовку предпросмотра договора.
@@ -175,13 +175,13 @@ class DocumentPageController:
             except Exception:
                 pass
         app._preview_contract_after = app.root.after(
-            self.PREVIEW_DELAY_MS, app._render_contract_preview)
+            self.PREVIEW_DELAY_MS, self.render_contract_preview)
 
     def render_contract_preview(self):
         """Собирает текст предпросмотра договора из текущих полей."""
         app = self.app
         app._preview_contract_after = None
-        rec = app._party_from_var(app.contract_party_var)
+        rec = app._doc_context_flow.party_from_var(app.contract_party_var)
         if rec is None:
             app._set_text(
                 app.contract_preview,
@@ -194,7 +194,7 @@ class DocumentPageController:
         data[F.MONTH] = app.contract_month_var.get().strip()
         is_ip = rec.get("type") == "ip"
         try:
-            doc = app._render_contract_docx(data, is_ip)
+            doc = app._doc_save_flow.render_contract_docx(data, is_ip)
             app._set_text(app.contract_preview, docx_to_text(doc))
         except Exception as exc:
             app._set_text(app.contract_preview, f"Не удалось собрать предпросмотр: {exc}")
@@ -212,7 +212,7 @@ class DocumentPageController:
                 "error",
             )
             return
-        app._set_current_party(rec)
+        app._doc_context_flow.set_current_party(rec)
         app.contract_search_var.set("")
 
     # ------------------------------------------------------------------ #
@@ -242,9 +242,9 @@ class DocumentPageController:
             width=int(main.ENTRY_WIDTH * app.scale), variable=app.addl_party_var,
         )
         card.wide(app.addl_party_combo, pady=(int(2 * app.scale), int(10 * app.scale)))
-        app.addl_party_var.trace_add("write", app._on_addl_party_changed)
+        app.addl_party_var.trace_add("write", self.on_addl_party_changed)
         app.addl_party_var.trace_add(
-            "write", lambda *_: app._on_party_selected("additional"))
+            "write", lambda *_: app._doc_context_flow.on_party_selected("additional"))
 
         # -- Договор-основание -------------------------------------------- #
         card = ui.Card(left, labels_above=True)
@@ -292,7 +292,7 @@ class DocumentPageController:
                  hint="Можно оставить пустым — сохранится как «б/н».")
 
         app._limit_var = tk.StringVar()
-        app._limit_var.trace_add("write", app._format_limit)
+        app._limit_var.trace_add("write", self.format_limit)
         limit_holder = ctk.CTkFrame(card.body, fg_color="transparent")
         app.limit_entry = ui.entry(
             limit_holder, width=int(220 * app.scale), textvariable=app._limit_var,
@@ -340,19 +340,19 @@ class DocumentPageController:
         )
         card.wide(app.words_label, pady=(int(2 * app.scale), int(2 * app.scale)))
 
-        app.term_var.trace_add("write", app._update_words)
-        app._update_words()
-        app._update_limit_words()
+        app.term_var.trace_add("write", self.update_words)
+        self.update_words()
+        self.update_limit_words()
 
         # Предпросмотр обновляется при любом изменении данных доп. соглашения.
-        app.addl_party_var.trace_add("write", app._preview_additional)
-        app.addl_contract_var.trace_add("write", app._preview_additional)
+        app.addl_party_var.trace_add("write", self.preview_additional)
+        app.addl_contract_var.trace_add("write", self.preview_additional)
         app.addl_contract_var.trace_add(
-            "write", lambda *_: app._update_contract_info("additional"))
-        app.addl_number_var.trace_add("write", app._preview_additional)
-        app._limit_var.trace_add("write", app._preview_additional)
-        app.term_var.trace_add("write", app._preview_additional)
-        app._preview_additional()
+            "write", lambda *_: app._doc_context_flow.update_contract_info("additional"))
+        app.addl_number_var.trace_add("write", self.preview_additional)
+        app._limit_var.trace_add("write", self.preview_additional)
+        app.term_var.trace_add("write", self.preview_additional)
+        self.preview_additional()
 
     def preview_additional(self, *_args):
         """Откладывает перерисовку предпросмотра доп. соглашения.
@@ -367,15 +367,15 @@ class DocumentPageController:
             except Exception:
                 pass
         app._preview_additional_after = app.root.after(
-            self.PREVIEW_DELAY_MS, app._render_additional_preview)
+            self.PREVIEW_DELAY_MS, self.render_additional_preview)
 
     def render_additional_preview(self):
         """Собирает текст предпросмотра доп. соглашения из текущих полей."""
         app = self.app
         app._preview_additional_after = None
-        party = app._party_from_var(app.addl_party_var)
+        party = app._doc_context_flow.party_from_var(app.addl_party_var)
         contract = (
-            app._contract_from_var(app.addl_contract_var, party["id"]) if party else None
+            app._doc_context_flow.contract_from_var(app.addl_contract_var, party["id"]) if party else None
         )
         if party is None or contract is None:
             app._set_text(
@@ -386,7 +386,7 @@ class DocumentPageController:
         data = dict(contract.get("data") or {})
         is_ip = party.get("type") == "ip"
         try:
-            doc = app._render_additional_docx(
+            doc = app._doc_save_flow.render_additional_docx(
                 data, is_ip,
                 app.addl_number_var.get().strip(),
                 app._limit_var.get().strip(),
@@ -399,10 +399,10 @@ class DocumentPageController:
     def on_addl_party_changed(self, *_args):
         """Обновляет список договоров выбранного контрагента (п. 5.1)."""
         app = self.app
-        rec = app._party_from_var(app.addl_party_var)
+        rec = app._doc_context_flow.party_from_var(app.addl_party_var)
         contracts = app.store.contracts_for(rec["id"]) if rec else []
         if contracts:
-            values = [app._contract_display(c) for c in contracts]
+            values = [app._doc_context_flow.contract_display(c) for c in contracts]
         else:
             values = ["— нет сохранённых договоров —"]
         app.addl_contract_combo.set_values(values)
@@ -449,7 +449,7 @@ class DocumentPageController:
                 pass
             app._limit_var.set(formatted)
             main.restore_caret_after_reformat(entry, caret, len(raw), len(formatted))
-        app._update_limit_words()
+        self.update_limit_words()
 
     def update_limit_words(self):
         """«Сумма прописью» под полем лимита доп. соглашения."""

@@ -103,7 +103,7 @@ class SettingsController:
         card = ui.Card(left, labels_above=True)
         card.grid(row=1, column=0, sticky="new", padx=int(4 * app.scale), pady=(0, int(12 * app.scale)))
         card.section("Папка для сохранения документов")
-        app._documents_dir_var = tk.StringVar(value=app._documents_dir())
+        app._documents_dir_var = tk.StringVar(value=app._settings_flow.documents_dir())
         card.wide(
             ctk.CTkLabel(
                 card.body, textvariable=app._documents_dir_var,
@@ -116,11 +116,11 @@ class SettingsController:
         buttons = ctk.CTkFrame(card.body, fg_color="transparent")
         card.wide(buttons)
         ui.secondary_button(
-            buttons, "Выбрать папку…", app._choose_documents_dir,
+            buttons, "Выбрать папку…", app._settings_flow.choose_documents_dir,
             width=int(170 * app.scale), height=int(30 * app.scale),
         ).pack(side="left")
         ui.secondary_button(
-            buttons, "Открыть папку", lambda: app._open_file(app._documents_dir()),
+            buttons, "Открыть папку", lambda: app._open_file(app._settings_flow.documents_dir()),
             width=int(150 * app.scale), height=int(30 * app.scale),
         ).pack(side="left", padx=(int(10 * app.scale), 0))
         card.wide(
@@ -164,7 +164,7 @@ class SettingsController:
         # значение не показывается и не копируется по Ctrl+C. Поле остаётся
         # пустым, пока пользователь не решит сменить ключ; состояние — строкой ниже.
         app._dadata_key_status_var = tk.StringVar(
-            value=app._dadata_key_status_text())
+            value=app._settings_flow.dadata_key_status_text())
         card.wide(
             ctk.CTkLabel(
                 card.body, textvariable=app._dadata_key_status_var,
@@ -181,11 +181,11 @@ class SettingsController:
         key_buttons = ctk.CTkFrame(card.body, fg_color="transparent")
         card.wide(key_buttons)
         ui.secondary_button(
-            key_buttons, "Сохранить ключ", app._save_dadata_key,
+            key_buttons, "Сохранить ключ", app._settings_flow.save_dadata_key,
             width=int(160 * app.scale), height=int(30 * app.scale),
         ).pack(side="left")
         ui.ghost_button(
-            key_buttons, "Удалить ключ", app._clear_dadata_key,
+            key_buttons, "Удалить ключ", app._settings_flow.clear_dadata_key,
             width=int(130 * app.scale), height=int(28 * app.scale),
         ).pack(side="left", padx=(int(10 * app.scale), 0))
 
@@ -213,7 +213,7 @@ class SettingsController:
                 app._dadata_key_entry.delete(0, "end")
             except Exception:
                 pass
-            app._dadata_key_status_var.set(app._dadata_key_status_text())
+            app._dadata_key_status_var.set(app._settings_flow.dadata_key_status_text())
             ui.alert(
                 app.root, "Ключ сохранён",
                 "Автозаполнение по ИНН будет использовать этот ключ."
@@ -241,7 +241,7 @@ class SettingsController:
             app._dadata_key_entry.delete(0, "end")
         except Exception:
             pass
-        app._dadata_key_status_var.set(app._dadata_key_status_text())
+        app._dadata_key_status_var.set(app._settings_flow.dadata_key_status_text())
         ui.alert(app.root, "Ключ удалён",
                  "Ключ DaData удалён из профиля пользователя.", "success")
 
@@ -251,7 +251,7 @@ class SettingsController:
     def choose_documents_dir(self):
         """Выбор папки документов с немедленным сохранением настройки."""
         app = self.app
-        current = app._documents_dir()
+        current = self.documents_dir()
         chosen = filedialog.askdirectory(
             parent=app.root, initialdir=current,
             title="Папка для сохранения договоров и документов",
@@ -314,10 +314,10 @@ class SettingsController:
         app = self.app
         app._log.warning("Папка документов недоступна: %s", type(exc).__name__)
         if app._docs_dir_fallback_active or app._docs_dir_dialog_active:
-            return app._default_documents_dir()
+            return self.default_documents_dir()
         if app._docs_dir_retry_count >= self.MAX_DIR_RETRIES:
             app._docs_dir_fallback_active = True
-            return app._default_documents_dir()
+            return self.default_documents_dir()
 
         app._docs_dir_dialog_active = True
         try:
@@ -336,7 +336,7 @@ class SettingsController:
 
         if choice == "retry":
             app._docs_dir_retry_count += 1
-            return app._documents_dir(interactive=True)
+            return self.documents_dir(interactive=True)
         if choice == "choose":
             chosen = filedialog.askdirectory(
                 parent=app.root, title="Выберите папку для документов",
@@ -348,7 +348,7 @@ class SettingsController:
                 app._persist_settings()
                 return chosen
         app._docs_dir_fallback_active = True
-        return app._default_documents_dir()
+        return self.default_documents_dir()
 
     def documents_dir(self, interactive: bool = True) -> str:
         """Папка для готовых документов: выбранная в настройках либо %APPDATA%.
@@ -366,12 +366,12 @@ class SettingsController:
                 return custom
             except OSError as exc:
                 if interactive:
-                    return app._resolve_unavailable_documents_dir(custom, exc)
+                    return self.resolve_unavailable_documents_dir(custom, exc)
                 app._log.warning(
                     "Папка документов недоступна (фоновая задача): %s",
                     type(exc).__name__,
                 )
-        return app._default_documents_dir(interactive=interactive)
+        return self.default_documents_dir(interactive=interactive)
 
     def documents_dir_for_import(self) -> str:
         """Папка документов для фонового импорта: без Tk-диалогов.
@@ -392,7 +392,7 @@ class SettingsController:
                     f"{custom}\n{exc}\n\n"
                     "Выберите другую папку в «Настройках» и повторите импорт."
                 ) from exc
-        return app._default_documents_dir(interactive=False)
+        return self.default_documents_dir(interactive=False)
 
     @staticmethod
     def is_inside_directory(base: str, path: str) -> bool:

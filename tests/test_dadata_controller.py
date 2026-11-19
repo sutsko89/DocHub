@@ -10,7 +10,7 @@
   * без API-ключа — понятная ошибка, запрос не запускается;
   * результат приходит через очередь и опрашивается из главного потока;
   * подстановка реквизитов: ООО — полный набор, ИП — ОГРНИП и ФИО без КПП;
-  * фасад ContractApp._cp_busy проецирует состояние контроллера.
+  * состояние busy живёт на контроллере (фасады ContractApp удалены, v2.12.0).
 """
 from __future__ import annotations
 
@@ -77,15 +77,6 @@ class FakeApp:
         self._cp_type_var = FakeVar("Юр. лицо")
         self._cp_status_var = FakeVar("")
         self._cp_entries = {"ooo": {}, "ip": {}}
-
-    def _cp_fetch_worker(self, inn, api_key, mode, result_queue):
-        self._cp_entries  # заглушка: фасад для подмены в smoke
-
-    def _cp_result_tick(self):
-        pass
-
-    def _cp_busy_tick(self):
-        pass
 
 
 def make_flow() -> tuple[DadataController, FakeApp]:
@@ -219,7 +210,7 @@ def test_start_schedules_queue_poll_and_worker(monkeypatch):
     # busy-анимация запущена и опрос очереди перепланирован
     assert app._cp_status_var.history and "Загружаю реквизиты" in \
         app._cp_status_var.history[0]
-    assert any(ms == 80 and fn == app._cp_result_tick
+    assert any(ms == 80 and fn == flow.result_tick
                for ms, fn in app.root.after_calls)
 
 
@@ -273,7 +264,7 @@ def test_result_tick_reschedules_on_empty_queue():
 
     flow.result_tick()
 
-    assert app.root.after_calls[-1] == (80, app._cp_result_tick)
+    assert app.root.after_calls[-1] == (80, flow.result_tick)
 
 
 def test_result_tick_stops_without_queue():
@@ -297,7 +288,7 @@ def test_busy_tick_animates_and_reschedules():
 
     assert app._cp_status_var.history[0].endswith("Загружаю реквизиты из ЕГРЮЛ/ЕГРИП")
     assert app._cp_status_var.history[1].endswith("Загружаю реквизиты из ЕГРЮЛ/ЕГРИП.")
-    assert app.root.after_calls[-1] == (300, app._cp_busy_tick)
+    assert app.root.after_calls[-1] == (300, flow.busy_tick)
     assert flow.busy_phase == 2
 
 
@@ -393,7 +384,7 @@ def test_party_loaded_without_data_alerts(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-#  Фасад ContractApp: состояние busy через прежние имена
+#  Состояние busy и guard: без Tk, как в smoke (п. 3.2)
 # --------------------------------------------------------------------------- #
 def _bare_app() -> "main.ContractApp":
     app = object.__new__(main.ContractApp)
@@ -401,21 +392,12 @@ def _bare_app() -> "main.ContractApp":
     return app
 
 
-def test_facade_busy_property_projects_controller_state():
-    app = _bare_app()
-
-    app._cp_busy = True
-    assert app._dadata_flow.busy is True
-    app._cp_busy = False
-    assert app._dadata_flow.busy is False
-
-
-def test_facade_guard_blocks_second_click_while_busy():
+def test_guard_blocks_second_click_while_busy():
     """Зеркало smoke-проверки: повторный клик при активном запросе — no-op."""
     app = _bare_app()
-    app._cp_busy = True
+    app._dadata_flow.busy = True
 
-    app._cp_fill_from_inn()  # guard срабатывает до обращения к полям
+    app._dadata_flow.fill_from_inn()  # guard срабатывает до обращения к полям
 
-    assert app._cp_busy is True, "guard не сбросил состояние"
+    assert app._dadata_flow.busy is True, "guard не сбросил состояние"
     assert app._dadata_flow.result_queue is None

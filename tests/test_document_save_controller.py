@@ -21,7 +21,8 @@ smoke-тест продолжает покрывать GUI-путь целико
   * открытие файла после сохранения идёт через фасад приложения
     ``ContractApp._open_file`` — именно модульное main.open_file подменяет
     smoke-тест;
-  * фасады ContractApp с прежними именами делегируют контроллеру.
+  * соседние контроллеры вызываются напрямую через app._flow.*
+    (фасады ContractApp удалены, v2.12.0).
 """
 from __future__ import annotations
 
@@ -162,27 +163,27 @@ class FakeApp:
         self._limit_var = FakeVar("")
         self.term_var = FakeVar("")
 
-        # Что вернут разборщики комбобоксов (настраивается тестом).
+        # Что вернут разборчики комбобоксов (настраивается тестом).
         self.party_for_var: dict | None = None
         self.contract_for_var: dict | None = None
 
-    # -- разборчики значений (остаются на приложении) ---------------------- #
-    def _party_from_var(self, var):
-        return self.party_for_var
-
-    def _contract_from_var(self, var, party_id):
-        return self.contract_for_var
-
-    def _contract_display(self, rec):
-        return f"Договор поставки № {rec.get('number')}"
+        # Соседние контроллеры вызываются напрямую (v2.12.0, фасады
+        # ContractApp удалены): записывающие фейки.
+        self._doc_context_flow = SimpleNamespace(
+            party_from_var=lambda var: self.party_for_var,
+            contract_from_var=lambda var, party_id: self.contract_for_var,
+            contract_display=lambda rec:
+                f"Договор поставки № {rec.get('number')}",
+            reset_form_baseline=lambda page: self.calls.append(("baseline", page)),
+        )
+        self._settings_flow = SimpleNamespace(
+            documents_dir=lambda interactive=True: self.docs_dir,
+            is_inside_directory=lambda base, path: self.inside,
+        )
+        self._registry_flow = SimpleNamespace(
+            refresh=lambda: self.calls.append("registry"))
 
     # -- страницы и обновления UI ------------------------------------------ #
-    def _documents_dir(self, interactive=True):
-        return self.docs_dir
-
-    def _is_inside_directory(self, base, path):
-        return self.inside
-
     def _set_text(self, textbox, text):
         textbox.insert("1.0", text)
 
@@ -194,12 +195,6 @@ class FakeApp:
 
     def _focus_page_widget(self, page, key):
         self.calls.append(("focus", page, key))
-
-    def _reset_form_baseline(self, page):
-        self.calls.append(("baseline", page))
-
-    def refresh_registry(self):
-        self.calls.append("registry")
 
     def _update_status(self):
         self.calls.append("status")
@@ -861,168 +856,3 @@ def test_render_spec_docx_uses_print_settings(store, ooo_fields, app, flow,
     settings = seen["settings"]
     assert settings["spec_year"] > 0, "год вычисляется на момент вызова (аудит 2.0.1)"
     assert "spec_supplier" in settings
-
-
-# --------------------------------------------------------------------------- #
-#  Фасады ContractApp с прежними именами
-# --------------------------------------------------------------------------- #
-class RecordingFlow:
-    """Пишет все вызовы: имя метода + аргументы."""
-
-    def __init__(self):
-        self.calls: list = []
-        self.spec_rows_value = [{"marker": "row"}]
-
-    def _record(self, __method, *args, **kwargs):
-        self.calls.append((__method, args, kwargs))
-        return "ok"
-
-    def build_spec_page(self):
-        return self._record("build_spec_page")
-
-    @property
-    def spec_rows(self):
-        return self.spec_rows_value
-
-    def add_spec_row(self, *args, **kwargs):
-        return self._record("add_spec_row", *args, **kwargs)
-
-    def remove_spec_row(self):
-        return self._record("remove_spec_row")
-
-    def spec_items(self):
-        return self._record("spec_items")
-
-    def spec_total(self):
-        return self._record("spec_total")
-
-    def on_spec_item_changed(self, *args):
-        return self._record("on_spec_item_changed", *args)
-
-    def on_spec_party_changed(self, *args):
-        return self._record("on_spec_party_changed", *args)
-
-    def persist_document(self, *args):
-        return self._record("persist_document", *args)
-
-    def party_documents_dir(self, *args, **kwargs):
-        return self._record("party_documents_dir", *args, **kwargs)
-
-    def render_contract_docx(self, *args):
-        return self._record("render_contract_docx", *args)
-
-    def render_additional_docx(self, *args):
-        return self._record("render_additional_docx", *args)
-
-    def render_spec_docx(self, *args):
-        return self._record("render_spec_docx", *args)
-
-    def rec_is_ip(self, *args):
-        return self._record("rec_is_ip", *args)
-
-    def build_record_docx(self, *args):
-        return self._record("build_record_docx", *args)
-
-    def write_docx(self, *args):
-        return self._record("write_docx", *args)
-
-    def save_and_open_document(self, *args):
-        return self._record("save_and_open_document", *args)
-
-    def persist_document_result_alert(self, *args):
-        return self._record("persist_document_result_alert", *args)
-
-    def regenerate_spec(self, *args):
-        return self._record("regenerate_spec", *args)
-
-    def flush_spec_preview(self):
-        return self._record("flush_spec_preview")
-
-    def render_spec_preview(self):
-        return self._record("render_spec_preview")
-
-    def confirm_document_duplicate(self, *args):
-        return self._record("confirm_document_duplicate", *args)
-
-    def save_contract(self):
-        return self._record("save_contract")
-
-    def save_additional(self):
-        return self._record("save_additional")
-
-    def save_spec(self):
-        return self._record("save_spec")
-
-
-def make_facade_app():
-    flow = RecordingFlow()
-    return SimpleNamespace(_doc_save_flow=flow), flow
-
-
-def test_facade_spec_page_delegates():
-    app, flow = make_facade_app()
-
-    main.ContractApp._build_spec_page(app)
-    main.ContractApp._add_spec_row(app, "Болт", "5", "200", "шт.")
-    main.ContractApp._remove_spec_row(app)
-    main.ContractApp._spec_items(app)
-    main.ContractApp._spec_total(app)
-    main.ContractApp._on_spec_item_changed(app, "evt")
-    main.ContractApp._on_spec_party_changed(app, "evt")
-    main.ContractApp._spec_rows.__get__(app)
-
-    names = [call[0] for call in flow.calls]
-    assert names == [
-        "build_spec_page", "add_spec_row", "remove_spec_row", "spec_items",
-        "spec_total", "on_spec_item_changed", "on_spec_party_changed",
-    ]
-    assert flow.calls[1][2] == {"name": "Болт", "qty": "5",
-                                "price": "200", "unit": "шт."}
-    assert main.ContractApp._spec_rows.fget(app) == [{"marker": "row"}]
-
-
-def test_facade_persist_and_render_delegates():
-    app, flow = make_facade_app()
-
-    main.ContractApp._persist_document(app, {"draft": 1})
-    main.ContractApp._party_documents_dir(app, {"party": 1}, interactive=False)
-    main.ContractApp._render_contract_docx(app, {"d": 1}, True)
-    main.ContractApp._render_additional_docx(app, {}, False, "1", "1 000", "30")
-    main.ContractApp._render_spec_docx(app, {"r": 1})
-    main.ContractApp._rec_is_ip(app, {"r": 2})
-    main.ContractApp._build_record_docx(app, {"r": 3})
-    main.ContractApp._write_docx(app, "doc", {"r": 4})
-    main.ContractApp._save_and_open_document(app, {"r": 5})
-    main.ContractApp._persist_document_result_alert(app, {"error": "x"})
-    main.ContractApp._confirm_document_duplicate(app, "p1", "contract", "5", "12.01")
-
-    names = [call[0] for call in flow.calls]
-    assert names == [
-        "persist_document", "party_documents_dir", "render_contract_docx",
-        "render_additional_docx", "render_spec_docx", "rec_is_ip",
-        "build_record_docx", "write_docx", "save_and_open_document",
-        "persist_document_result_alert", "confirm_document_duplicate",
-    ]
-    assert flow.calls[1][2] == {"interactive": False}, "keyword передан как есть"
-
-
-def test_facade_preview_and_save_delegates():
-    app, flow = make_facade_app()
-
-    main.ContractApp._regenerate_spec(app, "evt")
-    main.ContractApp._flush_spec_preview(app)
-    main.ContractApp._render_spec_preview(app)
-    main.ContractApp.save_contract(app)
-    main.ContractApp.save_additional(app)
-    main.ContractApp.save_spec(app)
-
-    names = [call[0] for call in flow.calls]
-    assert names == [
-        "regenerate_spec", "flush_spec_preview", "render_spec_preview",
-        "save_contract", "save_additional", "save_spec",
-    ]
-
-
-def test_facade_spec_rows_property_reads_flow():
-    app, flow = make_facade_app()
-    assert main.ContractApp._spec_rows.fget(app) == [{"marker": "row"}]

@@ -16,6 +16,7 @@ Tk — контроллер получает фейковое приложени
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 import os
 import queue
 import threading
@@ -24,7 +25,7 @@ import pytest
 import tkinter as tk
 
 import import_controller as ic
-import main
+import settings_controller as scc
 import storage
 from document_builder import F
 from document_importer import MAX_TOTAL_SIZE
@@ -117,64 +118,60 @@ class FakeApp:
         self.scale = 1.0
         self.store = FakeStore()
         self._log = logging.getLogger("test-import-controller")
-        self._documents_dir_for_import = lambda: str(tmp_path)
-        self._is_inside_directory = main.ContractApp._is_inside_directory
         self.calls: list = []
         self.notifications: list[str] = []
         self.ask_party_result: tuple = (None, "skip")
         self.choice_result: str = "skip"
         self.party_from_var_result: dict | None = None
+        # Соседние контроллеры вызываются напрямую (v2.12.0, фасады
+        # ContractApp удалены): записывающие фейки.
+        self._settings_flow = SimpleNamespace(
+            documents_dir_for_import=lambda: str(tmp_path),
+            is_inside_directory=SettingsController.is_inside_directory,
+        )
+        self._doc_context_flow = SimpleNamespace(
+            party_from_var=lambda var: self.party_from_var_result,
+            refresh_party_combo_values=lambda: self.calls.append("combo"),
+        )
+        self._doc_page_flow = SimpleNamespace(
+            preview_contract=lambda *a: self.calls.append("preview_contract"),
+            preview_additional=lambda *a: self.calls.append("preview_additional"),
+        )
+        self._registry_flow = SimpleNamespace(
+            refresh=lambda: self.calls.append("registry"))
 
     def _notify(self, message, path=None):
         self.notifications.append(message)
 
-    def _party_from_var(self, var):
-        return self.party_from_var_result
-
-    def _refresh_party_combo_values(self):
-        self.calls.append("combo")
-
-    def _preview_contract(self):
-        self.calls.append("preview_contract")
-
-    def _preview_additional(self):
-        self.calls.append("preview_additional")
-
-    def refresh_registry(self):
-        self.calls.append("registry")
-
     def _update_status(self):
         self.calls.append("status")
-
-    def _show_import_report(self, entries, summary):
-        self.calls.append(("report", entries, summary))
-
-    def _ask_import_party(self, result):
-        return self.ask_party_result
 
     def _choice_dialog(self, *args, **kwargs):
         return self.choice_result
 
-    def _import_worker(self, files, result_queue):
-        self.calls.append("worker")
-
-    def _import_tick(self):
-        self.calls.append("tick")
-
-    def _cancel_import(self):
-        self.calls.append("cancel")
-
-    def _finish_documents_import(self, results):
-        self.calls.append(("finish", results))
-
 
 def make_flow(tmp_path) -> tuple[ImportController, FakeApp]:
     app = FakeApp(tmp_path)
-    return ic.ImportController(app), app
+    flow = ic.ImportController(app)
+    # Собственные методы потока вызываются напрямую (v2.12.0): отчёт —
+    # записывающая подмена, finish — обёртка с записью результатов.
+    flow.show_report = lambda entries, summary: app.calls.append(
+        ("report", entries, summary))
+    flow.ask_party = lambda result: app.ask_party_result
+    real_finish = flow.finish
+
+    def _finish(results):
+        # снимок: реальный finish/register_result мутирует записи на месте
+        app.calls.append(("finish", [dict(r) for r in results]))
+        return real_finish(results)
+
+    flow.finish = _finish
+    return flow, app
 
 
 # для читаемости аннотаций тестов
 ImportController = ic.ImportController
+SettingsController = scc.SettingsController
 
 
 def zero_stats() -> dict:
@@ -263,7 +260,7 @@ def test_start_reports_unavailable_documents_dir(tmp_path, monkeypatch):
     def broken_dir():
         raise OSError("папка недоступна")
 
-    app._documents_dir_for_import = broken_dir
+    app._settings_flow = SimpleNamespace(documents_dir_for_import=broken_dir)
     flow = ic.ImportController(app)
     small = tmp_path / "ok.docx"
     small.write_bytes(b"PK")
@@ -486,6 +483,8 @@ def test_ask_party_attaches_existing_by_name(tmp_path, monkeypatch):
     result = {"name": "файл.docx", "party": {"display": "ООО Ромашка",
                                              "fields": {}, "missing": "ИНН"}}
 
+    del flow.ask_party  # снять подмену из make_flow — нужен настоящий диалог
+
     got_rec, action = flow.ask_party(result)
 
     assert action == "attach" and got_rec is rec
@@ -499,6 +498,8 @@ def test_ask_party_choice_dialog_routes_through_app(tmp_path, monkeypatch):
     captured: list = []
     monkeypatch.setattr(app, "_choice_dialog",
                         lambda *a, **kw: captured.append(a) or "create")
+
+    del flow.ask_party  # снять подмену из make_flow — нужен настоящий диалог
 
     got_rec, action = flow.ask_party(result)
 
@@ -514,6 +515,8 @@ def test_ask_party_offers_current_party(tmp_path):
     app.choice_result = "attach"
     result = {"name": "файл.docx", "party": {"display": "Кто-то новый",
                                              "fields": {}, "missing": "ИНН"}}
+
+    del flow.ask_party  # снять подмену из make_flow — нужен настоящий диалог
 
     got_rec, action = flow.ask_party(result)
 
@@ -601,8 +604,8 @@ def test_tick_processes_status_file_done(tmp_path):
     assert flow.running is False
     assert flow.queue is None
     assert app.root.after_calls == [], "после done опрос не перепланируется"
-    assert app.calls and app.calls[-1][0] == "finish"
-    assert app.calls[-1][1] == [{"name": "doc.docx"}]
+    finish_rec = next(c for c in app.calls if isinstance(c, tuple) and c[0] == "finish")
+    assert finish_rec[1] == [{"name": "doc.docx"}]
 
 
 def test_tick_reschedules_on_empty_queue(tmp_path):
@@ -615,7 +618,7 @@ def test_tick_reschedules_on_empty_queue(tmp_path):
     flow.tick()
 
     assert app.root.after_calls and app.root.after_calls[0][0] == 80
-    assert app.root.after_calls[0][1] == app._import_tick, "перепланируется фасад"
+    assert app.root.after_calls[0][1] == flow.tick, "перепланируется собственный tick"
 
 
 def test_tick_stops_when_window_is_dying(tmp_path):
@@ -638,57 +641,38 @@ def test_tick_stops_when_window_is_dying(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-#  Фасады ContractApp: свойства состояния и guard через прежние имена
+#  Guard повторного входа и отмена: напрямую через контроллер (v2.12.0)
 # --------------------------------------------------------------------------- #
-def _bare_app() -> "main.ContractApp":
-    app = object.__new__(main.ContractApp)
-    app._import_flow = ic.ImportController(app)
-    return app
-
-
-def test_facade_properties_project_controller_state():
-    app = _bare_app()
-
-    app._import_running = True
-    app._import_cancelled = True
-    app._import_queue = None
-    app._import_win = None
-
-    assert app._import_flow.running is True
-    assert app._import_flow.cancelled is True
-    assert app._import_queue is None
-    assert app._import_win is None
-
-
-def test_facade_guard_blocks_second_start_via_drag_and_drop():
+def test_guard_blocks_second_start_via_drag_and_drop():
     """Зеркало smoke-проверки re-entry: второй запуск не сбрасывает состояние."""
-    app = _bare_app()
-    app._import_running = True
-    app._import_queue = None
-    app._import_win = None
+    flow = ic.ImportController(SimpleNamespace(
+        _notify=lambda *_a, **_kw: None, _settings_flow=SimpleNamespace()))
+    flow.running = True
+    flow.queue = None
+    flow.win = None
 
-    app._start_documents_import(["guard.docx"])
+    flow.start(["guard.docx"])
 
-    assert app._import_queue is None and app._import_win is None
-    assert app._import_flow.running is True, "guard не сбросил состояние"
+    assert flow.queue is None and flow.win is None
+    assert flow.running is True, "guard не сбросил состояние"
 
 
-def test_facade_empty_files_do_not_start_worker():
-    app = _bare_app()
-    flow = app._import_flow
+def test_empty_files_do_not_start_worker():
+    flow = ic.ImportController(SimpleNamespace(
+        _notify=lambda *_a, **_kw: None, _settings_flow=SimpleNamespace()))
 
-    app._start_documents_import([])
+    flow.start([])
 
     assert flow.running is False
     assert flow.queue is None
 
 
-def test_facade_cancel_routes_to_controller():
-    app = _bare_app()
+def test_cancel_routes_to_state():
+    flow = ic.ImportController(SimpleNamespace(_status_var=FakeVar("")))
 
-    app._cancel_import()  # импорт не выполняется — no-op
-    assert app._import_cancelled is False
+    flow.cancel()  # импорт не выполняется — no-op
+    assert flow.cancelled is False
 
-    app._import_running = True
-    app._cancel_import()
-    assert app._import_cancelled is True
+    flow.running = True
+    flow.cancel()
+    assert flow.cancelled is True

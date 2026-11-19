@@ -21,6 +21,9 @@ ContractApp с прежними именами.
 from __future__ import annotations
 
 import queue
+import threading
+import threading
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -45,14 +48,14 @@ class DadataController:
     # ------------------------------------------------------------------ #
     #  Запрос
     # ------------------------------------------------------------------ #
-    def fill_from_inn(self, thread_factory: Callable[..., Any]) -> None:
+    def fill_from_inn(self, thread_factory: Callable[..., Any] | None = None) -> None:
         """Запрашивает реквизиты по ИНН из активной карточки (ООО или ИП).
 
         Guard повторных кликов стоит в начале: пока запрос выполняется,
         новый воркер не запускается (аудит 2.0.1). ``thread_factory``
-        передаётся вызывающим кодом на каждый запуск: smoke-тест подменяет
-        ``main.threading.Thread`` синхронным исполнителем, и подмена должна
-        действовать в момент вызова.
+        разрешается в момент вызова (по умолчанию — ``threading.Thread``):
+        smoke-тест подменяет ``threading.Thread`` синхронным исполнителем,
+        и подмена должна действовать в момент запуска воркера.
         """
         if self.busy:
             return
@@ -84,12 +87,13 @@ class DadataController:
         result_queue: queue.Queue = queue.Queue()
         self.result_queue = result_queue
         self.busy_tick()
-        thread_factory(
-            target=self.app._cp_fetch_worker,
+        factory = thread_factory or threading.Thread
+        factory(
+            target=self.fetch_worker,
             args=(inn, api_key, mode, result_queue),
             daemon=True,
         ).start()
-        self.app.root.after(80, self.app._cp_result_tick)
+        self.app.root.after(80, self.result_tick)
 
     # ------------------------------------------------------------------ #
     #  Анимация ожидания
@@ -101,7 +105,7 @@ class DadataController:
         dots = "." * (self.busy_phase % 4)
         self.app._cp_status_var.set(f"Загружаю реквизиты из ЕГРЮЛ/ЕГРИП{dots}")
         self.busy_phase += 1
-        self.busy_after = self.app.root.after(300, self.app._cp_busy_tick)
+        self.busy_after = self.app.root.after(300, self.busy_tick)
 
     def busy_stop(self) -> None:
         """Останавливает анимацию и цикл опроса результата."""
@@ -135,7 +139,7 @@ class DadataController:
         try:
             item = result_queue.get_nowait()
         except queue.Empty:
-            self.app.root.after(80, self.app._cp_result_tick)
+            self.app.root.after(80, self.result_tick)
             return
         except (tk.TclError, AttributeError):
             return

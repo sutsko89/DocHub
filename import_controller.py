@@ -7,7 +7,7 @@
 
 Контроллер получает ссылку на приложение и обращается к общим службам через
 него (``self.app.store``, ``self.app.root`` …), а вызовы, которые подменяет
-smoke-тест (``_show_import_report``, ``_ask_import_party``, ``_choice_dialog``),
+smoke-тест (``show_report``, ``ask_party``, ``_choice_dialog``),
 всегда идут через ``self.app.*`` — подмена instance-атрибута продолжает
 работать. Состояние потока импорта (``running``/``queue``/``win``…) живёт
 здесь; ContractApp публикует его через свойства с прежними именами.
@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import os
 import queue
+import threading
+import threading
+import threading
 import shutil
 from collections.abc import Callable
 from typing import Any
@@ -68,7 +71,7 @@ class ImportController:
     # ------------------------------------------------------------------ #
     #  Запуск
     # ------------------------------------------------------------------ #
-    def start(self, files: list[str], thread_factory: Callable[..., Any]) -> None:
+    def start(self, files: list[str], thread_factory: Callable[..., Any] | None = None) -> None:
         """Проверяет лимиты пакета и запускает фоновый анализ файлов.
 
         До запуска отклоняются: повторный запуск во время работающего
@@ -80,9 +83,10 @@ class ImportController:
         метод напрямую, и раньше второй запуск сбрасывал очередь/результаты
         работающего первого (риск порчи отчёта и задвоения записей).
 
-        ``thread_factory`` передаётся вызывающим кодом на каждый запуск:
-        smoke-тест подменяет ``main.threading.Thread`` синхронным
-        исполнителем, и подмена должна действовать в момент вызова.
+        ``thread_factory`` разрешается в момент вызова (по умолчанию —
+        ``threading.Thread`` из модуля threading): smoke-тест подменяет
+        ``threading.Thread`` синхронным исполнителем, и подмена должна
+        действовать в момент запуска воркера.
         """
         if self.running:
             self.app._notify("Импорт уже выполняется — дождитесь завершения.")
@@ -135,7 +139,7 @@ class ImportController:
             anchor="w", justify="left", wraplength=int(360 * scale),
         ).pack(anchor="w", pady=(int(10 * scale), 0))
         self.cancel_btn = ui.ghost_button(
-            frame, "Отменить", self.app._cancel_import,
+            frame, "Отменить", self.cancel,
             width=int(120 * scale), height=int(28 * scale),
         )
         self.cancel_btn.pack(anchor="e", pady=(int(8 * scale), 0))
@@ -152,10 +156,11 @@ class ImportController:
         except tk.TclError:
             pass
 
-        thread_factory(
-            target=self.app._import_worker, args=(files, result_queue), daemon=True,
+        factory = thread_factory or threading.Thread
+        factory(
+            target=self.worker, args=(files, result_queue), daemon=True,
         ).start()
-        self.app.root.after(80, self.app._import_tick)
+        self.app.root.after(80, self.tick)
 
     def _pack_problem(
         self, files: list[str],
@@ -191,7 +196,7 @@ class ImportController:
             )
 
         try:
-            target_dir = self.app._documents_dir_for_import()
+            target_dir = self.app._settings_flow.documents_dir_for_import()
         except OSError as exc:
             return ("Папка документов недоступна", str(exc), "error")
 
@@ -282,12 +287,12 @@ class ImportController:
         ext = os.path.splitext(src)[1].lower()
         if ext not in ALLOWED_EXTENSIONS:
             return ""
-        base = self.app._documents_dir_for_import()
+        base = self.app._settings_flow.documents_dir_for_import()
         folder = services.safe_filename(
             importer.party_display_name(result["party"]), "Контрагент"
         )
         dest_dir = os.path.normpath(os.path.join(base, folder))
-        if not self.app._is_inside_directory(base, dest_dir):
+        if not self.app._settings_flow.is_inside_directory(base, dest_dir):
             self.app._log.error("Папка импортированного контрагента вне папки документов")
             return ""
         try:
@@ -345,13 +350,13 @@ class ImportController:
                         win.destroy()
                     except Exception:
                         pass
-                    self.app._finish_documents_import(results)
+                    self.finish(results)
                     return
         except queue.Empty:
             pass
         except (tk.TclError, AttributeError):
             return  # окно программы закрывается — импорт прекращаем
-        self.app.root.after(80, self.app._import_tick)
+        self.app.root.after(80, self.tick)
 
     # ------------------------------------------------------------------ #
     #  Регистрация результатов
@@ -396,10 +401,10 @@ class ImportController:
             self.app._log.info("Пакет импорта записан одним save() (п. 5.2)")
 
         if stats["added"]:
-            self.app._refresh_party_combo_values()
-            self.app._preview_contract()
-            self.app._preview_additional()
-        self.app.refresh_registry()
+            self.app._doc_context_flow.refresh_party_combo_values()
+            self.app._doc_page_flow.preview_contract()
+            self.app._doc_page_flow.preview_additional()
+        self.app._registry_flow.refresh()
         self.app._update_status()
 
         message = (
@@ -423,7 +428,7 @@ class ImportController:
             stats["added"], stats["new_parties"], stats["skipped"],
             stats["duplicates"], len(save_errors),
         )
-        self.app._show_import_report(entries, message)
+        self.show_report(entries, message)
         self.cancelled_count = 0
 
     @staticmethod
@@ -479,7 +484,7 @@ class ImportController:
                 if action != "attach":
                     action = "create"
         else:
-            rec, action = self.app._ask_import_party(result)
+            rec, action = self.ask_party(result)
 
         if action == "create":
             rec = self.app.store.add_counterparty(
@@ -594,7 +599,7 @@ class ImportController:
             var = getattr(self.app, attr, None)
             if var is None:
                 continue
-            rec = self.app._party_from_var(var)
+            rec = self.app._doc_context_flow.party_from_var(var)
             if rec is not None:
                 return rec
         return None
@@ -627,7 +632,7 @@ class ImportController:
         try:
             if not os.path.exists(path):
                 return path
-            base = self.app._documents_dir_for_import()
+            base = self.app._settings_flow.documents_dir_for_import()
             unknown_dir = os.path.join(base, importer.UNKNOWN_FOLDER)
             os.makedirs(unknown_dir, exist_ok=True)
             ext = os.path.splitext(path)[1]

@@ -34,7 +34,6 @@ import pytest
 from docx import Document
 
 import document_page_controller as dpc
-import main
 import storage
 from document_builder import F
 
@@ -168,27 +167,27 @@ class FakeApp:
         self.party_for_var: dict | None = None
         self.contract_for_var: dict | None = None
 
-    # -- разборчики значений (остаются на приложении) ---------------------- #
-    def _party_from_var(self, var):
-        return self.party_for_var
-
-    def _contract_from_var(self, var, party_id):
-        return self.contract_for_var
-
-    def _contract_display(self, rec):
-        return f"Договор поставки № {rec.get('number')}"
-
     def _set_text(self, textbox, text):
         textbox.insert("1.0", text)
 
-    # -- выбор контрагента (фасады приложения) ----------------------------- #
-    def _set_current_party(self, rec, source=None):
-        self.calls.append(("set_current_party", rec.get("id") if rec else None))
+    # -- соседние контроллеры: записывающие фейки (v2.12.0, фасады удалены) - #
+    def _make_flow_fakes(self):
+        self._doc_context_flow = SimpleNamespace(
+            party_from_var=lambda var: self.party_for_var,
+            contract_from_var=lambda var, party_id: self.contract_for_var,
+            contract_display=lambda rec:
+                f"Договор поставки № {rec.get('number')}",
+            set_current_party=lambda rec, source=None: self.calls.append(
+                ("set_current_party", rec.get("id") if rec else None)),
+            on_party_selected=lambda key: self.calls.append(
+                ("on_party_selected", key)),
+        )
+        self._doc_save_flow = SimpleNamespace(
+            render_contract_docx=self._render_contract_docx,
+            render_additional_docx=self._render_additional_docx,
+        )
 
-    def _on_party_selected(self, key):
-        self.calls.append(("on_party_selected", key))
-
-    # -- печать предпросмотра: фасады DocumentSaveController ---------------- #
+    # -- печать предпросмотра: контроллер сохранения ----------------------- #
     def _render_contract_docx(self, data, is_ip):
         self.calls.append(("render_contract_docx", dict(data), is_ip))
         doc = Document()
@@ -208,11 +207,8 @@ def app(store, tmp_path):
     a = FakeApp(store, tmp_path)
     flow = DocumentPageController(a)
     a._doc_page_flow = flow
-    # Фасады ContractApp, которые контроллер вызывает повторно: тот же
-    # маршрут «фасад → контроллер», что и в настоящем приложении.
-    a._render_contract_preview = flow.render_contract_preview
-    a._render_additional_preview = flow.render_additional_preview
-    a._update_limit_words = flow.update_limit_words
+    # Соседние контроллеры вызываются напрямую (v2.12.0, фасады удалены).
+    a._make_flow_fakes()
     return a
 
 
@@ -261,8 +257,8 @@ def test_preview_contract_debounces(app, flow):
     assert ms == DocumentPageController.PREVIEW_DELAY_MS == 120
     assert app._preview_contract_after == token
     # Перерисовка планируется через атрибут приложения — маршрут подмен сохранён:
-    # колбэк резолвится из app._render_contract_preview на каждый вызов.
-    assert fn is app._render_contract_preview
+    # колбэк — собственный метод контроллера.
+    assert fn == flow.render_contract_preview  # bound-методы равны при том же instance
 
 
 def test_render_contract_preview_without_party(app, flow):
@@ -312,7 +308,7 @@ def test_render_contract_preview_error_is_honest(app, flow, store, ooo_fields):
     def broken(data, is_ip):
         raise RuntimeError("шаблон недоступен")
 
-    app._render_contract_docx = broken
+    app._doc_save_flow.render_contract_docx = broken
     flow.render_contract_preview()
 
     assert "Не удалось собрать предпросмотр" in app.contract_preview.get("1.0", "end")
@@ -379,7 +375,7 @@ def test_render_additional_preview_error_is_honest(app, flow, store, ooo_fields)
     def broken(data, is_ip, number, limit_display, term):
         raise RuntimeError("шаблон недоступен")
 
-    app._render_additional_docx = broken
+    app._doc_save_flow.render_additional_docx = broken
     flow.render_additional_preview()
 
     assert "Не удалось собрать предпросмотр" in app.addl_preview.get("1.0", "end")
@@ -502,99 +498,17 @@ def test_update_limit_words_garbage(app, flow):
 
 
 # --------------------------------------------------------------------------- #
-#  Фасады ContractApp делегируют контроллеру
+#  Привязка трасс: методы контроллера напрямую (v2.12.0)
 # --------------------------------------------------------------------------- #
-class RecordingFlow:
-    def __init__(self):
-        self.calls: list = []
-
-    def _record(self, name, *args):
-        self.calls.append((name, *args))
-        return "recorded"
-
-    def build_contract_page(self):
-        return self._record("build_contract_page")
-
-    def preview_contract(self, *args):
-        return self._record("preview_contract", *args)
-
-    def render_contract_preview(self):
-        return self._record("render_contract_preview")
-
-    def find_party_by_inn(self):
-        return self._record("find_party_by_inn")
-
-    def build_additional_page(self):
-        return self._record("build_additional_page")
-
-    def preview_additional(self, *args):
-        return self._record("preview_additional", *args)
-
-    def render_additional_preview(self):
-        return self._record("render_additional_preview")
-
-    def on_addl_party_changed(self, *args):
-        return self._record("on_addl_party_changed", *args)
-
-    def update_words(self, *args):
-        return self._record("update_words", *args)
-
-    def format_limit(self, *args):
-        return self._record("format_limit", *args)
-
-    def update_limit_words(self):
-        return self._record("update_limit_words")
-
-
-def make_facade_app():
-    flow = RecordingFlow()
-    return SimpleNamespace(_doc_page_flow=flow), flow
-
-
-def test_facade_contract_page_delegates():
-    app, flow = make_facade_app()
-
-    main.ContractApp._build_contract_page(app)
-    main.ContractApp._preview_contract(app, "evt")
-    main.ContractApp._render_contract_preview(app)
-    main.ContractApp._find_party_by_inn(app)
-
-    names = [call[0] for call in flow.calls]
-    assert names == [
-        "build_contract_page", "preview_contract",
-        "render_contract_preview", "find_party_by_inn",
-    ]
-    assert flow.calls[1][1] == "evt"
-
-
-def test_facade_additional_page_delegates():
-    app, flow = make_facade_app()
-
-    main.ContractApp._build_additional_page(app)
-    main.ContractApp._preview_additional(app, "evt")
-    main.ContractApp._render_additional_preview(app)
-    main.ContractApp._on_addl_party_changed(app, "evt")
-    main.ContractApp._update_words(app, "evt")
-    main.ContractApp._format_limit(app, "evt")
-    main.ContractApp._update_limit_words(app)
-
-    names = [call[0] for call in flow.calls]
-    assert names == [
-        "build_additional_page", "preview_additional",
-        "render_additional_preview", "on_addl_party_changed",
-        "update_words", "format_limit", "update_limit_words",
-    ]
-
-
-def test_facade_traces_use_app_methods():
-    """Трассы переменных привязаны к фасадам ContractApp (маршрут подмен)."""
+def test_traces_bind_controller_methods():
+    """Трассы переменных привязаны к собственным методам контроллера."""
     import inspect
 
     src = inspect.getsource(dpc.DocumentPageController.build_contract_page)
-    assert "app._preview_contract" in src
-    assert "app._find_party_by_inn" in src
+    assert 'trace_add("write", self.preview_contract)' in src
+    assert "self.find_party_by_inn" in src
     src_addl = inspect.getsource(dpc.DocumentPageController.build_additional_page)
-    assert "app._on_addl_party_changed" in src_addl
-    assert "app._preview_additional" in src_addl
-    assert "app._update_words" in src_addl
-    assert "app._format_limit" in src_addl
+    assert 'trace_add("write", self.on_addl_party_changed)' in src_addl
+    assert 'trace_add("write", self.preview_additional)' in src_addl
+    assert 'trace_add("write", self.update_words)' in src_addl
+    assert 'trace_add("write", self.format_limit)' in src_addl

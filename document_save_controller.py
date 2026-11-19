@@ -111,7 +111,7 @@ class DocumentSaveController:
         )
         card.wide(app.spec_party_combo, pady=(int(2 * app.scale), int(10 * app.scale)))
         app.spec_party_var.trace_add("write", self.on_spec_party_changed)
-        app.spec_party_var.trace_add("write", lambda *_: app._on_party_selected("spec"))
+        app.spec_party_var.trace_add("write", lambda *_: app._doc_context_flow.on_party_selected("spec"))
 
         # -- Договор-основание -------------------------------------------- #
         card = ui.Card(left, labels_above=True)
@@ -136,7 +136,7 @@ class DocumentSaveController:
             pady=(int(2 * app.scale), int(2 * app.scale)),
         )
         app.spec_contract_var.trace_add("write", self.regenerate_spec)
-        app.spec_contract_var.trace_add("write", lambda *_: app._update_contract_info("spec"))
+        app.spec_contract_var.trace_add("write", lambda *_: app._doc_context_flow.update_contract_info("spec"))
         app.spec_contract_var.trace_add("write",
                                         lambda *_: app._on_doc_field_changed("spec", F.NUMBER))
 
@@ -241,10 +241,10 @@ class DocumentSaveController:
 
     def on_spec_party_changed(self, *_args):
         app = self.app
-        rec = app._party_from_var(app.spec_party_var)
+        rec = app._doc_context_flow.party_from_var(app.spec_party_var)
         contracts = app.store.contracts_for(rec["id"]) if rec else []
         if contracts:
-            values = [app._contract_display(c) for c in contracts]
+            values = [app._doc_context_flow.contract_display(c) for c in contracts]
         else:
             values = ["— нет сохранённых договоров —"]
         app.spec_contract_combo.set_values(values)
@@ -283,13 +283,13 @@ class DocumentSaveController:
         пределы папки документов.
         """
         app = self.app
-        base = app._documents_dir(interactive=interactive)
+        base = app._settings_flow.documents_dir(interactive=interactive)
         if party_rec is None:
             return base
         folder = safe_filename(storage.display_name(party_rec), "Контрагент")
         path = os.path.normpath(os.path.join(base, folder))
         if (
-            not app._is_inside_directory(base, path)
+            not app._settings_flow.is_inside_directory(base, path)
             or os.path.normcase(path) == os.path.normcase(os.path.normpath(base))
         ):
             app._log.error(
@@ -403,11 +403,11 @@ class DocumentSaveController:
         import main  # поздний импорт: печатные настройки main.get_spec_settings
 
         app._spec_preview_after = None
-        party = app._party_from_var(app.spec_party_var)
+        party = app._doc_context_flow.party_from_var(app.spec_party_var)
         if party is None:
             app._set_text(app.spec_text, "Выберите контрагента и договор-основание слева.")
             return
-        contract = app._contract_from_var(app.spec_contract_var, party["id"])
+        contract = app._doc_context_flow.contract_from_var(app.spec_contract_var, party["id"])
         data = dict(party.get("fields", {}))
 
         lines: list[str] = []
@@ -415,7 +415,7 @@ class DocumentSaveController:
         if contract is not None:
             lines.append(
                 f"Приложение № {spec['spec_appendix_number']} к Договору поставки "
-                f"{app._contract_display(contract)}"
+                f"{app._doc_context_flow.contract_display(contract)}"
             )
         lines.append("")
         number = app.spec_number_var.get().strip() or "б/н"
@@ -506,7 +506,7 @@ class DocumentSaveController:
     def save_contract(self):
         app = self.app
         try:
-            rec = app._party_from_var(app.contract_party_var)
+            rec = app._doc_context_flow.party_from_var(app.contract_party_var)
             if rec is None:
                 ui.alert(app.root, "Контрагент не выбран",
                          "Выберите контрагента из списка или добавьте нового "
@@ -557,8 +557,8 @@ class DocumentSaveController:
                 self.persist_document_result_alert(result)
                 return
             path = result["path"]
-            app._reset_form_baseline("contract")
-            app.refresh_registry()
+            app._doc_context_flow.reset_form_baseline("contract")
+            app._registry_flow.refresh()
             app._update_status()
             opened = app._open_file(path)
             app._notify(
@@ -573,12 +573,12 @@ class DocumentSaveController:
     def save_additional(self):
         app = self.app
         try:
-            party = app._party_from_var(app.addl_party_var)
+            party = app._doc_context_flow.party_from_var(app.addl_party_var)
             if party is None:
                 ui.alert(app.root, "Контрагент не выбран",
                          "Выберите контрагента из списка слева.", "error")
                 return
-            contract = app._contract_from_var(app.addl_contract_var, party["id"])
+            contract = app._doc_context_flow.contract_from_var(app.addl_contract_var, party["id"])
             if contract is None:
                 ui.alert(app.root, "Договор не выбран",
                          "Выберите договор-основание. Если договоров нет — создайте "
@@ -637,8 +637,8 @@ class DocumentSaveController:
                 self.persist_document_result_alert(result)
                 return
             path = result["path"]
-            app._reset_form_baseline("additional")
-            app.refresh_registry()
+            app._doc_context_flow.reset_form_baseline("additional")
+            app._registry_flow.refresh()
             app._update_status()
             opened = app._open_file(path)
             app._notify(
@@ -653,12 +653,12 @@ class DocumentSaveController:
     def save_spec(self):
         app = self.app
         try:
-            party = app._party_from_var(app.spec_party_var)
+            party = app._doc_context_flow.party_from_var(app.spec_party_var)
             if party is None:
                 ui.alert(app.root, "Контрагент не выбран",
                          "Выберите контрагента из списка слева.", "error")
                 return
-            contract = app._contract_from_var(app.spec_contract_var, party["id"])
+            contract = app._doc_context_flow.contract_from_var(app.spec_contract_var, party["id"])
             if contract is None:
                 ui.alert(app.root, "Договор не выбран",
                          "Выберите договор-основание. Если договоров нет — создайте "
@@ -733,8 +733,8 @@ class DocumentSaveController:
                 self.persist_document_result_alert(result)
                 return
             path = result["path"]
-            app._reset_form_baseline("spec")
-            app.refresh_registry()
+            app._doc_context_flow.reset_form_baseline("spec")
+            app._registry_flow.refresh()
             app._update_status()
             opened = app._open_file(path)
             app._notify(

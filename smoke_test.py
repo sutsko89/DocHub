@@ -23,6 +23,7 @@ os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "dogovor_smoke_appda
 
 import main as m
 import reconcile
+import settings_controller
 import storage
 import document_importer as di
 from docx import Document as _Doc
@@ -171,9 +172,9 @@ if sys.platform == "win32":
     _path_base, _path_inside, _path_outside = r"C:\docs", r"C:\docs\party", r"C:\other"
 else:
     _path_base, _path_inside, _path_outside = "/docs", "/docs/party", "/other"
-check(m.ContractApp._is_inside_directory(_path_base, _path_inside),
+check(settings_controller.SettingsController.is_inside_directory(_path_base, _path_inside),
       "пути: вложенная папка разрешена")
-check(not m.ContractApp._is_inside_directory(_path_base, _path_outside),
+check(not settings_controller.SettingsController.is_inside_directory(_path_base, _path_outside),
       "пути: выход за папку документов запрещён")
 
 # ---------- Хранилище ----------
@@ -800,7 +801,7 @@ try:
                 _inn_widget.delete(0, "end")
                 _inn_widget.insert(0, "312301234567")
                 ALERTS.clear()
-                app._cp_fill_from_inn()
+                app._dadata_flow.fill_from_inn()
                 for _ in range(60):
                     app.root.update()
                     time.sleep(0.02)
@@ -852,26 +853,26 @@ try:
 
         # Первый импорт «выполняется»: второй запуск (как при drag-and-drop)
         # обязан быть заблокирован, не сбрасывая состояние очереди.
-        app._import_running = True
-        app._import_queue = None
-        app._import_win = None
-        app._start_documents_import([_guard_docx])
+        app._import_flow.running = True
+        app._import_flow.queue = None
+        app._import_flow.win = None
+        app._import_flow.start([_guard_docx])
         check(len(_guard_threads) == _threads_before
-              and app._import_queue is None and app._import_win is None,
+              and app._import_flow.queue is None and app._import_flow.win is None,
               "импорт: повторный запуск во время первого заблокирован, "
               "очередь первого не тронута")
-        app._import_running = False
+        app._import_flow.running = False
 
-        app._start_documents_import([])
+        app._import_flow.start([])
         check(len(_guard_threads) == _threads_before,
               "импорт: пустой список файлов не запускает воркер")
 
         # Повторный клик «Заполнить по ИНН» при активном запросе игнорируется.
-        app._cp_busy = True
-        app._cp_fill_from_inn()
-        check(len(_guard_threads) == _threads_before and app._cp_busy,
+        app._dadata_flow.busy = True
+        app._dadata_flow.fill_from_inn()
+        check(len(_guard_threads) == _threads_before and app._dadata_flow.busy,
               "dadata: повторный клик при активном запросе не порождает воркера")
-        app._cp_busy = False
+        app._dadata_flow.busy = False
     finally:
         m.threading.Thread = _guard_thread_orig
         ALERTS.clear()
@@ -879,7 +880,7 @@ try:
 
 
     # Контрагент появляется в списке страницы договора.
-    app._refresh_party_combo_values()
+    app._doc_context_flow.refresh_party_combo_values()
     app.root.update()
     app.contract_party_var.set(storage.display_with_inn(party_rec))
     app.root.update()
@@ -889,12 +890,12 @@ try:
     app.contract_day_var.set("12")
     app.contract_month_var.set("января")
     app.root.update()
-    app._render_contract_preview()
+    app._doc_page_flow.render_contract_preview()
     check("Ромашка" in app.contract_preview.get("1.0", "end"),
           "предпросмотр договора: данные контрагента видны")
     data = dict(party_rec["fields"])
     data.update({m.F.NUMBER: "5", m.F.DAY: "12", m.F.MONTH: "января"})
-    doc = app._render_contract_docx(data, is_ip=False)
+    doc = app._doc_save_flow.render_contract_docx(data, is_ip=False)
     contract_text = "\n".join(p.text for p in doc.paragraphs)
     check("ООО Ромашка" in contract_text and "Иванов" in contract_text,
           "печатная форма договора: данные контрагента подставлены")
@@ -907,26 +908,26 @@ try:
     _cached = m._TEMPLATE_CACHE.get(m.resource_path("dogovor_template.docx"))
     check(_cached is not None and _cached[0] > 0,
           "5.5: в кэше шаблона хранятся mtime и разобранный Document")
-    _doc_again = app._render_contract_docx(data, is_ip=False)
+    _doc_again = app._doc_save_flow.render_contract_docx(data, is_ip=False)
     check("{{" not in "\n".join(p.text for p in _doc_again.paragraphs),
           "5.5: повторный рендер из кэша даёт чистый документ без {{...}}")
 
-    app.save_contract()
+    app._doc_save_flow.save_contract()
     check(len(app.store.documents) == 1 and app.store.documents[0]["kind"] == storage.KIND_CONTRACT,
           "договор сохранён в реестре")
 
     _saved_doc = app.store.documents[0]
-    check(app._import_document_is_duplicate(party_rec["id"], {
+    check(app._import_flow.document_is_duplicate(party_rec["id"], {
         "kind": _saved_doc["kind"],
         "number": _saved_doc["number"],
         "date": _saved_doc["date"],
     }), "импорт: повторный документ распознан как дубль")
-    check(not app._import_document_is_duplicate(party_rec["id"], {
+    check(not app._import_flow.document_is_duplicate(party_rec["id"], {
         "kind": _saved_doc["kind"],
         "number": "999",
         "date": _saved_doc["date"],
     }), "импорт: другой номер — не дубль")
-    check(not app._import_document_is_duplicate(party_rec["id"], {
+    check(not app._import_flow.document_is_duplicate(party_rec["id"], {
         "kind": storage.KIND_SPEC, "number": "", "date": "",
     }), "импорт: без номера и даты дубль не определяется")
 
@@ -938,7 +939,7 @@ try:
     app.addl_party_var.set(storage.display_with_inn(party_rec))
     app.root.update()
     check("№ 5" in app.addl_contract_var.get(), f"список договоров: {app.addl_contract_var.get()!r}")
-    doc2 = app._render_additional_docx(data, is_ip=False, number="1",
+    doc2 = app._doc_save_flow.render_additional_docx(data, is_ip=False, number="1",
                                        limit_display="1 500 000", term="45")
     additional_text = "\n".join(p.text for p in doc2.paragraphs)
     check("Ромашка" in additional_text and "№ 1" in additional_text,
@@ -950,10 +951,10 @@ try:
     check("пятьсот тысяч" in app.limit_words_label.cget("text"), "лимит прописью")
     app.term_var.set("45")
     check("сорок пять" in app.words_label.cget("text"), "срок прописью")
-    app._render_additional_preview()
+    app._doc_page_flow.render_additional_preview()
     check("Ромашка" in app.addl_preview.get("1.0", "end"),
           "предпросмотр доп. соглашения: данные контрагента видны")
-    app.save_additional()
+    app._doc_save_flow.save_additional()
     check(sum(1 for d in app.store.documents if d["kind"] == storage.KIND_ADDITIONAL) == 1,
           "доп. соглашение сохранено в реестре")
 
@@ -966,14 +967,14 @@ try:
     app.root.update()
     app.spec_number_var.set("1")
     app.spec_day_var.set("20")
-    row = app._spec_rows[0]
+    row = app._doc_save_flow.spec_rows[0]
     row["name"].set("Товар")
     row["qty"].set("10")
     row["unit"].set("шт.")
     row["price"].set("100")
     app.root.update()
     # 5.6: предпросмотр спецификации отложен — дособираем его синхронно.
-    app._flush_spec_preview()
+    app._doc_save_flow.flush_spec_preview()
     spec_text = app.spec_text.get("1.0", "end")
     check("СПЕЦИФИКАЦИЯ № 1" in spec_text, "заголовок спецификации")
     check("1 000" in spec_text, "итог спецификации посчитан")
@@ -985,13 +986,13 @@ try:
     app.spec_delivery_term_var.set("45")
     check(getattr(app, "_spec_preview_after", None) is not None,
           "5.6: изменение поля планирует отложенную пересборку предпросмотра")
-    app._flush_spec_preview()
+    app._doc_save_flow.flush_spec_preview()
     check("отсрочка" in app.spec_text.get("1.0", "end").lower()
           or "45" in app.spec_text.get("1.0", "end"),
           "5.6: flush дособирает предпросмотр актуальным текстом")
     app.spec_delivery_term_var.set("")
-    app._flush_spec_preview()
-    app.save_spec()
+    app._doc_save_flow.flush_spec_preview()
+    app._doc_save_flow.save_spec()
     check(sum(1 for d in app.store.documents if d["kind"] == storage.KIND_SPEC) == 1,
           "спецификация сохранена в реестре")
 
@@ -1034,7 +1035,7 @@ try:
         },
         "text": "",
     }
-    _ip_doc = app._render_spec_docx(_ip_spec_rec)
+    _ip_doc = app._doc_save_flow.render_spec_docx(_ip_spec_rec)
     check("{{" not in _doc_full_text(_ip_doc),
           "спецификация ИП: в документе нет незаполненных {{...}}")
     _ip_buyer = next(
@@ -1053,7 +1054,7 @@ try:
 
     # Печатная форма ООО не пострадала (КПП и ОГРН на месте).
     _ooo_spec_rec = next(d for d in app.store.documents if d["kind"] == storage.KIND_SPEC)
-    _ooo_text = _doc_full_text(app._render_spec_docx(_ooo_spec_rec))
+    _ooo_text = _doc_full_text(app._doc_save_flow.render_spec_docx(_ooo_spec_rec))
     check("{{" not in _ooo_text, "спецификация ООО: нет незаполненных {{...}}")
     check("770101001" in _ooo_text and "1037739010221" in _ooo_text,
           "спецификация ООО: КПП и ОГРН подставлены как раньше")
@@ -1096,13 +1097,13 @@ try:
     _tmp_copied = os.path.join(tempfile.gettempdir(), "smoke_import_copy.docx")
     with open(_tmp_copied, "wb") as _fh:
         _fh.write(b"stub")
-    _orig_report = app._show_import_report
-    _orig_ask = app._ask_import_party
-    app._show_import_report = lambda entries, summary: None
-    app._ask_import_party = lambda result: (party_rec, "attach")
+    _orig_report = app._import_flow.show_report
+    _orig_ask = app._import_flow.ask_party
+    app._import_flow.show_report = lambda entries, summary: None
+    app._import_flow.ask_party = lambda result: (party_rec, "attach")
     try:
         _parties_before = len(app.store.counterparties)
-        app._finish_documents_import([{
+        app._import_flow.finish([{
             "name": "Импорт без ИНН.docx",
             "kind": storage.KIND_ADDITIONAL,
             "number": "77",
@@ -1125,8 +1126,8 @@ try:
         check(len(app.store.counterparties) == _parties_before,
               "импорт: карточка-дубль не создана")
     finally:
-        app._show_import_report = _orig_report
-        app._ask_import_party = _orig_ask
+        app._import_flow.show_report = _orig_report
+        app._import_flow.ask_party = _orig_ask
         try:
             os.remove(_tmp_copied)
         except OSError:
@@ -1143,20 +1144,20 @@ try:
     app.root.clipboard_append("Болт М8\t5\tшт.\t200\nГайка М10\t12\tшт.\t50\n\n")
     check(app.spec_table._paste_block((0, 0)), "таблица: блок из буфера вставлен")
     app.root.update()
-    items = app._spec_items()
+    items = app._doc_save_flow.spec_items()
     check(len(items) == 2 and items[0]["name"] == "Болт М8" and items[1]["qty"] == 12,
           "таблица: строки из буфера попали в позиции")
-    app._flush_spec_preview()
+    app._doc_save_flow.flush_spec_preview()
     check("1 600" in app.spec_text.get("1.0", "end"), "таблица: итог пересчитан после вставки")
-    check(len(app._spec_rows) == 10, "таблица: стартовое количество строк — 10")
+    check(len(app._doc_save_flow.spec_rows) == 10, "таблица: стартовое количество строк — 10")
 
     # Задание точного количества строк.
     app.spec_table.set_row_count(20)
     app.root.update()
-    check(len(app._spec_rows) == 20, "таблица: количество строк задано полем «Строк»")
+    check(len(app._doc_save_flow.spec_rows) == 20, "таблица: количество строк задано полем «Строк»")
     app.spec_table.set_row_count(4)
-    check(len(app._spec_rows) == 4, "таблица: лишние строки удаляются")
-    check(app._spec_rows[-1]["num"].cget("text") == "4", "таблица: нумерация строк актуальна")
+    check(len(app._doc_save_flow.spec_rows) == 4, "таблица: лишние строки удаляются")
+    check(app._doc_save_flow.spec_rows[-1]["num"].cget("text") == "4", "таблица: нумерация строк актуальна")
 
     # Аудит 2.0.1: валидаторы ячеек включены флагом validate="key" — раньше
     # Tk создавал validatecommand, но никогда его не вызывал, и в «Кол-во»/
@@ -1179,16 +1180,16 @@ try:
     app.root.update()
     inner.event_generate("<Return>")
     app.root.update()
-    check(len(app._spec_rows) == 6, "таблица: количество строк применяется по Enter")
+    check(len(app._doc_save_flow.spec_rows) == 6, "таблица: количество строк применяется по Enter")
 
     # 5.4: массовое задание строк больше не O(n²) — 500 строк создаются быстро.
     _t0 = time.perf_counter()
     app.spec_table.set_row_count(500)
     _elapsed = time.perf_counter() - _t0
-    check(len(app._spec_rows) == 500, "5.4: таблица задаёт 500 строк")
+    check(len(app._doc_save_flow.spec_rows) == 500, "5.4: таблица задаёт 500 строк")
     check(_elapsed < 10.0,
           f"5.4: 500 строк создаются без O(n²) за {_elapsed:.1f} с (<10 с)")
-    check(str(app._spec_rows[0]["cells"]["name"].cget("readonlybackground")) != "",
+    check(str(app._doc_save_flow.spec_rows[0]["cells"]["name"].cget("readonlybackground")) != "",
           "5.4: после массового задания строк все строки стилизованы")
 
     # 5.4: комбобокс ограничивает число пунктов, подсветка движется точечно.
@@ -1218,10 +1219,10 @@ try:
     app.spec_table.set_row_count(4)
     app.spec_table._selected_row = 1
     app.spec_table._delete_row(1)
-    check(len(app._spec_rows) == 3 and app._spec_rows[0]["num"].cget("text") == "1"
-          and app._spec_rows[1]["num"].cget("text") == "2",
+    check(len(app._doc_save_flow.spec_rows) == 3 and app._doc_save_flow.spec_rows[0]["num"].cget("text") == "1"
+          and app._doc_save_flow.spec_rows[1]["num"].cget("text") == "2",
           "таблица: Delete удаляет выделенную строку, нумерация сдвигается")
-    check(str(app._spec_rows[0]["cells"]["name"].cget("state")) == "readonly",
+    check(str(app._doc_save_flow.spec_rows[0]["cells"]["name"].cget("state")) == "readonly",
           "таблица: ячейка доступна для правки только по двойному клику")
 
     # ---------- P1: подтверждения, диалоги, защита данных (этапы 2–4) ----------
@@ -1231,7 +1232,7 @@ try:
     _del_caps: list = []
     m.ui.confirm = lambda *args, **kwargs: _del_caps.append(args) or False
     try:
-        app._delete_document(app.store.documents[0])
+        app._lifecycle_flow.delete_document(app.store.documents[0])
     finally:
         m.ui.confirm = _orig_confirm_stub
     _del_msg = str(_del_caps[-1]) if _del_caps else ""
@@ -1247,7 +1248,7 @@ try:
     _cp_caps: list = []
     m.ui.confirm = lambda *args, **kwargs: _cp_caps.append(args) or False
     try:
-        app._delete_counterparty(party_rec)
+        app._lifecycle_flow.delete_counterparty(party_rec)
     finally:
         m.ui.confirm = _orig_confirm_stub
     _cp_msg = str(_cp_caps[-1]) if _cp_caps else ""
@@ -1263,7 +1264,7 @@ try:
     _orig_choice = app._choice_dialog
     app._choice_dialog = lambda *args, **kwargs: _choice_caps.append(args) or "retry"
     try:
-        app._resolve_unavailable_documents_dir(
+        app._settings_flow.resolve_unavailable_documents_dir(
             os.path.join(tempfile.gettempdir(), "missing_docs_dir"),
             OSError(2, "Нет такого каталога"),
         )
@@ -1291,7 +1292,7 @@ try:
     _orig_show_folder = m.show_in_folder
     m.show_in_folder = lambda path: OPENED.append(f"folder:{path}")
     try:
-        app.export_document(_lost_rec)
+        app._lifecycle_flow.export_document(_lost_rec)
     finally:
         app._choice_dialog = _orig_choice
         m.show_in_folder = _orig_show_folder
@@ -1321,21 +1322,21 @@ try:
         "text": "", "ok": True, "recognized": True,
         "copied": _dup_copy, "error": "", "warning": "",
     }
-    _orig_report = app._show_import_report
-    app._show_import_report = lambda entries, summary: None
+    _orig_report = app._import_flow.show_report
+    app._import_flow.show_report = lambda entries, summary: None
     try:
-        app._finish_documents_import([dict(_dup_result)])
+        app._import_flow.finish([dict(_dup_result)])
         _dup_card = app.store.find_by_inn("2540123456")
         check(_dup_card is not None, "3.3: карточка по ИНН создана автоматически")
         _parties_after_first = len(app.store.counterparties)
-        app._finish_documents_import([dict(_dup_result)])
+        app._import_flow.finish([dict(_dup_result)])
         check(len(app.store.counterparties) == _parties_after_first,
               "3.3: повторный импорт того же файла не плодит карточек")
         check(app.store.find_by_inn("2540123456")["id"] == _dup_card["id"],
               "3.3: документ привязан к существующей карточке")
         app.store.purge_counterparty(_dup_card["id"])
     finally:
-        app._show_import_report = _orig_report
+        app._import_flow.show_report = _orig_report
         try:
             os.remove(_dup_copy)
         except OSError:
@@ -1366,42 +1367,42 @@ try:
         return bool(_orig_store_save())
 
     app.store.save = _counting_save
-    _orig_report2 = app._show_import_report
-    app._show_import_report = lambda entries, summary: None
+    _orig_report2 = app._import_flow.show_report
+    app._import_flow.show_report = lambda entries, summary: None
     try:
         _docs_before = len(app.store.documents)
-        app._finish_documents_import(_batch_results)
+        app._import_flow.finish(_batch_results)
         check(_save_calls == [1],
               f"5.2: пакет из 30 файлов записан одним save() (раньше — 30 записей): {_save_calls}")
         check(len(app.store.documents) == _docs_before + 30,
               "5.2: все 30 документов пакета добавлены в реестр")
         check(app.store.find_by_inn("2540999887") is not None,
               "5.2: карточка контрагента из пакета создана")
-        check("_cancel_import" in _main_src and "_import_cancelled" in _main_src,
+        check("def cancel" in _app_src and "self.cancelled = True" in _app_src,
               "5.3: у импорта есть отмена «Отменить» (кнопка в окне загрузки)")
-        app._import_running = True
-        app._cancel_import()
-        check(app._import_cancelled, "5.3: после «Отменить» разбор остатка пакета прекращается")
-        app._import_running = False
-        app._import_cancelled = False
+        app._import_flow.running = True
+        app._import_flow.cancel()
+        check(app._import_flow.cancelled, "5.3: после «Отменить» разбор остатка пакета прекращается")
+        app._import_flow.running = False
+        app._import_flow.cancelled = False
     finally:
         app.store.save = _orig_store_save
-        app._show_import_report = _orig_report2
+        app._import_flow.show_report = _orig_report2
         _batch_party_rec = app.store.find_by_inn("2540999887")
         if _batch_party_rec is not None:
             app.store.purge_counterparty(_batch_party_rec["id"])
         shutil.rmtree(_batch_dir, ignore_errors=True)
 
     # 4.1: дубликаты контрагентов по ИНН и номеров документов.
-    # Создание карточки с чужим ИНН gated диалогом _cp_save (find_by_inn).
+    # Создание карточки с чужим ИНН gated диалогом save_card (find_by_inn).
     _dup_party = app.store.add_counterparty("ooo", {
         "ИНН": "7701234567",
         "Сокращенное название компании": "ООО Ромашка",
     }, save=False)
-    check(any("ООО Ромашка" in base for base in app._party_duplicate_bases()),
+    check(any("ООО Ромашка" in base for base in app._doc_context_flow.party_duplicate_bases()),
           "4.1: одинаковые карточки помечаются дубликатами в списках")
     app.store.counterparties.remove(_dup_party)
-    # _cp_save с шага 6 декомпозиции живёт в counterparty_controller —
+    # save_card с шага 6 декомпозиции живёт в counterparty_controller —
     # исходник читаем оттуда (def save_card).
     with open("counterparty_controller.py", encoding="utf-8") as _cpf:
         _cp_ctrl_src = _cpf.read()
@@ -1414,7 +1415,7 @@ try:
     _dupnum_caps: list = []
     m.ui.confirm = lambda *args, **kwargs: _dupnum_caps.append(args) or False
     try:
-        _dup_allowed = app._confirm_document_duplicate(
+        _dup_allowed = app._doc_save_flow.confirm_document_duplicate(
             party_rec["id"], storage.KIND_CONTRACT, "5", "12.01.2026",
         )
     finally:
@@ -1423,20 +1424,21 @@ try:
           "4.1: повтор номера договора требует подтверждения")
     check("уже есть" in str(_dupnum_caps[0]) and "№ 5" in str(_dupnum_caps[0]),
           "4.1: в предупреждении назван существующий документ")
-    check(app._confirm_document_duplicate(
+    check(app._doc_save_flow.confirm_document_duplicate(
         party_rec["id"], storage.KIND_CONTRACT, "555", "12.01.2026",
     ), "4.1: новый номер не требует подтверждения")
 
     # 4.2: единый «текущий контрагент» на всех страницах документов.
-    app._set_current_party(party_rec)
-    _expected_party = app._party_display(party_rec, app._party_duplicate_bases())
+    app._doc_context_flow.set_current_party(party_rec)
+    _expected_party = app._doc_context_flow.party_display(
+        party_rec, app._doc_context_flow.party_duplicate_bases())
     check(app._current_party_id == party_rec["id"],
           "4.2: текущий контрагент запомнен")
     for _attr in ("contract_party_var", "addl_party_var", "spec_party_var"):
         check(getattr(app, _attr).get() == _expected_party,
               f"4.2: выбор перенесён на {_attr}")
     app.contract_party_var.set("Несуществующий контрагент XYZ")
-    app._refresh_party_combo_values()
+    app._doc_context_flow.refresh_party_combo_values()
     check(app.contract_party_var.get() == "",
           "4.2: устаревшее имя в поле выбора сбрасывается")
 
@@ -1447,10 +1449,10 @@ try:
           "4.3: предпросмотр только для чтения")
 
     # 4.4: защита несохранённых данных.
-    check("contract" not in app._dirty_pages(),
+    check("contract" not in app._doc_context_flow.dirty_pages(),
           "4.4: сохранённая форма не считается изменённой")
     app.contract_number_var.set("999")
-    check("contract" in app._dirty_pages(),
+    check("contract" in app._doc_context_flow.dirty_pages(),
           "4.4: изменение формы фиксируется как несохранённое")
     _close_caps: list = []
     m.ui.confirm = lambda *args, **kwargs: _close_caps.append(args) or False
@@ -1463,7 +1465,7 @@ try:
           "4.4: при закрытии с изменениями запрашивается подтверждение")
     check(app.root.winfo_exists(), "4.4: после «Остаться» окно живо")
     app.contract_number_var.set("5")
-    check("contract" not in app._dirty_pages(),
+    check("contract" not in app._doc_context_flow.dirty_pages(),
           "4.4: возврат значений возвращает форме сохранённое состояние")
 
     # 4.5: быстрые UX-правки.
@@ -1503,11 +1505,11 @@ try:
     check(os.path.exists("license.txt"), "6.1: файл лицензии и уведомлений существует")
 
     # 6.2: сообщение соответствует действительности — открытие проверяется.
-    app._set_current_party(party_rec)
+    app._doc_context_flow.set_current_party(party_rec)
     m.open_file = lambda path: False
     try:
         app.contract_number_var.set("9")
-        app.save_contract()
+        app._doc_save_flow.save_contract()
     finally:
         m.open_file = lambda path: True  # возвращаем стаб успешного открытия
     app.root.update()
@@ -1516,7 +1518,7 @@ try:
           f"6.2: при неудачном открытии не обещается «открыт»: {_toast_text!r}")
     try:
         app.contract_number_var.set("10")
-        app.save_contract()
+        app._doc_save_flow.save_contract()
     finally:
         m.open_file = _real_open_file
     app.root.update()
@@ -1525,7 +1527,7 @@ try:
           f"{app.toast_label.cget('text')!r}")
 
     # 6.2: папка документов по умолчанию — видимые «Документы», а не скрытый %APPDATA%.
-    _def_dir = app._default_documents_dir(interactive=False)
+    _def_dir = app._settings_flow.default_documents_dir(interactive=False)
     check("Documents" in _def_dir and os.path.basename(_def_dir) == "EW.DocHub",
           f"6.2: папка документов по умолчанию в «Документах»: {_def_dir}")
     check(m.open_file(os.path.join(tempfile.gettempdir(), "smoke_missing_6_2.docx")) is False,
@@ -1555,7 +1557,7 @@ try:
     check("ООО Ромашка" in registry_text, "реестр: контрагент виден")
 
     # Документы в реестре появляются после выбора контрагента.
-    app._select_registry_party(party_rec)
+    app._registry_flow.select_party(party_rec)
     app.root.update()
     texts = []
     collect(app.registry_list)
@@ -1564,15 +1566,15 @@ try:
     check("Доп. соглашение" in registry_text, "реестр: доп. соглашение видно")
 
     # Поиск по ИНН в реестре.
-    app._select_registry_party(party_rec)  # снять выбор
+    app._registry_flow.select_party(party_rec)  # снять выбор
     app.registry_search_var.set("7701234567")
-    app._registry_apply_filter()
+    app._registry_flow.apply_filter()
     app.root.update()
     texts = []
     collect(app.registry_list)
     check("ООО Ромашка" in "\n".join(texts), "реестр: поиск по ИНН находит контрагента")
     app.registry_search_var.set("")
-    app._registry_apply_filter()
+    app._registry_flow.apply_filter()
 
     # 5.1: клик по контрагенту не пересоздаёт строки других контрагентов.
     _party_2 = app.store.add_counterparty("ooo", {
@@ -1580,10 +1582,10 @@ try:
         "Сокращенное название компании": "ООО Стрелка",
         "Юридический адрес": "г. Владивосток, ул. Светланская, д. 1",
     }, save=False)
-    app.refresh_registry()
+    app._registry_flow.refresh()
     _frames_before = {pid: entry["frame"] for pid, entry in app._registry_rows.items()}
     check(len(_frames_before) == 2, "5.1: в реестре два контрагента для проверки")
-    app._select_registry_party(party_rec)
+    app._registry_flow.select_party(party_rec)
     check(all(app._registry_rows[pid]["frame"] is _frames_before[pid]
               for pid in _frames_before if pid in app._registry_rows),
           "5.1: выбор контрагента не пересоздаёт строки реестра")
@@ -1596,23 +1598,23 @@ try:
             pass
     check(any("Документы" in str(_t) for _t in _docs_texts),
           "5.1: секция документов выбранного видна после частичного обновления")
-    app._select_registry_party(party_rec)  # снять выбор
+    app._registry_flow.select_party(party_rec)  # снять выбор
     check(app._registry_selected_id is None, "5.1: повторный клик снимает выбор")
     app.store.counterparties.remove(_party_2)
-    app.refresh_registry()
+    app._registry_flow.refresh()
 
     check(app.store.delete_document(app.store.documents[0]["id"]),
           "хранилище: окончательное удаление записи документа")
 
     # Удаление контрагента: теперь это перемещение в корзину (п. 2.6).
-    app._delete_counterparty(party_rec)
+    app._lifecycle_flow.delete_counterparty(party_rec)
     app.root.update()
     check(not app.store.active_counterparties() and not app.store.active_documents(),
           "корзина: контрагент и документы перемещены в корзину")
     check(bool(app.store.trashed_counterparties()) and bool(app.store.trashed_documents()),
           "корзина: записи доступны для восстановления")
 
-    app._restore_counterparty(party_rec)
+    app._lifecycle_flow.restore_counterparty(party_rec)
     app.root.update()
     check(app.store.get_counterparty(party_rec["id"]) is not None,
           "корзина: контрагент восстановлен")
@@ -1621,7 +1623,7 @@ try:
 
     # Повторное удаление и полная очистка корзины.
     _party_again = app.store.get_counterparty(party_rec["id"])
-    app._delete_counterparty(_party_again)
+    app._lifecycle_flow.delete_counterparty(_party_again)
     app.root.update()
     check(app.store.trash_count() > 0, "корзина: записи снова в корзине")
     app.store.purge_all_trash()

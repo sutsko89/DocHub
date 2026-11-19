@@ -19,6 +19,7 @@ smoke-тестом под Xvfb; здесь проверяется логика �
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -78,21 +79,18 @@ class FakeApp:
         self.choice_calls: list = []
         self.choice_result = "skip"
         self.docs_dir = "/tmp/registry-tests-docs"
-
-    def refresh_registry(self):
-        self.calls.append("registry")
-
-    def _set_current_party(self, rec):
-        self.calls.append(("set_party", rec.get("id")))
+        # Соседние контроллеры вызываются напрямую (v2.12.0, фасады удалены):
+        # записывающие фейки.
+        self._doc_context_flow = SimpleNamespace(
+            set_current_party=lambda rec, source=None: self.calls.append(
+                ("set_party", rec.get("id"))),
+            refresh_party_combo_values=lambda: self.calls.append("combo"),
+        )
+        self._settings_flow = SimpleNamespace(
+            documents_dir=lambda interactive=True: self.docs_dir)
 
     def _update_status(self):
         self.calls.append("status")
-
-    def _refresh_party_combo_values(self):
-        self.calls.append("combo")
-
-    def _documents_dir(self, interactive=True):
-        return self.docs_dir
 
     def _choice_dialog(self, *args):
         self.choice_calls.append(args)
@@ -117,7 +115,11 @@ def ui_alerts(monkeypatch):
 
 @pytest.fixture()
 def flow(app):
-    return RegistryController(app)
+    controller = RegistryController(app)
+    # Перерисовка реестра требует живого Tk-рендера: в юнит-тестах она
+    # заменяется записывающей подменой (GUI-путь покрывает smoke-тест).
+    controller.refresh = lambda *a, **kw: app.calls.append("registry")
+    return controller
 
 
 def make_party(inn="7701234567", short="ООО Ромашка", ptype="ooo"):
@@ -380,46 +382,3 @@ def test_reconcile_dialog_skip_choice_does_nothing(app, flow, monkeypatch):
 
     assert app.choice_calls, "диалог открывается"
     assert app.calls == [], "без выбора пользователя ничего не происходит"
-
-
-# --------------------------------------------------------------------------- #
-#  Фасады ContractApp
-# --------------------------------------------------------------------------- #
-class RecordingFlow:
-    def __init__(self):
-        self.calls: list = []
-
-    def build_page(self):
-        self.calls.append("build_page")
-
-    def refresh(self):
-        self.calls.append("refresh")
-
-    def apply_filter(self):
-        self.calls.append("apply_filter")
-
-    def select_party(self, rec):
-        self.calls.append(("select_party", rec))
-
-    def scan_consistency(self):
-        self.calls.append("scan_consistency")
-
-
-def test_facades_delegate_to_controller():
-    """Зеркало smoke-вызовов: app.refresh_registry/_registry_apply_filter/…"""
-    import main
-
-    app = object.__new__(main.ContractApp)
-    flow = RecordingFlow()
-    app._registry_flow = flow
-
-    app._build_registry_page()
-    app.refresh_registry()
-    app._registry_apply_filter()
-    app._select_registry_party({"id": 1})
-    app._scan_documents_consistency()
-
-    assert flow.calls == [
-        "build_page", "refresh", "apply_filter",
-        ("select_party", {"id": 1}), "scan_consistency",
-    ]

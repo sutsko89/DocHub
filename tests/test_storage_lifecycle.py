@@ -1,11 +1,10 @@
-"""Жизненный цикл реестра: корзина, бэкапы, поиск, вспомогательные функции.
+"""Жизненный цикл реестра: корзина, запись, поиск, вспомогательные функции.
 
 Добивает покрытие storage.py до цели плана (≥ 70 %) и фиксирует поведение
-корзины (п. 2.5–2.6) и ротации копий (п. 2.1) на уровне pytest.
+корзины (п. 2.5–2.6) и записи в SQLite (п. 11 этапа 5) на уровне pytest.
 """
 from __future__ import annotations
 
-import glob
 import os
 
 import storage
@@ -90,16 +89,15 @@ def test_cleanup_trash_respects_retention(store):
     assert store.get_document(fresh["id"], include_deleted=True) is not None
 
 
-# ---------- Ротация копий (п. 2.1) ----------
+# ---------- Запись в базу (п. 11 этапа 5) ----------
 
-def test_save_rotates_backup_copies(appdata):
+def test_save_creates_sqlite_without_legacy_json(appdata):
     store = storage.DataStore()
-    for number in range(1, 8):  # больше, чем хранится копий
+    for number in range(1, 4):
         store.add_counterparty("ooo", {"ИНН": f"25401234567{number}"})
-    db_dir = os.path.dirname(storage.db_path())
-    backups = glob.glob(os.path.join(db_dir, "database.json.bak*"))
-    assert backups, "копии .bak не создаются при записи"
-    assert len(backups) <= 6  # .bak + .bak.1..4 (5) — старшие затираются
+    assert os.path.exists(storage.db_path()), "реестр записан в базу SQLite"
+    assert not os.path.exists(storage.legacy_json_path()), \
+        "JSON больше не пишется: источник правды — SQLite"
 
 
 def test_save_returns_true_and_no_error(appdata):

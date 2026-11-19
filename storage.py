@@ -1,20 +1,24 @@
 """Хранилище данных программы: контрагенты и созданные документы.
 
-Данные хранятся в одном JSON-файле в профиле пользователя
-(%APPDATA%/DogovorGenerator/database.json), поэтому работают и в
-разработке, и внутри собранного PyInstaller .exe.
+Реестр ведётся в SQLite-базе в профиле пользователя
+(%APPDATA%/DogovorGenerator/database.db), поэтому работают и в разработке,
+и внутри собранного PyInstaller .exe (п. 11 этапа 5 плана).
 
-Структура записей:
+    * WAL-журнал: чтение не блокирует запись, второй экземпляр программы
+      безопасно работает параллельно (busy_timeout, транзакции);
+    * каждая запись — строка таблицы, есть индексы: по ИНН
+      (counterparties.inn), по контрагенту и типу документа (documents);
+    * запись идёт одной транзакцией: либо весь реестр, либо ничего —
+      при сбое предыдущая версия базы не теряется;
+    * при временных сбоях (антивирус, индексатор) — до 3 попыток;
+    * старый JSON-реестр database.json переносится в базу при первом
+      запуске и сохраняется как database.json.migrated.
+
+Структура записей в памяти не изменилась:
     контрагент: {"id", "type": "ooo"|"ip", "fields": {...}, "created_at"}
     документ:   {"id", "kind": "contract"|"additional"|"spec",
                  "party_id", "number", "date", "data": {...},
                  "extra": {...}, "text", "created_at"}
-
-Надёжность записи (п. 2.1 плана):
-    * запись идёт в уникальный ``database.json.<pid>.tmp`` с ``fsync``;
-    * предыдущая версия сохраняется в ``database.json.bak`` (до 5 копий);
-    * при временных ``OSError`` (антивирус, индексатор) — до 3 попыток;
-    * в файле хранится ``schema_version``.
 
 Корзина (п. 2.6): удаление помечает запись полем ``deleted_at``, а не стирает
 её. Восстановление снимает метку, окончательная очистка удаляет физически.
@@ -25,7 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
+import sqlite3
 import time
 from datetime import datetime, timedelta
 
@@ -33,12 +37,16 @@ import applog
 
 SETTINGS_DIR_NAME = "DogovorGenerator"
 
-SCHEMA_VERSION = 2
-BACKUP_COUNT = 5          # database.json.bak + .bak.1 … .bak.4
+DB_FILENAME = "database.db"              # источник правды (SQLite)
+LEGACY_JSON_FILENAME = "database.json"   # реестр прежних версий (только чтение)
+
+SQLITE_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2              # схема старого JSON-реестра (для переноса)
+BUSY_TIMEOUT_SECONDS = 5.0      # ждём освобождения базы вместо мгновенного сбоя
 SAVE_RETRIES = 3
 RETRY_DELAY_SECONDS = 0.25
 TRASH_RETENTION_DAYS = 30
-BAD_COPY_RETENTION_DAYS = 30   # сколько дней хранить database.json.bad-* (аудит 2.0.1)
+BAD_COPY_RETENTION_DAYS = 30   # сколько дней хранить database.db.bad-*
 
 KIND_CONTRACT = "contract"
 KIND_ADDITIONAL = "additional"
@@ -52,6 +60,54 @@ KIND_LABELS = {
     KIND_UNKNOWN: "Неопознанный документ",
 }
 
+# Ключи записи, у которых в базе есть собственные колонки. Всё остальное
+# (запас на будущее) сохраняется в колонке extra_keys как JSON — перенос
+# в обе стороны не теряет ни одного ключа.
+_PARTY_KEYS = ("id", "type", "fields", "created_at", "deleted_at")
+_DOCUMENT_KEYS = ("id", "kind", "party_id", "number", "date", "data", "extra",
+                  "text", "created_at", "deleted_at", "deleted_with_party")
+
+_SCHEMA_SQL = (
+    """
+    CREATE TABLE IF NOT EXISTS counterparties (
+        id         INTEGER PRIMARY KEY,
+        type       TEXT NOT NULL DEFAULT '',
+        fields     TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT '',
+        deleted_at TEXT,
+        inn        TEXT NOT NULL DEFAULT '',
+        extra_keys TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_counterparties_inn ON counterparties(inn)",
+    "CREATE INDEX IF NOT EXISTS idx_counterparties_deleted ON counterparties(deleted_at)",
+    """
+    CREATE TABLE IF NOT EXISTS documents (
+        id                 INTEGER PRIMARY KEY,
+        kind               TEXT NOT NULL DEFAULT '',
+        party_id           INTEGER,
+        number             TEXT NOT NULL DEFAULT '',
+        date               TEXT NOT NULL DEFAULT '',
+        data               TEXT NOT NULL DEFAULT '{}',
+        extra              TEXT NOT NULL DEFAULT '{}',
+        text               TEXT NOT NULL DEFAULT '',
+        created_at         TEXT NOT NULL DEFAULT '',
+        deleted_at         TEXT,
+        deleted_with_party INTEGER NOT NULL DEFAULT 0,
+        extra_keys         TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_documents_party ON documents(party_id)",
+    "CREATE INDEX IF NOT EXISTS idx_documents_kind ON documents(kind, party_id)",
+    "CREATE INDEX IF NOT EXISTS idx_documents_deleted ON documents(deleted_at)",
+    """
+    CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """,
+)
+
 
 def data_dir() -> str:
     """Каталог данных программы (создаётся при необходимости)."""
@@ -62,11 +118,27 @@ def data_dir() -> str:
 
 
 def db_path() -> str:
-    return os.path.join(data_dir(), "database.json")
+    return os.path.join(data_dir(), DB_FILENAME)
+
+
+def legacy_json_path() -> str:
+    """Старый JSON-реестр: читается один раз для переноса в базу."""
+    return os.path.join(data_dir(), LEGACY_JSON_FILENAME)
+
+
+def _connect_db(path: str) -> sqlite3.Connection:
+    """Открывает базу: WAL (параллельное чтение), FULL-синхронизация, схема."""
+    conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_SECONDS)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
+    for statement in _SCHEMA_SQL:
+        conn.execute(statement)
+    conn.commit()
+    return conn
 
 
 def _safe_int(value, default: int = 0) -> int:
-    """Безопасно приводит значение из JSON к int (null/строка не роняют запуск)."""
+    """Безопасно приводит значение к int (null/строка не роняют запуск)."""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -88,13 +160,18 @@ def active_records(records: list[dict]) -> list[dict]:
 
 
 class DataStore:
-    """Простое JSON-хранилище контрагентов и документов."""
+    """SQLite-хранилище контрагентов и документов.
+
+    В памяти реестр выглядит как раньше — два списка словарей
+    (``counterparties`` и ``documents``); на диск он целиком пишется
+    одной транзакцией в database.db.
+    """
 
     def __init__(self):
         self.counterparties: list[dict] = []
         self.documents: list[dict] = []
         self._seq = 1
-        self.schema_version = SCHEMA_VERSION
+        self.schema_version = SQLITE_SCHEMA_VERSION
         # Причина последней неудачной записи: UI обязан проверять её перед
         # сообщением «сохранено».
         self.last_error = ""
@@ -111,154 +188,293 @@ class DataStore:
         self._purge_stale_bad_copies(path)
         try:
             with applog.timed("Чтение реестра", 500, "storage"):
-                with open(path, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-        except FileNotFoundError:
-            log.info("Файл реестра не найден — создан пустой реестр")
-            return  # первый запуск — пустой реестр
-        except (OSError, ValueError) as exc:
-            data = self._recover_from_broken_file(path, exc)
-            if data is None:
-                return
-
-        if not isinstance(data, dict):
+                conn = _connect_db(path)
+                try:
+                    parties, documents, seq = self._read_all(conn)
+                finally:
+                    conn.close()
+        except sqlite3.DatabaseError as exc:
+            if self._quarantine_corrupt_db(path, exc):
+                return  # повреждённая база убрана в .bad, предупреждение выставлено
             self.load_warning = (
-                "Файл реестра имеет неверную структуру и не был загружен.\n"
-                f"Путь: {path}"
+                "Не удалось прочитать реестр — программа запущена с пустым "
+                f"реестром.\nОшибка: {exc}\nПуть: {path}"
             )
+            log.error("Реестр не прочитан: %s", type(exc).__name__)
+            return
+        except OSError as exc:
+            self.load_warning = (
+                "Не удалось открыть базу реестра — программа запущена с "
+                f"пустым реестром.\nОшибка: {exc}\nПуть: {path}"
+            )
+            log.error("База реестра не открыта: %s", type(exc).__name__)
             return
 
-        raw_parties = data.get("counterparties", [])
-        raw_documents = data.get("documents", [])
-        if not isinstance(raw_parties, list) or not isinstance(raw_documents, list):
-            # null/объект вместо списка: не роняем запуск, но честно предупреждаем.
-            self.load_warning = (
-                "Файл реестра повреждён: разделы «counterparties»/«documents» "
-                "имеют неверный формат, поэтому реестр показан пустым.\n"
-                f"Путь: {path}"
-            )
+        if seq is None and not parties and not documents:
+            # База пуста и ни разу не сохранялась: переносим старый JSON.
+            self._migrate_from_legacy_json()
             return
 
-        self.schema_version = _safe_int(data.get("schema_version"), 1)
-        self.counterparties = [rec for rec in raw_parties if isinstance(rec, dict)]
-        self.documents = [rec for rec in raw_documents if isinstance(rec, dict)]
-
-        dropped = (len(raw_parties) - len(self.counterparties)) + (
-            len(raw_documents) - len(self.documents)
-        )
-        if dropped:
-            log.warning("При чтении реестра отброшено битых записей: %d", dropped)
-
-        self._seq = _safe_int(data.get("seq"), 1)
-        max_id = [self._seq]
-        max_id.extend(_safe_int(rec.get("id"), 0) for rec in self.counterparties)
-        max_id.extend(_safe_int(rec.get("id"), 0) for rec in self.documents)
-        self._seq = max(max_id) + 1
-
-        if self.schema_version < SCHEMA_VERSION:
-            log.info(
-                "Реестр прочитан в схеме %d; при следующем сохранении будет схема %d",
-                self.schema_version, SCHEMA_VERSION,
-            )
+        self.counterparties = parties
+        self.documents = documents
+        self._seq = max(
+            [_safe_int(seq, 1)]
+            + [_safe_int(rec.get("id"), 0) for rec in self.counterparties]
+            + [_safe_int(rec.get("id"), 0) for rec in self.documents]
+        ) + 1
         log.info(
             "Реестр загружен: контрагентов=%d, документов=%d, в корзине=%d",
             len(self.counterparties), len(self.documents),
             sum(1 for rec in self.counterparties + self.documents if is_deleted(rec)),
         )
 
-    @staticmethod
-    def _tmp_candidates(path: str) -> list[str]:
-        """Временные файлы записи (старый ``.tmp`` и новые ``.<pid>.tmp``)."""
-        directory = os.path.dirname(path)
-        base = os.path.basename(path)
-        candidates: list[str] = []
-        try:
-            names = os.listdir(directory)
-        except OSError:
-            return candidates
-        for name in names:
-            if name == base + ".tmp" or (
-                name.startswith(base + ".") and name.endswith(".tmp")
-            ):
-                candidates.append(os.path.join(directory, name))
-
-        def mtime(value: str) -> float:
-            try:
-                return os.path.getmtime(value)
-            except OSError:
-                return 0.0
-
-        candidates.sort(key=mtime, reverse=True)
-        return candidates
-
-    def _recover_from_broken_file(self, path: str, exc: Exception) -> dict | None:
-        """Спасает реестр: сначала пробует временные файлы, затем делает
-        .bad-копию повреждённого файла. Возвращает прочитанные данные или None."""
-        data: dict | None = None
-        recovered_from = ""
-        tmp_errors: list[str] = []
-        for tmp_path in self._tmp_candidates(path):
-            try:
-                with open(tmp_path, "r", encoding="utf-8") as fh:
-                    candidate = json.load(fh)
-                if isinstance(candidate, dict):
-                    data = candidate
-                    recovered_from = os.path.basename(tmp_path)
-                    break
-            except (OSError, ValueError) as tmp_exc:
-                tmp_errors.append(f"{os.path.basename(tmp_path)}: {tmp_exc}")
-
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        bad_path = f"{path}.bad-{stamp}"
-        try:
-            os.replace(path, bad_path)
-            moved = f"\nПовреждённый файл сохранён как:\n{bad_path}"
-        except OSError as move_exc:
-            moved = f"\nНе удалось сохранить копию повреждённого файла: {move_exc}"
-
-        tmp_note = ""
-        if tmp_errors:
-            tmp_note = "\nВременные файлы тоже не читаются: " + "; ".join(tmp_errors[:3])
-
-        if data is not None:
+    # ------------------- Перенос старого JSON-реестра ------------------ #
+    def _migrate_from_legacy_json(self) -> None:
+        """Переносит старый JSON-реестр в базу при первом запуске (п. 11)."""
+        log = applog.get_logger("storage")
+        legacy = self._read_legacy_json()
+        if legacy is None:
+            return  # файла нет или он не читается — предупреждение выставлено
+        self.counterparties = legacy["counterparties"]
+        self.documents = legacy["documents"]
+        self._seq = legacy["seq"]
+        if not self.save():
             self.load_warning = (
-                "Основной файл реестра повреждён, данные восстановлены из "
-                f"{recovered_from}.\n"
-                f"Ошибка: {exc}{tmp_note}{moved}"
+                "Реестр прочитан из старого файла database.json, но записать "
+                "новую базу не удалось: " + (self.last_error or "неизвестная ошибка")
             )
-            applog.get_logger("storage").warning(
-                "Реестр восстановлен из временного файла; повреждённый сохранён как .bad"
-            )
-            return data
+            return  # JSON оставлен на месте, данные не потеряны
+        json_path = legacy_json_path()
+        try:
+            os.replace(json_path, json_path + ".migrated")
+        except OSError:
+            log.warning("Старый JSON-реестр не переименован в .migrated")
+        log.info(
+            "Реестр перенесён из JSON в базу: контрагентов=%d, документов=%d",
+            len(self.counterparties), len(self.documents),
+        )
 
+    def _read_legacy_json(self) -> dict | None:
+        """Читает старый JSON-реестр. None — файла нет или он не читается."""
+        log = applog.get_logger("storage")
+        path = legacy_json_path()
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return None  # старого реестра нет — чистый старт
+        except (OSError, ValueError) as exc:
+            self.load_warning = (
+                "Старый файл реестра database.json повреждён и не был "
+                "перенесён в новую базу. Файл сохранён без изменений — "
+                "скопируйте его, если хотите восстановить записи вручную.\n"
+                f"Путь: {path}\nОшибка: {exc}"
+            )
+            log.error("Старый JSON-реестр не прочитан: %s", type(exc).__name__)
+            return None
+
+        if not isinstance(data, dict):
+            self.load_warning = (
+                "Старый файл реестра имеет неверную структуру и не был "
+                f"перенесён в новую базу.\nПуть: {path}"
+            )
+            return None
+
+        raw_parties = data.get("counterparties", [])
+        raw_documents = data.get("documents", [])
+        if not isinstance(raw_parties, list) or not isinstance(raw_documents, list):
+            self.load_warning = (
+                "Старый файл реестра повреждён: разделы «counterparties»/"
+                "«documents» имеют неверный формат, перенос не выполнен.\n"
+                f"Путь: {path}"
+            )
+            return None
+
+        parties = [rec for rec in raw_parties if isinstance(rec, dict)]
+        documents = [rec for rec in raw_documents if isinstance(rec, dict)]
+        dropped = (len(raw_parties) - len(parties)) + (
+            len(raw_documents) - len(documents)
+        )
+        if dropped:
+            log.warning("При переносе реестра отброшено битых записей: %d", dropped)
+
+        # Дубли id (файл могли править вручную): база не допустит второй
+        # записи с тем же PRIMARY KEY, поэтому переносим первое вхождение.
+        seen_ids: set[int] = set()
+        parties = self._dedupe_by_id(parties, seen_ids)
+        documents = self._dedupe_by_id(documents, seen_ids)
+
+        seq = max(
+            [_safe_int(data.get("seq"), 1)]
+            + [_safe_int(rec.get("id"), 0) for rec in parties]
+            + [_safe_int(rec.get("id"), 0) for rec in documents]
+        ) + 1
+        return {"counterparties": parties, "documents": documents, "seq": seq}
+
+    @staticmethod
+    def _dedupe_by_id(records: list[dict], seen_ids: set[int]) -> list[dict]:
+        unique: list[dict] = []
+        for rec in records:
+            rid = _safe_int(rec.get("id"), 0)
+            if rid and rid in seen_ids:
+                applog.get_logger("storage").warning(
+                    "Дубликат id=%s пропущен при переносе", rid,
+                )
+                continue
+            if rid:
+                seen_ids.add(rid)
+            unique.append(rec)
+        return unique
+
+    # --------------------------- Чтение базы --------------------------- #
+    @staticmethod
+    def _loads(text, fallback):
+        try:
+            return json.loads(text or "")
+        except ValueError:
+            return fallback
+
+    @classmethod
+    def _party_from_row(cls, row) -> dict | None:
+        fields = cls._loads(row[2], None)
+        if not isinstance(fields, dict):
+            return None
+        rec: dict = {
+            "id": row[0],
+            "type": row[1] or "",
+            "fields": fields,
+            "created_at": row[3] or "",
+        }
+        if row[4]:
+            rec["deleted_at"] = row[4]
+        extra = cls._loads(row[5], None)
+        if isinstance(extra, dict):
+            for key, value in extra.items():
+                if key not in _PARTY_KEYS:
+                    rec[key] = value
+        return rec
+
+    @classmethod
+    def _document_from_row(cls, row) -> dict | None:
+        data = cls._loads(row[5], None)
+        extra = cls._loads(row[6], None)
+        if not isinstance(data, dict) or not isinstance(extra, dict):
+            return None
+        rec: dict = {
+            "id": row[0],
+            "kind": row[1] or "",
+            "party_id": row[2],
+            "number": row[3] or "",
+            "date": row[4] or "",
+            "data": data,
+            "extra": extra,
+            "text": row[7] or "",
+            "created_at": row[8] or "",
+        }
+        if row[9]:
+            rec["deleted_at"] = row[9]
+        if row[10]:
+            rec["deleted_with_party"] = True
+        extra_keys = cls._loads(row[11], None)
+        if isinstance(extra_keys, dict):
+            for key, value in extra_keys.items():
+                if key not in _DOCUMENT_KEYS:
+                    rec[key] = value
+        return rec
+
+    @classmethod
+    def _read_all(cls, conn) -> tuple[list[dict], list[dict], int | None]:
+        parties: list[dict] = []
+        documents: list[dict] = []
+        dropped = 0
+        for row in conn.execute(
+            "SELECT id, type, fields, created_at, deleted_at, extra_keys "
+            "FROM counterparties"
+        ):
+            rec = cls._party_from_row(row)
+            if rec is None:
+                dropped += 1
+            else:
+                parties.append(rec)
+        for row in conn.execute(
+            "SELECT id, kind, party_id, number, date, data, extra, text, "
+            "created_at, deleted_at, deleted_with_party, extra_keys FROM documents"
+        ):
+            rec = cls._document_from_row(row)
+            if rec is None:
+                dropped += 1
+            else:
+                documents.append(rec)
+        if dropped:
+            applog.get_logger("storage").warning(
+                "При чтении реестра отброшено битых записей: %d", dropped,
+            )
+        seq_row = conn.execute("SELECT value FROM meta WHERE key = 'seq'").fetchone()
+        seq = _safe_int(seq_row[0], None) if seq_row else None
+        return parties, documents, seq
+
+    # ------------------------ Повреждённая база ------------------------ #
+    def _quarantine_corrupt_db(self, path: str, exc: Exception) -> bool:
+        """Повреждённую базу убирает в ``.bad-копию`` и предупреждает.
+
+        Возвращает True, если ошибка похожа на повреждение файла и реестр
+        начат с пустой базы. Блокировки и другие временные ошибки — False.
+        """
+        message = str(exc).lower()
+        markers = ("not a database", "malformed", "encrypted", "corrupt")
+        if not any(marker in message for marker in markers):
+            return False
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        moved: list[str] = []
+        failed: list[str] = []
+        for suffix in ("", "-wal", "-shm"):
+            src = path + suffix
+            if not os.path.exists(src):
+                continue
+            try:
+                os.replace(src, f"{path}.bad-{stamp}{suffix}")
+                moved.append(os.path.basename(src))
+            except OSError:
+                failed.append(os.path.basename(src))
         self.load_warning = (
-            "Не удалось прочитать файл реестра — программа запущена с пустым "
-            f"реестром.\nОшибка: {exc}{tmp_note}{moved}\n\n"
-            "До первого сохранения скопируйте папку данных, если хотите "
-            "попробовать восстановить записи вручную."
+            "Файл базы реестра повреждён — программа запущена с пустым "
+            f"реестром.\nОшибка: {exc}"
         )
+        if moved:
+            self.load_warning += (
+                f"\nПовреждённый файл сохранён как:\n{path}.bad-{stamp}"
+            )
+        if failed:
+            self.load_warning += (
+                "\nНе удалось убрать повреждённые файлы: " + ", ".join(failed)
+            )
         applog.get_logger("storage").error(
-            "Реестр не прочитан; повреждённый файл сохранён как .bad"
+            "База реестра повреждена (%s); начат пустой реестр",
+            type(exc).__name__,
         )
-        return None
+        return True
 
     def _purge_stale_bad_copies(self, path: str) -> None:
         """Удаляет ``.bad-*``-копии старше BAD_COPY_RETENTION_DAYS (аудит 2.0.1).
 
         Копии повреждённых файлов раньше копились без ограничения возраста
         и не попадали ни в какую очистку — теперь уборка идёт при каждом
-        запуске, свежие копии не трогаются.
+        запуске, свежие копии не трогаются. Чистятся и старые
+        ``database.json.bad-*`` от прежних версий программы.
         """
         directory = os.path.dirname(path)
         try:
             names = os.listdir(directory)
         except OSError:
             return
-        prefix = os.path.basename(path) + ".bad-"
+        prefixes = (
+            os.path.basename(path) + ".bad-",
+            LEGACY_JSON_FILENAME + ".bad-",
+        )
         deadline = time.time() - BAD_COPY_RETENTION_DAYS * 86400
         removed = 0
         for name in names:
-            if not name.startswith(prefix):
+            if not name.startswith(prefixes):
                 continue
             full = os.path.join(directory, name)
             try:
@@ -272,92 +488,100 @@ class DataStore:
                 "Убраны старые копии повреждённых файлов: %d", removed,
             )
 
-    @staticmethod
-    def _remove_silent(path: str) -> None:
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except OSError:
-            pass
+    # --------------------------- Запись базы --------------------------- #
+    def _party_row(self, rec: dict) -> tuple:
+        fields = rec.get("fields") or {}
+        extra = {k: v for k, v in rec.items() if k not in _PARTY_KEYS}
+        return (
+            _safe_int(rec.get("id"), 0),
+            str(rec.get("type") or ""),
+            json.dumps(fields, ensure_ascii=False),
+            str(rec.get("created_at") or ""),
+            rec.get("deleted_at"),
+            str(fields.get("ИНН", "") or "").strip(),
+            json.dumps(extra, ensure_ascii=False),
+        )
 
-    def _rotate_backups(self, path: str) -> None:
-        """Сдвигает ``.bak``-копии и сохраняет текущую версию как ``.bak``."""
-        log = applog.get_logger("storage")
-        try:
-            oldest = f"{path}.bak.{BACKUP_COUNT - 1}"
-            if os.path.exists(oldest):
-                os.remove(oldest)
-            for index in range(BACKUP_COUNT - 2, 0, -1):
-                src = f"{path}.bak.{index}"
-                if os.path.exists(src):
-                    os.replace(src, f"{path}.bak.{index + 1}")
-            if os.path.exists(f"{path}.bak"):
-                os.replace(f"{path}.bak", f"{path}.bak.1")
-            if os.path.exists(path):
-                shutil.copy2(path, f"{path}.bak")
-                try:
-                    # Бэкап — «вторая линия обороны»: он обязан пережить сбой
-                    # питания, поэтому сбрасывается на диск явно (аудит 2.0.1).
-                    with open(f"{path}.bak", "rb") as fh:
-                        os.fsync(fh.fileno())
-                except OSError:
-                    pass  # fsync недоступен — бэкап всё равно лучше, чем ничего
-        except OSError as exc:
-            # Бэкап — страховка, но не причина срывать сохранение.
-            log.warning("Не удалось обновить резервные копии реестра: %s", exc)
+    def _document_row(self, rec: dict) -> tuple:
+        extra = {k: v for k, v in rec.items() if k not in _DOCUMENT_KEYS}
+        return (
+            _safe_int(rec.get("id"), 0),
+            str(rec.get("kind") or ""),
+            rec.get("party_id"),
+            str(rec.get("number") or ""),
+            str(rec.get("date") or ""),
+            json.dumps(rec.get("data") or {}, ensure_ascii=False),
+            json.dumps(rec.get("extra") or {}, ensure_ascii=False),
+            str(rec.get("text") or ""),
+            str(rec.get("created_at") or ""),
+            rec.get("deleted_at"),
+            1 if rec.get("deleted_with_party") else 0,
+            json.dumps(extra, ensure_ascii=False),
+        )
 
-    def _cleanup_stale_tmp(self, path: str) -> None:
-        """Удаляет временные файлы предыдущих неудачных записей."""
-        own = f"{path}.{os.getpid()}.tmp"
-        for candidate in self._tmp_candidates(path):
-            if os.path.normcase(candidate) != os.path.normcase(own):
-                self._remove_silent(candidate)
+    def _write_all(self, path: str, party_rows: list, document_rows: list) -> None:
+        """Записывает весь реестр одной транзакцией: либо всё, либо ничего."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        conn = _connect_db(path)
+        try:
+            with conn:
+                conn.execute("DELETE FROM counterparties")
+                conn.execute("DELETE FROM documents")
+                conn.execute("DELETE FROM meta")
+                conn.executemany(
+                    "INSERT INTO counterparties (id, type, fields, created_at, "
+                    "deleted_at, inn, extra_keys) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    party_rows,
+                )
+                conn.executemany(
+                    "INSERT INTO documents (id, kind, party_id, number, date, "
+                    "data, extra, text, created_at, deleted_at, "
+                    "deleted_with_party, extra_keys) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    document_rows,
+                )
+                conn.executemany(
+                    "INSERT INTO meta (key, value) VALUES (?, ?)",
+                    (
+                        ("schema_version", str(SQLITE_SCHEMA_VERSION)),
+                        ("seq", str(self._seq)),
+                    ),
+                )
+        finally:
+            conn.close()
 
     def save(self) -> bool:
-        """Атомарно записывает реестр. Возвращает False и заполняет last_error при сбое.
+        """Атомарно записывает реестр транзакцией. Возвращает False и заполняет
+        last_error при сбое; предыдущая версия базы при этом не теряется.
 
         Долгая запись (более 500 мс — обычно антивирус или медленный диск)
         попадает в журнал (п. 10 этапа 5).
         """
         log = applog.get_logger("storage")
         self.last_error = ""
-        payload = {
-            "schema_version": SCHEMA_VERSION,
-            "seq": self._seq,
-            "counterparties": self.counterparties,
-            "documents": self.documents,
-        }
+        # Сериализация до открытия базы: битые данные не роняют файл.
         try:
-            text = json.dumps(payload, ensure_ascii=False, indent=2)
+            party_rows = [self._party_row(rec) for rec in self.counterparties]
+            document_rows = [self._document_row(rec) for rec in self.documents]
         except (TypeError, ValueError) as exc:
             self.last_error = f"Данные реестра не удалось сериализовать: {exc}"
             log.error("Сериализация реестра не удалась: %s", type(exc).__name__)
             return False
 
         path = db_path()
-        directory = os.path.dirname(path)
-        tmp = f"{path}.{os.getpid()}.tmp"
         last_exc: Exception | None = None
         with applog.timed("Запись реестра", 500, "storage"):
             for attempt in range(1, SAVE_RETRIES + 1):
                 try:
-                    os.makedirs(directory, exist_ok=True)
-                    with open(tmp, "w", encoding="utf-8") as fh:
-                        fh.write(text)
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                    self._rotate_backups(path)
-                    os.replace(tmp, path)
-                    self._cleanup_stale_tmp(path)
-                    self.schema_version = SCHEMA_VERSION
+                    self._write_all(path, party_rows, document_rows)
+                    self.schema_version = SQLITE_SCHEMA_VERSION
                     log.info(
                         "Реестр записан: контрагентов=%d, документов=%d",
                         len(self.counterparties), len(self.documents),
                     )
                     return True
-                except OSError as exc:
+                except (sqlite3.Error, OSError) as exc:
                     last_exc = exc
-                    self._remove_silent(tmp)
                     if attempt < SAVE_RETRIES:
                         log.warning(
                             "Запись реестра не удалась (попытка %d из %d): %s",
@@ -365,7 +589,7 @@ class DataStore:
                         )
                         time.sleep(RETRY_DELAY_SECONDS * attempt)
 
-        self.last_error = f"Не удалось записать файл реестра: {last_exc}"
+        self.last_error = f"Не удалось записать реестр: {last_exc}"
         log.error("Реестр не записан после %d попыток: %s", SAVE_RETRIES, last_exc)
         return False
 

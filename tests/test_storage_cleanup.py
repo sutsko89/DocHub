@@ -1,11 +1,14 @@
-"""Уборка .bad-* копий повреждённого реестра (аудит 2.0.1, P3).
+"""Уборка .bad-* копий повреждённого реестра (аудит 2.0.1, P3) и надёжность
+записи базы (п. 11 этапа 5).
 
-Свежие копии не трогаются, старше BAD_COPY_RETENTION_DAYS — удаляются
-при загрузке реестра.
+Свежие .bad-копии не трогаются, старше BAD_COPY_RETENTION_DAYS — удаляются
+при загрузке реестра. Долговечность записи (сбой питания) в SQLite
+гарантирует PRAGMA synchronous=FULL.
 """
 from __future__ import annotations
 
 import os
+import sqlite3
 import time
 
 import storage
@@ -44,18 +47,18 @@ def test_young_bad_copies_are_kept(appdata):
     assert os.path.exists(young)
 
 
-def test_backup_file_gets_fsync_call(appdata, monkeypatch):
-    """fsync у .bak-копии вызывается (аудит: бэкап обязан пережить сбой питания)."""
-    calls: list[int] = []
-    real_fsync = os.fsync
+def test_synchronous_full_for_power_failure_safety(appdata):
+    """synchronous=FULL: коммит доходит до диска до подтверждения записи.
 
-    def spy_fsync(fd):
-        calls.append(fd)
-        return real_fsync(fd)
-
-    monkeypatch.setattr(os, "fsync", spy_fsync)
+    Прежний тест проверял fsync у .bak-копии JSON; при записи транзакцией
+    в SQLite ту же гарантию даёт PRAGMA synchronous=FULL.
+    """
     store = storage.DataStore()
     store.add_counterparty("ooo", {"ИНН": "2540123456"})
     assert store.save() is True
-    assert calls, "os.fsync вызван при ротации бэкапов"
-    assert os.path.exists(storage.db_path() + ".bak")
+    conn = sqlite3.connect(storage.db_path())
+    try:
+        mode = conn.execute("PRAGMA synchronous").fetchone()[0]
+    finally:
+        conn.close()
+    assert mode == 2, "synchronous=FULL (2): запись переживает сбой питания"

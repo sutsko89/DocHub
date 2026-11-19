@@ -1,28 +1,25 @@
-"""Тесты восстановления реестра (п. 7.3).
+"""Тесты переноса и восстановления реестра (п. 11 этапа 5).
 
-Битый JSON (мусор/обрезка/null/дубли id), восстановление из ``.tmp``,
-``.bad``-копия, read-only папка при записи, осиротевшие файлы и восстановление
-реестра из папки документов (reconcile).
+Миграция JSON → SQLite (сохранность данных, корзины, неизвестных ключей
+и счётчика id), повреждённая база (.bad-копия + предупреждение), битый
+legacy-JSON (файл не трогаем), сбой записи и сверка с папкой (reconcile).
 """
 from __future__ import annotations
 
 import json
 import os
-import stat
-import sys
-
-import pytest
+import sqlite3
 
 import storage
 from document_builder import F
 from render_helpers import OOO_FIELDS
 
 
-def _write_db(text: str) -> str:
-    path = storage.db_path()
+def _write_json_registry(payload) -> str:
+    path = storage.legacy_json_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
+        json.dump(payload, fh, ensure_ascii=False)
     return path
 
 
@@ -39,70 +36,166 @@ def _valid_registry() -> dict:
     }
 
 
-# ---------- Битый JSON ----------
+# ---------- Миграция JSON → SQLite ----------
 
-def test_garbage_json_starts_fresh_with_bad_copy(appdata):
-    path = _write_db("мусор {{{ это не JSON")
+def test_migration_from_json_preserves_data(appdata):
+    registry = _valid_registry()
+    registry["documents"].append({
+        "id": 2, "kind": storage.KIND_CONTRACT, "party_id": 1,
+        "number": "516", "date": "10 января", "data": {"a": "1"},
+        "extra": {"restored": True}, "text": "текст",
+        "created_at": "2026-01-01T00:00:00",
+    })
+    registry["counterparties"][0]["archived"] = True  # неизвестный ключ записи
+    _write_json_registry(registry)
+
+    store = storage.DataStore()
+    assert len(store.counterparties) == 1 and len(store.documents) == 1
+    assert store.counterparties[0]["archived"] is True
+    assert store.documents[0]["extra"].get("restored") is True
+    assert not store.load_warning
+
+    assert os.path.exists(storage.db_path()), "создана база SQLite"
+    assert not os.path.exists(storage.legacy_json_path()), "JSON переименован"
+    assert os.path.exists(storage.legacy_json_path() + ".migrated")
+
+    reloaded = storage.DataStore()
+    assert len(reloaded.counterparties) == 1 and len(reloaded.documents) == 1
+    assert reloaded.counterparties[0]["archived"] is True, \
+        "неизвестные ключи записи переживают перенос"
+    another = reloaded.add_counterparty("ooo", {"ИНН": "2540999999"}, save=False)
+    assert another["id"] > 2, "счётчик id продолжается после переноса"
+
+
+def test_migration_moves_trash_flags(appdata):
+    registry = _valid_registry()
+    registry["documents"].append({
+        "id": 2, "kind": storage.KIND_CONTRACT, "party_id": 1,
+        "number": "1", "date": "1", "data": {}, "extra": {}, "text": "",
+        "created_at": "2026-01-01T00:00:00",
+        "deleted_at": "2026-02-01T00:00:00.123456",
+        "deleted_with_party": True,
+    })
+    _write_json_registry(registry)
+
+    store = storage.DataStore()
+    trashed = store.trashed_documents()
+    assert len(trashed) == 1 and trashed[0]["deleted_with_party"] is True
+
+    reloaded = storage.DataStore()
+    assert len(reloaded.trashed_documents()) == 1, "корзина переживает перенос"
+    assert reloaded.restore_document(2) is True
+    assert reloaded.active_documents(), "восстановление после переноса работает"
+
+
+def test_garbage_json_migration_keeps_file(appdata):
+    path = storage.legacy_json_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("мусор {{{ это не JSON")
+
     store = storage.DataStore()
     assert store.counterparties == [] and store.documents == []
     assert store.load_warning, "пользователь должен быть предупреждён"
-    bad_copies = [f for f in os.listdir(os.path.dirname(path))
-                  if f.startswith("database.json.bad")]
-    assert bad_copies, ".bad-копия повреждённого файла не создана"
+    assert os.path.exists(path), \
+        "повреждённый JSON не трогаем — это единственная копия данных"
+    assert not os.path.exists(storage.legacy_json_path() + ".migrated")
 
 
-def test_truncated_json_recovered(appdata):
+def test_truncated_json_migration_starts_empty(appdata):
     text = json.dumps(_valid_registry(), ensure_ascii=False)
-    _write_db(text[: len(text) // 2])
+    path = _write_json_registry(text[: len(text) // 2])
     store = storage.DataStore()
     assert store.counterparties == [] and store.load_warning
+    assert os.path.exists(path), "обрезанный JSON сохранён для ручного восстановления"
 
 
 def test_null_json_not_a_dict(appdata):
-    _write_db("null")
+    path = _write_json_registry("null")
     store = storage.DataStore()
     assert store.counterparties == [] and store.load_warning
+    assert os.path.exists(path)
 
 
 def test_sections_of_wrong_type_shown_empty(appdata):
     registry = _valid_registry()
     registry["counterparties"] = None
-    _write_db(json.dumps(registry, ensure_ascii=False))
+    path = _write_json_registry(registry)
     store = storage.DataStore()
     assert store.counterparties == [] and store.load_warning
+    assert os.path.exists(path)
 
 
-def test_duplicate_ids_do_not_crash_and_seq_is_raised(appdata):
+def test_duplicate_ids_deduplicated_with_seq_raised(appdata):
     registry = _valid_registry()
     registry["counterparties"].append(dict(registry["counterparties"][0]))
-    _write_db(json.dumps(registry, ensure_ascii=False))
+    _write_json_registry(registry)
     store = storage.DataStore()
-    assert len(store.counterparties) == 2
+    assert len(store.counterparties) == 1, "дубликат id пропущен при переносе"
     new_party = store.add_counterparty("ooo", {"ИНН": "7709999999"}, save=False)
-    ids = {rec["id"] for rec in store.counterparties}
-    assert new_party["id"] not in ids or new_party["id"] > 1
+    assert new_party["id"] > 1, "счётчик id не конфликтует с перенесёнными"
 
 
 def test_records_with_wrong_type_dropped(appdata):
     registry = _valid_registry()
     registry["counterparties"].append("строка вместо записи")
-    _write_db(json.dumps(registry, ensure_ascii=False))
+    _write_json_registry(registry)
     store = storage.DataStore()
     assert len(store.counterparties) == 1  # битая запись отброшена, валидная жива
 
 
-# ---------- Восстановление из .tmp ----------
+# ---------- Повреждённая база SQLite ----------
 
-def test_registry_recovered_from_tmp_file(appdata):
-    base = storage.db_path()
-    os.makedirs(os.path.dirname(base), exist_ok=True)
-    with open(base + ".1234.tmp", "w", encoding="utf-8") as fh:
-        json.dump(_valid_registry(), fh, ensure_ascii=False)
-    with open(base, "w", encoding="utf-8") as fh:
-        fh.write("битые данные")
+def test_corrupt_sqlite_file_quarantined(appdata):
+    path = storage.db_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(b"not a sqlite database at all" * 10)
+
     store = storage.DataStore()
-    assert len(store.counterparties) == 1
-    assert store.load_warning  # «восстановлен из временного файла»
+    assert store.counterparties == [] and store.documents == []
+    assert store.load_warning, "пользователь должен быть предупреждён"
+    bad_copies = [f for f in os.listdir(os.path.dirname(path))
+                  if f.startswith("database.db.bad")]
+    assert bad_copies, ".bad-копия повреждённой базы не создана"
+
+
+# ---------- Схема и режимы базы ----------
+
+def test_schema_indexes_and_wal(appdata):
+    store = storage.DataStore()
+    store.add_counterparty("ooo", {"ИНН": "2540123456"})
+    conn = sqlite3.connect(storage.db_path())
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        indexes = {name for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'")}
+    finally:
+        conn.close()
+    assert mode == "wal", "WAL-журнал включён (параллельное чтение)"
+    assert {"idx_counterparties_inn", "idx_documents_party",
+            "idx_documents_kind"} <= indexes, "индексы по ИНН и документам созданы"
+
+
+def test_meta_schema_version_written(appdata):
+    store = storage.DataStore()
+    store.add_counterparty("ooo", {"ИНН": "2540123456"})
+    conn = sqlite3.connect(storage.db_path())
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM meta"))
+    finally:
+        conn.close()
+    assert int(meta["schema_version"]) == storage.SQLITE_SCHEMA_VERSION
+    assert int(meta["seq"]) >= 2, "счётчик id записан в базу"
+
+
+def test_unknown_record_keys_roundtrip(appdata):
+    store = storage.DataStore()
+    party = store.add_counterparty("ooo", {"ИНН": "2540123456"})
+    party["custom_flag"] = "тест"  # ключ, для которого нет колонки
+    assert store.save() is True
+    reloaded = storage.DataStore()
+    assert reloaded.counterparties[0].get("custom_flag") == "тест"
 
 
 # ---------- Запись при отказе ОС ----------
@@ -114,15 +207,16 @@ def test_save_returns_false_when_os_refuses_write(appdata, monkeypatch):
     Windows (права каталога там не блокируют запись) и под root, поэтому в
     CI приходилось пропускать тест. Контракт «save() честно сообщает об
     отказе и заполняет last_error» проверяется платформонезависимо:
-    os.replace (финальный шаг атомарной записи) отказывает в доступе.
+    открытие базы отказывает в доступе.
     """
     store = storage.DataStore()
     store.add_counterparty("ooo", {"ИНН": "2540123456"})
 
-    def denied_replace(src, dst, *args, **kwargs):
+    def denied_connect(path, *args, **kwargs):
         raise PermissionError(13, "Отказано в доступе")
 
-    monkeypatch.setattr(os, "replace", denied_replace)
+    monkeypatch.setattr(storage, "_connect_db", denied_connect)
+    monkeypatch.setattr(storage.time, "sleep", lambda _seconds: None)
     assert store.save() is False
     assert store.last_error  # причина доносится до пользователя
     # Реестр в памяти не «пропал» из-за сбоя записи.

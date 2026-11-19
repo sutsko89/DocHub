@@ -14,6 +14,7 @@ import zipfile
 import applog
 import dadata_client as dadata
 import single_instance
+import sqlite3
 from datetime import datetime
 
 # Настройки приложения и база данных (контрагенты/документы) читаются из APPDATA:
@@ -192,18 +193,18 @@ party_rec = store.add_counterparty("ooo", {
 check(store.get_counterparty(party_rec["id"]) is not None, "хранилище: контрагент сохранён")
 check(store.find_by_inn("7701234567") is not None, "хранилище: поиск по ИНН")
 
-# ---------- Надёжность записи реестра (п. 2.1) ----------
+# ---------- Надёжность записи реестра (п. 2.1, п. 11 этапа 5) ----------
 check(store.save(), "хранилище: повторная запись реестра")
-check(os.path.exists(storage.db_path() + ".bak"), "хранилище: создана резервная копия .bak")
-with open(storage.db_path(), "r", encoding="utf-8") as _fh:
-    _raw_db = json.load(_fh)
-check(_raw_db.get("schema_version") == storage.SCHEMA_VERSION,
-      "хранилище: schema_version записан в файл")
+check(os.path.exists(storage.db_path()), "хранилище: база SQLite создана")
+with sqlite3.connect(storage.db_path()) as _conn:
+    _meta = dict(_conn.execute("SELECT key, value FROM meta"))
+check(int(_meta.get("schema_version", "0")) == storage.SQLITE_SCHEMA_VERSION,
+      "хранилище: schema_version записан в базу")
 check(storage.is_deleted({"deleted_at": "2026-01-01T00:00:00"}),
       "корзина: запись с deleted_at считается удалённой")
 check(not storage.is_deleted({}), "корзина: запись без deleted_at активна")
 
-# ---------- 2.1 дополнительно: tmp с PID, повтор записи, защита версии ----------
+# ---------- 2.1: сбой записи не теряет предыдущую версию реестра ----------
 _appdata_p1 = os.environ["APPDATA"]
 os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "smoke_p1_storage")
 shutil.rmtree(storage.data_dir(), ignore_errors=True)
@@ -213,62 +214,42 @@ _p1.add_counterparty("ooo", {
     "ИНН": "7709991111", "Сокращенное название компании": "ООО Первая",
 }, save=False)
 check(_p1.save(), "2.1: первая запись реестра успешна")
-_prev_snapshot = open(storage.db_path(), encoding="utf-8").read()
 
-_orig_replace = os.replace
-_replaces: list[tuple[str, str]] = []
+_orig_connect = storage._connect_db
 
-def _spy_replace(src, dst, *args, **kwargs):
-    _replaces.append((src, dst))
-    return _orig_replace(src, dst, *args, **kwargs)
+def _locked_connect(path, *args, **kwargs):
+    raise sqlite3.OperationalError("database is locked (имитация антивируса)")
 
-os.replace = _spy_replace
-check(_p1.save(), "2.1: запись под наблюдением os.replace")
-os.replace = _orig_replace
-_tmp_to_db = [src for src, dst in _replaces
-              if dst == storage.db_path() and str(os.getpid()) in src]
-check(bool(_tmp_to_db),
-      "2.1: tmp-файл уникален — имя содержит PID процесса")
-
-# Приёмка 2.1: сбой между записью tmp и replace не теряет предыдущую версию.
-def _broken_replace(src, dst, *args, **kwargs):
-    raise OSError(28, "нет места (имитация антивируса)")
-
-_p1.add_counterparty("ooo", {
-    "ИНН": "7718882222", "Сокращенное название компании": "ООО Вторая",
-}, save=False)
+storage._connect_db = _locked_connect
 _orig_sleep = time.sleep
 time.sleep = lambda _seconds: None  # ускоряем повторы записи
-os.replace = _broken_replace
 try:
-    check(_p1.save() is False, "2.1: сбой replace повторён 3 раза и возвращён False")
+    check(_p1.save() is False, "2.1: сбой записи повторён 3 раза и возвращён False")
 finally:
-    os.replace = _orig_replace
+    storage._connect_db = _orig_connect
     time.sleep = _orig_sleep
-check(open(storage.db_path(), encoding="utf-8").read() == _prev_snapshot,
-      "2.1: при сбое replace предыдущая версия реестра не потеряна")
 check(bool(_p1.last_error), "2.1: причина сбоя доступна пользователю")
+_reloaded = storage.DataStore()
+check(len(_reloaded.counterparties) == 1,
+      "2.1: при сбое записи предыдущая версия реестра не потеряна")
 
 # Временный сбой (файл занят сканером): запись повторами всё же проходит.
 _transients = {"left": 2}
 
-def _flaky_replace(src, dst, *args, **kwargs):
-    if (_transients["left"] > 0 and os.path.normcase(os.path.abspath(dst))
-            == os.path.normcase(os.path.abspath(storage.db_path()))):
+def _flaky_connect(path, *args, **kwargs):
+    if _transients["left"] > 0:
         _transients["left"] -= 1
-        raise OSError(13, "файл занят сканером")
-    return _orig_replace(src, dst, *args, **kwargs)
+        raise sqlite3.OperationalError("database is locked (имитация сканера)")
+    return _orig_connect(path, *args, **kwargs)
 
 time.sleep = lambda _seconds: None
-os.replace = _flaky_replace
+storage._connect_db = _flaky_connect
 try:
     check(_p1.save(), "2.1: повтор записи переживает 2 временных сбоя")
 finally:
-    os.replace = _orig_replace
+    storage._connect_db = _orig_connect
     time.sleep = _orig_sleep
 check(_transients["left"] == 0, "2.1: обе запасные попытки понадобились")
-check(os.path.exists(storage.db_path() + ".bak.1"),
-      "2.1: ротация хранит предыдущие версии .bak.1…4")
 check(not [n for n in os.listdir(storage.data_dir()) if n.endswith(".tmp")],
       "2.1: временные файлы после записи не остаются")
 os.environ["APPDATA"] = _appdata_p1
@@ -410,51 +391,65 @@ check(os.path.exists(_disk_doc),
 os.remove(_disk_doc)
 os.environ["APPDATA"] = _appdata_p1
 
-# ---------- Защита чтения реестра (п. 1.4) ----------
+# ---------- Защита чтения реестра (п. 1.4, п. 11 этапа 5) ----------
 _appdata_main = os.environ["APPDATA"]
 os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "smoke_storage_bad")
-# Песочница могла остаться от прошлого прогона (в т.ч. .bad/.tmp файлы) — сбрасываем.
+# Песочница могла остаться от прошлого прогона (в т.ч. .bad файлы) — сбрасываем.
 shutil.rmtree(storage.data_dir(), ignore_errors=True)
 os.makedirs(storage.data_dir(), exist_ok=True)
-with open(storage.db_path(), "w", encoding="utf-8") as _fh:
-    _fh.write("{ это не JSON !!!")
+
+# Повреждённая база: убирается в .bad-копию, пользователь предупреждён.
+with open(storage.db_path(), "wb") as _fh:
+    _fh.write(b"{\xe4\xee\xea\xf3\xec\xe5\xed\xf2\xfb \xe1\xe5\xe7 \xe1\xe0\xe7\xfb")
 _broken = storage.DataStore()
-check(bool(_broken.load_warning), "реестр: при битом JSON пользователь предупреждён")
+check(bool(_broken.load_warning), "реестр: при битой базе пользователь предупреждён")
 check(not _broken.counterparties and not _broken.documents,
-      "реестр: битый файл — реестр пуст, запуск не падает")
+      "реестр: битая база — реестр пуст, запуск не падает")
 _bad_copies = [n for n in os.listdir(storage.data_dir())
-               if n.startswith("database.json.bad-")]
+               if n.startswith("database.db.bad-")]
 check(len(_bad_copies) == 1,
-      f"реестр: повреждённый файл сохранён как .bad ({_bad_copies})")
+      f"реестр: повреждённая база сохранена как .bad ({_bad_copies})")
 
-# Восстановление из временного файла записи.
-with open(storage.db_path(), "w", encoding="utf-8") as _fh:
-    _fh.write("{ тоже не JSON")
-_rescue_tmp = storage.db_path() + ".999.tmp"
-with open(_rescue_tmp, "w", encoding="utf-8") as _fh:
-    _fh.write('{"counterparties": [{"id": 3, "type": "ooo", "fields": {"ИНН": "7701234567"}}], '
-              '"documents": [], "seq": 4}')
-_rescued = storage.DataStore()
-check([rec["id"] for rec in _rescued.counterparties] == [3],
-      "реестр: данные восстановлены из временного файла записи")
-check("восстановлены" in _rescued.load_warning,
-      "реестр: о восстановлении сообщено пользователю")
+# Битый старый JSON-реестр при переносе: файл не трогаем, реестр пуст.
+with open(storage.legacy_json_path(), "w", encoding="utf-8") as _fh:
+    _fh.write("{ это не JSON !!!")
+_legacy = storage.DataStore()
+check(bool(_legacy.load_warning), "реестр: при битом legacy-JSON предупреждение")
+check(not _legacy.counterparties and not _legacy.documents,
+      "реестр: перенос не выполнен, запуск не падает")
+check(os.path.exists(storage.legacy_json_path()),
+      "реестр: повреждённый JSON сохранён без изменений")
 
-# null вместо списков не роняет запуск (п. 1.4).
-with open(storage.db_path(), "w", encoding="utf-8") as _fh:
+# null вместо списков не роняет запуск и не блокирует перенос (п. 1.4).
+with open(storage.legacy_json_path(), "w", encoding="utf-8") as _fh:
     _fh.write('{"counterparties": null, "documents": null}')
 _null_store = storage.DataStore()
 check(bool(_null_store.load_warning) and not _null_store.counterparties,
       "реестр: null вместо разделов — предупреждение без падения")
 
+# Валидный legacy-JSON переносится в базу при первом запуске.
+with open(storage.legacy_json_path(), "w", encoding="utf-8") as _fh:
+    json.dump({"schema_version": storage.SCHEMA_VERSION, "seq": 4,
+               "counterparties": [{"id": 3, "type": "ooo",
+                                   "fields": {"ИНН": "7701234567"}}],
+               "documents": []}, _fh, ensure_ascii=False)
+_migrated = storage.DataStore()
+check([rec["id"] for rec in _migrated.counterparties] == [3],
+      "реестр: данные перенесены из старого JSON в базу")
+check(os.path.exists(storage.legacy_json_path() + ".migrated"),
+      "реестр: перенесённый JSON сохранён как .migrated")
+_reloaded = storage.DataStore()
+check([rec["id"] for rec in _reloaded.counterparties] == [3],
+      "реестр: перенесённые данные читаются из базы повторным запуском")
+
 # ---------- Сбой записи реестра (п. 1.5) ----------
-os.remove(storage.db_path())
 _ro = storage.DataStore()
-_ro.add_counterparty("ooo", {"ИНН": "7709999999"}, save=False)
-os.makedirs(storage.db_path())  # каталог вместо файла: os.replace падает
+_ro_party = _ro.add_counterparty("ooo", {"ИНН": "7709999999"}, save=False)
+os.remove(storage.db_path())   # файл создаётся при загрузке — убираем
+os.makedirs(storage.db_path())  # каталог вместо файла: база не открывается
 check(_ro.save() is False and _ro.last_error,
       "save(): сбой записи возвращает False и last_error, а не ложный успех")
-_upd_id = _ro.counterparties[0]["id"]
+_upd_id = _ro_party["id"]
 check(_ro.update_counterparty(_upd_id, {"ИНН": "7700000001"}) is None,
       "update_counterparty: при сбое записи правки откатываются (None)")
 check(_ro.get_counterparty(_upd_id)["fields"]["ИНН"] == "7709999999",

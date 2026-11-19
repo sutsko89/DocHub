@@ -169,14 +169,29 @@ def legacy_json_path() -> str:
 
 
 def _connect_db(path: str) -> sqlite3.Connection:
-    """Открывает базу: WAL (параллельное чтение), FULL-синхронизация, схема."""
+    """Открывает базу: WAL (параллельное чтение), FULL-синхронизация, схема.
+
+    При ошибке инициализации (например, «file is not a database» на
+    PRAGMA) соединение закрывается ДО выхода из функции: иначе объект
+    Connection живёт в traceback исключения, держит дескриптор файла и
+    os.replace/os.remove в quarantine на Windows падают с WinError 32
+    («файл занят другим процессом») — битая база оставалась на месте и
+    quarantine повторялся при каждом запуске (2.15.0).
+    """
     conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_SECONDS)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
-    for statement in _SCHEMA_SQL:
-        conn.execute(statement)
-    conn.commit()
-    return conn
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        for statement in _SCHEMA_SQL:
+            conn.execute(statement)
+        conn.commit()
+        return conn
+    except BaseException:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -525,13 +540,16 @@ class DataStore:
             if not moved_ok:
                 # Последний шанс: чтение не требует эксклюзивной блокировки —
                 # копируем содержимое в .bad-копию и удаляем оригинал.
+                # moved_ok ставится только при УСПЕШНОМ удалении: если битый
+                # файл остался на месте базы, quarantine повторится при
+                # следующем запуске (потери данных нет, копия уже создана).
                 try:
                     shutil.copyfile(src, destination)
-                    moved_ok = True
                     try:
                         os.remove(src)
+                        moved_ok = True
                     except OSError as remove_exc:
-                        last_exc = remove_exc  # копия уже создана — не критично
+                        last_exc = remove_exc
                 except OSError as copy_exc:
                     last_exc = copy_exc
             if moved_ok:

@@ -302,6 +302,10 @@ check(bool(single_instance.MUTEX_NAME) and "EWDocHub" in single_instance.MUTEX_N
       "2.2: именованный mutex настроен")
 with open("main.py", encoding="utf-8") as _mf:
     _main_src = _mf.read()
+# Исходники контроллеров декомпозиции ContractApp (аудит 2.0.1, P2) —
+# часть «приложения» для строковых проверок ниже.
+with open("import_controller.py", encoding="utf-8") as _icf:
+    _app_src = _main_src + _icf.read()
 check("if not lock.acquire()" in _main_src
       and "single_instance.show_already_running" in _main_src,
       "2.2: старт приложения gated захватом блокировки")
@@ -688,7 +692,7 @@ finally:
 check(di.MAX_FILES_PER_BATCH > 0 and di.MAX_TOTAL_SIZE > 0,
       "3.4: лимиты пакета импорта настроены")
 check("IMPORT_MAX_FILES" in _main_src and "IMPORT_MAX_TOTAL_SIZE" in _main_src
-      and "disk_usage" in _main_src,
+      and "disk_usage" in _app_src,
       "3.4: пакет импорта и свободное место проверяются в приложении")
 
 # ---------- Причины отказа импорта (п. 3.5) ----------

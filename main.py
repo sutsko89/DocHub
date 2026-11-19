@@ -19,7 +19,6 @@ import os
 import platform
 import queue
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -36,6 +35,7 @@ from tkinter import filedialog
 import applog
 import dadata_client as dadata
 import document_importer as importer
+import import_controller
 import reconcile
 import single_instance
 import storage
@@ -75,7 +75,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -235,7 +235,8 @@ def get_spec_settings() -> dict:
 
 # Импорт принимает только документы, которые программа умеет разбирать.
 # Всё остальное (в т. ч. .exe/.bat/.lnk) не копируется и не открывается.
-IMPORT_ALLOWED_EXTENSIONS = {".docx", ".xlsx"}
+# Канонический набор расширений — import_controller.ALLOWED_EXTENSIONS.
+IMPORT_ALLOWED_EXTENSIONS = import_controller.ALLOWED_EXTENSIONS
 
 # Лимиты пакетного импорта (п. 3.4): файл, количество, суммарный объём,
 # свободное место на диске. Проверяются до запуска фонового разбора.
@@ -572,6 +573,9 @@ class ContractApp:
         self.root.bind("<Control-n>", lambda _event: self._select_page("counterparty"))
         self.root.bind("<Control-N>", lambda _event: self._select_page("counterparty"))
         ui.refresh_taskbar(self.root)
+        # Оркестрация пакетного импорта — в отдельном контроллере (шаг
+        # декомпозиции ContractApp, аудит 2.0.1 P2).
+        self._import_flow = import_controller.ImportController(self)
         self._enable_drop_files()
 
     # ------------------------------------------------------------------ #
@@ -2602,10 +2606,6 @@ class ContractApp:
         except (ValueError, OSError):
             return False
 
-    def _fit_document_path(self, directory: str, base: str, ext: str = ".docx") -> str:
-        """Собирает путь, укладывающийся в ``MAX_PATH_LENGTH`` (сервисный слой)."""
-        return services.fit_document_path(directory, base, ext)
-
     def _persist_document(self, draft: dict) -> dict:
         """Пишет .docx и регистрирует запись через сервисный слой (п. 9.2).
 
@@ -3767,619 +3767,107 @@ class ContractApp:
             return
         self._start_documents_import(list(files))
 
-    def _start_documents_import(self, files: list[str]):
+    # ------------------------------------------------------------------ #
+    #  Импорт документов: оркестрация в ImportController
+    # ------------------------------------------------------------------ #
+    #  Шаг декомпозиции «бог-класса» ContractApp (аудит 2.0.1, P2 — «по
+    #  одному контроллеру за итерацию»): логика пакетного импорта живёт в
+    #  import_controller.ImportController, здесь остаются фасады с прежними
+    #  именами — smoke-тест, drag-and-drop-хук и внутренние вызовы продолжают
+    #  работать как раньше. Состояние потока импорта публикуется свойствами:
+    #  smoke-тест читает и подменяет его через прежние имена атрибутов.
+
+    @property
+    def _import_running(self) -> bool:
+        """Выполняется ли сейчас пакетный импорт (состояние контроллера)."""
+        return self._import_flow.running
+
+    @_import_running.setter
+    def _import_running(self, value) -> None:
+        self._import_flow.running = bool(value)
+
+    @property
+    def _import_queue(self):
+        """Очередь результатов текущего импорта (или None между запусками)."""
+        return self._import_flow.queue
+
+    @_import_queue.setter
+    def _import_queue(self, value) -> None:
+        self._import_flow.queue = value
+
+    @property
+    def _import_win(self):
+        """Окно прогресса импорта (или None между запусками)."""
+        return self._import_flow.win
+
+    @_import_win.setter
+    def _import_win(self, value) -> None:
+        self._import_flow.win = value
+
+    @property
+    def _import_cancelled(self) -> bool:
+        """Запрошена ли отмена остатка пакета (п. 5.3)."""
+        return self._import_flow.cancelled
+
+    @_import_cancelled.setter
+    def _import_cancelled(self, value) -> None:
+        self._import_flow.cancelled = bool(value)
+
+    def _start_documents_import(self, files: list[str]) -> None:
         """Проверяет лимиты пакета и запускает фоновый анализ файлов.
 
-        До запуска отклоняются: слишком большой пакет, слишком большой
-        суммарный объём и ситуация «на диске не хватит места» (п. 3.4).
-        Размер каждого файла дополнительно проверяется в analyze_file().
-
-        Аудит 2.0.1: guard перенесён сюда из диалога — drag-and-drop вызывает
-        метод напрямую, и раньше второй запуск сбрасывал очередь/результаты
-        работающего первого (риск порчи отчёта и задвоения записей).
+        Guard повторного входа и проверки пакета — в ImportController.start;
+        drag-and-drop вызывает метод напрямую, поэтому защита стоит в начале
+        запуска (аудит 2.0.1, P1). Фабрика потока передаётся из main на
+        каждый вызов: smoke-тест подменяет main.threading.Thread синхронным
+        исполнителем, и подмена должна действовать в момент вызова.
         """
-        if getattr(self, "_import_running", False):
-            self._notify("Импорт уже выполняется — дождитесь завершения.")
-            return
-        files = [str(path) for path in files if path]
-        if not files:
-            return
-        if len(files) > IMPORT_MAX_FILES:
-            ui.alert(
-                self.root, "Слишком много файлов",
-                f"За один раз можно добавить не более {IMPORT_MAX_FILES} файлов, "
-                f"выбрано {len(files)}.\n\n"
-                "Разбейте загрузку на несколько частей.",
-                "warning",
-            )
-            return
+        self._import_flow.start(files, thread_factory=threading.Thread)
 
-        total_size = 0
-        for path in files:
-            try:
-                total_size += os.path.getsize(path)
-            except OSError:
-                pass
-        if total_size > IMPORT_MAX_TOTAL_SIZE:
-            ui.alert(
-                self.root, "Слишком большой пакет",
-                f"Суммарный объём файлов {total_size / (1024 * 1024):.0f} МБ "
-                f"превышает допустимые {IMPORT_MAX_TOTAL_SIZE / (1024 * 1024):.0f} МБ.\n\n"
-                "Разбейте загрузку на несколько частей.",
-                "warning",
-            )
-            return
-
-        try:
-            target_dir = self._documents_dir_for_import()
-        except OSError as exc:
-            ui.alert(self.root, "Папка документов недоступна", str(exc), "error")
-            return
-        try:
-            free = shutil.disk_usage(target_dir).free
-        except OSError:
-            free = None
-        if free is not None and free < total_size + IMPORT_MIN_FREE_SPACE:
-            ui.alert(
-                self.root, "Недостаточно места на диске",
-                "Для импорта нужно около "
-                f"{(total_size + IMPORT_MIN_FREE_SPACE) / (1024 * 1024):.0f} МБ "
-                f"свободного места, доступно {free / (1024 * 1024):.0f} МБ.\n\n"
-                "Освободите место или выберите другую папку документов в «Настройках».",
-                "warning",
-            )
-            return
-
-        self._import_running = True
-        # Очередь у каждого запуска своя и передаётся воркеру через args:
-        # воркер не зависит от того, что лежит в self._import_queue (аудит 2.0.1).
-        result_queue: queue.Queue = queue.Queue()
-        self._import_queue = result_queue
-        self._import_results: list[dict] = []
-        self._import_total = max(1, len(files))
-        self._import_cancelled = False
-        self._import_cancelled_count = 0
-
-        win = ctk.CTkToplevel(self.root)
-        win.title("Загрузка документов")
-        win.resizable(False, False)
-        win.transient(self.root)
-        self._import_win = win
-
-        frame = ctk.CTkFrame(win, fg_color="transparent")
-        frame.pack(fill="both", expand=True,
-                   padx=int(28 * self.scale), pady=int(22 * self.scale))
-        ctk.CTkLabel(
-            frame, text="Загрузка документов", font=ui.font(16, "bold"),
-            text_color=ui.COLORS["text"], anchor="w",
-        ).pack(anchor="w")
-        self._import_status_var = tk.StringVar(value="Подготовка…")
-        ctk.CTkLabel(
-            frame, textvariable=self._import_status_var, font=ui.font(12),
-            text_color=ui.COLORS["text_secondary"], anchor="w", justify="left",
-            wraplength=int(360 * self.scale),
-        ).pack(anchor="w", pady=(int(8 * self.scale), int(12 * self.scale)))
-        self._import_progress = ctk.CTkProgressBar(frame, width=int(360 * self.scale))
-        self._import_progress.set(0)
-        self._import_progress.pack(fill="x")
-        ctk.CTkLabel(
-            frame,
-            text="Документы анализируются в фоне. Не закрывайте окно программы.",
-            font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
-            anchor="w", justify="left", wraplength=int(360 * self.scale),
-        ).pack(anchor="w", pady=(int(10 * self.scale), 0))
-        self._import_cancel_btn = ui.ghost_button(
-            frame, "Отменить", self._cancel_import,
-            width=int(120 * self.scale), height=int(28 * self.scale),
-        )
-        self._import_cancel_btn.pack(anchor="e", pady=(int(8 * self.scale), 0))
-
-        # Окно по центру родительского, поверх остальных.
-        win.update_idletasks()
-        width = int(430 * self.scale)
-        height = int(240 * self.scale)
-        x = self.root.winfo_x() + (self.root.winfo_width() - width) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - height) // 2
-        win.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
-        try:
-            win.grab_set()
-        except tk.TclError:
-            pass
-
-        threading.Thread(
-            target=self._import_worker, args=(files, result_queue), daemon=True,
-        ).start()
-        self.root.after(80, self._import_tick)
-
-    def _cancel_import(self):
+    def _cancel_import(self) -> None:
         """Отменяет импорт: остаток пакета не анализируется и не регистрируется (п. 5.3)."""
-        if not getattr(self, "_import_running", False):
-            return
-        self._import_cancelled = True
-        try:
-            self._import_status_var.set("Отмена…")
-            self._import_cancel_btn.configure(state="disabled")
-        except Exception:
-            pass
+        self._import_flow.cancel()
 
     def _import_worker(self, files: list[str], result_queue: "queue.Queue") -> None:
-        """Фоновый поток: анализ каждого файла и копирование в папку контрагента.
-
-        После нажатия «Отменить» остаток пакета не анализируется (п. 5.3).
-        Результаты кладутся в свою очередь (args), а не в общий атрибут —
-        повторный запуск импорта не может смешать два пакета (аудит 2.0.1).
-        """
-        for index, path in enumerate(files):
-            if self._import_cancelled:
-                break
-            name = os.path.basename(path)
-            result_queue.put(
-                ("status", f"Анализ файла {index + 1} из {len(files)}:\n{name}")
-            )
-            ext = os.path.splitext(path)[1].lower()
-            if ext not in IMPORT_ALLOWED_EXTENSIONS:
-                # Allowlist: .exe/.bat/.lnk и прочее не анализируем и не копируем.
-                result_queue.put(("file", {
-                    "path": path,
-                    "name": name,
-                    "kind": storage.KIND_UNKNOWN,
-                    "number": "",
-                    "date": "",
-                    "party": None,
-                    "text": "",
-                    "error": f"Тип файла не поддерживается: {ext or 'без расширения'}",
-                    "warning": "",
-                    "recognized": False,
-                    "ok": False,
-                    "copied": "",
-                }))
-                continue
-            result = importer.analyze_file(path)
-            try:
-                result["copied"] = self._copy_imported_file(result)
-            except Exception as exc:
-                result["copied"] = ""
-                if not result.get("error"):
-                    result["error"] = f"Не удалось скопировать файл: {exc}"
-            result_queue.put(("file", result))
-        result_queue.put(("done",))
+        """Фоновый поток: анализ каждого файла и копирование в папку контрагента."""
+        self._import_flow.worker(files, result_queue)
 
     def _copy_imported_file(self, result: dict) -> str:
-        """Копирует в папку контрагента только разобранные .docx/.xlsx.
+        """Копирует в папку контрагента только разобранные .docx/.xlsx."""
+        return self._import_flow.copy_imported_file(result)
 
-        Неопознанные и потенциально опасные файлы не копируются: раньше они
-        попадали в папку документов и открывались по клику (запуск кода).
-        """
-        if not result.get("ok") or not result.get("party"):
-            return ""
-        src = str(result.get("path") or "")
-        ext = os.path.splitext(src)[1].lower()
-        if ext not in IMPORT_ALLOWED_EXTENSIONS:
-            return ""
-        base = self._documents_dir_for_import()
-        folder = safe_filename(
-            importer.party_display_name(result["party"]), "Контрагент"
-        )
-        dest_dir = os.path.normpath(os.path.join(base, folder))
-        if not self._is_inside_directory(base, dest_dir):
-            self._log.error("Папка импортированного контрагента вне папки документов")
-            return ""
-        try:
-            os.makedirs(dest_dir, exist_ok=True)
-        except OSError as exc:
-            self._log.warning(
-                "Не удалось создать папку для импорта: %s", type(exc).__name__,
-            )
-            raise
-
-        stem = safe_filename(os.path.splitext(os.path.basename(src))[0], "Документ")
-        dest = self._fit_document_path(dest_dir, stem, ext)
-        counter = 2
-        while os.path.exists(dest):
-            dest = self._fit_document_path(dest_dir, f"{stem} ({counter})", ext)
-            counter += 1
-        copy_with_zone_identifier(src, dest)
-        try:
-            size = os.path.getsize(dest)
-        except OSError:
-            size = 0
-        self._log.info(
-            "Импортированный файл скопирован: тип=%s, размер=%d байт", ext, size,
-        )
-        return dest
-
-    def _import_tick(self):
+    def _import_tick(self) -> None:
         """Опрос очереди фонового потока из главного потока Tk."""
-        try:
-            while True:
-                item = self._import_queue.get_nowait()
-                kind = item[0]
-                if kind == "status":
-                    self._import_status_var.set(item[1])
-                elif kind == "file":
-                    self._import_results.append(item[1])
-                    self._import_progress.set(
-                        len(self._import_results) / self._import_total
-                    )
-                elif kind == "done":
-                    results = self._import_results
-                    win = self._import_win
-                    self._import_queue = None
-                    self._import_results = []
-                    self._import_win = None
-                    self._import_progress = None
-                    self._import_running = False
-                    # Часть пакета могла быть пропущена по «Отмене» (п. 5.3).
-                    self._import_cancelled_count = max(
-                        0, self._import_total - len(results)
-                    )
-                    try:
-                        win.grab_release()
-                        win.destroy()
-                    except Exception:
-                        pass
-                    self._finish_documents_import(results)
-                    return
-        except queue.Empty:
-            pass
-        except (tk.TclError, AttributeError):
-            return  # окно программы закрывается — импорт прекращаем
-        self.root.after(80, self._import_tick)
+        self._import_flow.tick()
 
-    def _finish_documents_import(self, results: list[dict]):
-        """Регистрирует результаты анализа в реестре и показывает отчёт.
-
-        Правила (п. 3.3, 3.5):
-          * карточка создаётся автоматически только при найденном ИНН;
-          * без ИНН — диалог «привязать к существующему / создать / пропустить»;
-          * документ, который уже есть в реестре, повторно не добавляется;
-          * по каждому файлу в отчёте видны тип, результат и причина.
-
-        Пакетная запись (п. 5.2): все изменения пакета пишутся на диск ОДНИМ
-        ``save()`` в конце. Раньше каждое «добавить» полностью перезаписывало
-        JSON с fsync и ротацией копий — импорт 200 файлов давал 200 полных
-        записей реестра.
-        """
-        stats = {
-            "added": 0,
-            "new_parties": 0,
-            "skipped": 0,
-            "duplicates": 0,
-            "cancelled": max(0, int(getattr(self, "_import_cancelled_count", 0))),
-        }
-        save_errors: list[str] = []
-        entries: list[dict] = []
-        store_dirty = False
-
-        for result in results:
-            entry = self._new_import_entry(result)
-            entries.append(entry)
-            if self._register_import_result(result, entry, stats):
-                store_dirty = True
-
-        if store_dirty:
-            with applog.timed("Запись реестра (импорт)", 500, "storage"):
-                if not self.store.save():
-                    save_errors.append(self.store.last_error or "реестр не записан")
-            self._log.info("Пакет импорта записан одним save() (п. 5.2)")
-
-        if stats["added"]:
-            self._refresh_party_combo_values()
-            self._preview_contract()
-            self._preview_additional()
-            self.refresh_registry()
-            self._update_status()
-
-        message = (
-            "Загрузка завершена.\n"
-            f"Добавлено документов: {stats['added']} (новых контрагентов: {stats['new_parties']})\n"
-            f"Пропущено: {stats['skipped']}"
-        )
-        if stats["duplicates"]:
-            message += f", уже были в реестре: {stats['duplicates']}"
-        if stats["cancelled"]:
-            message += f"\nОтменено пользователем: {stats['cancelled']}"
-        if save_errors:
-            message += (
-                "\n\nВНИМАНИЕ: часть записей не попала на диск:\n"
-                + "\n".join(f"• {err}" for err in dict.fromkeys(save_errors))
-            )
-        self._log.info(
-            "Импорт завершён: добавлено=%d, новых контрагентов=%d, "
-            "пропущено=%d, дубликатов=%d, ошибок записи=%d",
-            stats["added"], stats["new_parties"], stats["skipped"],
-            stats["duplicates"], len(save_errors),
-        )
-        self._show_import_report(entries, message)
-        self._import_cancelled_count = 0
+    def _finish_documents_import(self, results: list[dict]) -> None:
+        """Регистрирует результаты анализа в реестре и показывает отчёт."""
+        self._import_flow.finish(results)
 
     @staticmethod
     def _new_import_entry(result: dict) -> dict:
         """Заготовка строки отчёта импорта для одного файла."""
-        return {
-            "name": result.get("name") or "файл",
-            "kind": result.get("kind") or storage.KIND_UNKNOWN,
-            "status": "skip",
-            "detail": "",
-            "warning": "",
-        }
+        return import_controller.ImportController.new_entry(result)
 
     def _register_import_result(self, result: dict, entry: dict, stats: dict) -> bool:
-        """Регистрирует один результат разбора. Возвращает True, если реестр менялся.
+        """Регистрирует один результат разбора; True — если реестр менялся."""
+        return self._import_flow.register_result(result, entry, stats)
 
-        Изменения остаются в памяти: сохранение на диск делает вызывающий код
-        одним ``save()`` на весь пакет (п. 5.2).
-        """
-        copied = result.get("copied") or ""
-        party = result.get("party") or {}
-
-        if not result.get("ok") or not party:
-            stats["skipped"] += 1
-            entry["detail"] = result.get("error") or "документ не распознан"
-            result["copied"] = self._move_import_to_unknown(copied)
-            return False
-
-        fields = dict(party.get("fields") or {})
-        inn = str(fields.get(F.INN, "")).strip()
-        rec = None
-        action = ""
-        if result.get("recognized") and inn:
-            rec = self.store.find_by_inn(inn)
-            if rec is not None:
-                action = "attach"
-            else:
-                # ИНН новый, но карточка с таким названием уже может быть
-                # (например, заведена вручную без ИНН) — не плодим дубль.
-                same_name = self.store.find_by_name(party.get("display"))
-                if same_name is not None:
-                    attach = ui.confirm(
-                        self.root, "Похожее название уже есть",
-                        f"Файл: {result.get('name')}\n"
-                        f"Распознано: {party.get('display')}\n\n"
-                        f"В реестре есть «{storage.display_name(same_name)}» "
-                        "с другим ИНН.\n\n"
-                        "Привязать документ к этой карточке?",
-                        "Привязать", "Создать новую",
-                    )
-                    if attach:
-                        rec, action = same_name, "attach"
-                if action != "attach":
-                    action = "create"
-        else:
-            rec, action = self._ask_import_party(result)
-
-        if action == "create":
-            rec = self.store.add_counterparty(party.get("type") or "ooo", fields, save=False)
-            stats["new_parties"] += 1
-            entry["detail"] = "создана новая карточка"
-        elif action == "attach" and rec is not None:
-            entry["detail"] = f"привязан к «{storage.display_name(rec)}»"
-
-        if action == "skip" or rec is None:
-            stats["skipped"] += 1
-            entry["detail"] = entry["detail"] or "контрагент не выбран"
-            result["copied"] = self._move_import_to_unknown(copied)
-            return False
-
-        if not copied:
-            stats["skipped"] += 1
-            entry["detail"] = result.get("error") or "файл не скопирован"
-            return False
-
-        if self._import_document_is_duplicate(rec["id"], result):
-            stats["duplicates"] += 1
-            entry["status"] = "duplicate"
-            entry["detail"] = "такой документ уже есть в реестре"
-            result["copied"] = self._move_import_to_unknown(copied)
-            return False
-
-        self.store.add_document(
-            result.get("kind") or storage.KIND_UNKNOWN,
-            rec["id"],
-            result.get("number") or "",
-            result.get("date") or "",
-            data=dict(rec.get("fields") or {}),
-            extra={
-                "imported": True,
-                "source_file": copied,
-                "is_ip": rec.get("type") == "ip",
-            },
-            text=result.get("text") or "",
-            save=False,
-        )
-        stats["added"] += 1
-        entry["status"] = "added"
-        if not result.get("recognized"):
-            entry["warning"] = (
-                result.get("warning") or "карточка создана без ИНН"
-            )
-        return True
-
-    def _ask_import_party(self, result: dict) -> tuple[dict | None, str]:
-        """Спрашивает, к какому контрагенту отнести документ без ИНН (п. 3.3).
-
-        Возвращает ``(запись, действие)``: действие — ``attach`` / ``create`` /
-        ``skip``. Сначала предлагается найденный по названию контрагент,
-        затем — выбранный на страницах документов, затем создание карточки.
-        """
-        party = result.get("party") or {}
-        fields = party.get("fields") or {}
-        display = str(party.get("display") or "").strip() or "название не распознано"
-        missing = party.get("missing") or "ИНН"
-
-        existing = self.store.find_by_name(display) if display else None
-        if existing is not None:
-            existing_inn = str(
-                (existing.get("fields") or {}).get(F.INN, "")
-            ).strip() or "не указан"
-            attach = ui.confirm(
-                self.root, "Похожий контрагент уже есть",
-                f"Файл: {result.get('name')}\n"
-                f"Распознано: {display}\n\n"
-                f"В реестре есть «{storage.display_name(existing)}» "
-                f"(ИНН {existing_inn}).\n\n"
-                "Привязать документ к этой карточке?",
-                "Привязать", "Создать новую",
-            )
-            if attach:
-                return existing, "attach"
-            choice = self._choice_dialog(
-                "Новый контрагент",
-                f"Создать новую карточку «{display}» без {missing}?",
-                [("create", "Создать карточку", True),
-                 ("skip", "Пропустить", False)],
-            )
-            return (None, "create") if choice == "create" else (None, "skip")
-
-        current = self._current_import_party()
-        options: list[tuple[str, str, bool]] = []
-        if current is not None:
-            options.append((
-                "attach", f"Привязать к «{storage.display_name(current)}»", False,
-            ))
-        options.append(("create", "Создать карточку", True))
-        options.append(("skip", "Пропустить", False))
-        choice = self._choice_dialog(
-            "Не найден ИНН",
-            f"Файл: {result.get('name')}\n"
-            f"Распознано: {display}\n\n"
-            f"Не найден {missing}: автоматически карточку создать нельзя.\n"
-            "Выберите, что сделать с документом:",
-            options,
-        )
-        if choice == "attach":
-            return current, "attach"
-        if choice == "create":
-            return None, "create"
-        return None, "skip"
-
-    def _current_import_party(self) -> dict | None:
-        """Контрагент, выбранный на страницах договора/доп./спецификации."""
-        for attr in ("contract_party_var", "addl_party_var", "spec_party_var"):
-            var = getattr(self, attr, None)
-            if var is None:
-                continue
-            rec = self._party_from_var(var)
-            if rec is not None:
-                return rec
-        return None
+    def _ask_import_party(self, result: dict) -> "tuple[dict | None, str]":
+        """Диалог: к какому контрагенту отнести документ без ИНН (п. 3.3)."""
+        return self._import_flow.ask_party(result)
 
     def _import_document_is_duplicate(self, party_id, result: dict) -> bool:
         """Такой документ уже есть у контрагента (тип + номер + дата)."""
-        kind = result.get("kind") or ""
-        number = str(result.get("number") or "").strip()
-        date_text = str(result.get("date") or "").strip()
-        if not kind or (not number and not date_text):
-            return False  # без номера и даты сравнивать нечего
-        for rec in self.store.documents_for(party_id):
-            if rec.get("kind") != kind:
-                continue
-            if str(rec.get("number") or "").strip() != number:
-                continue
-            if str(rec.get("date") or "").strip() != date_text:
-                continue
-            return True
-        return False
+        return self._import_flow.document_is_duplicate(party_id, result)
 
     def _move_import_to_unknown(self, path: str) -> str:
-        """Переносит отклонённый файл в папку «unknown» (п. 3.5).
-
-        Документ, который не попал в реестр, не должен оставаться в папке
-        контрагента — иначе он выглядит как осиротевший файл.
-        """
-        if not path:
-            return path
-        try:
-            if not os.path.exists(path):
-                return path
-            base = self._documents_dir_for_import()
-            unknown_dir = os.path.join(base, importer.UNKNOWN_FOLDER)
-            os.makedirs(unknown_dir, exist_ok=True)
-            ext = os.path.splitext(path)[1]
-            stem = safe_filename(os.path.splitext(os.path.basename(path))[0], "Документ")
-            dest = self._fit_document_path(unknown_dir, stem, ext)
-            counter = 2
-            while os.path.exists(dest):
-                dest = self._fit_document_path(
-                    unknown_dir, f"{stem} ({counter})", ext
-                )
-                counter += 1
-            os.replace(path, dest)
-            return dest
-        except OSError as exc:
-            self._log.warning(
-                "Не удалось перенести файл в unknown: %s", type(exc).__name__,
-            )
-            return path
+        """Переносит отклонённый файл в папку «unknown» (п. 3.5)."""
+        return self._import_flow.move_to_unknown(path)
 
     def _show_import_report(self, entries: list[dict], summary: str) -> None:
         """Окно отчёта: по каждому файлу тип, результат и причина (п. 3.5)."""
-        win = ctk.CTkToplevel(self.root)
-        win.title("Отчёт об импорте")
-        win.configure(fg_color=ui.COLORS["window"])
-        win.transient(self.root)
-        win.resizable(True, True)
-
-        body = ctk.CTkFrame(win, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=int(22 * self.scale),
-                  pady=int(18 * self.scale))
-        ctk.CTkLabel(
-            body, text="Отчёт об импорте", font=ui.font(16, "bold", display=True),
-            text_color=ui.COLORS["text"], anchor="w",
-        ).pack(anchor="w")
-        ctk.CTkLabel(
-            body, text=summary, font=ui.font(12), justify="left", anchor="w",
-            text_color=ui.COLORS["text_secondary"], wraplength=int(660 * self.scale),
-        ).pack(anchor="w", pady=(int(6 * self.scale), int(10 * self.scale)))
-
-        textbox = ctk.CTkTextbox(
-            body, width=int(660 * self.scale), height=int(360 * self.scale),
-            font=ui.font(12), wrap="word",
-        )
-        textbox.pack(fill="both", expand=True)
-
-        icons = {"added": "✓", "duplicate": "•", "skip": "✕"}
-        lines: list[str] = []
-        for entry in entries:
-            label = storage.KIND_LABELS.get(entry.get("kind"), "Документ")
-            line = (
-                f"{icons.get(entry.get('status'), '•')} {entry.get('name')} — "
-                f"{label}"
-            )
-            if entry.get("detail"):
-                line += f": {entry['detail']}"
-            if entry.get("warning"):
-                line += f" ({entry['warning']})"
-            lines.append(line)
-        textbox.insert("1.0", "\n".join(lines) or "Файлы не выбраны")
-        textbox.configure(state="disabled")
-
-        buttons = ctk.CTkFrame(body, fg_color="transparent")
-        buttons.pack(fill="x", pady=(int(12 * self.scale), 0))
-        ui.primary_button(
-            buttons, "Закрыть", win.destroy,
-            width=int(120 * self.scale), height=int(32 * self.scale),
-        ).pack(side="right")
-
-        win.update_idletasks()
-        width = int(720 * self.scale)
-        height = int(520 * self.scale)
-        try:
-            x = self.root.winfo_rootx() + max(
-                0, (self.root.winfo_width() - width) // 2
-            )
-            y = self.root.winfo_rooty() + max(
-                0, (self.root.winfo_height() - height) // 3
-            )
-            win.geometry(f"{width}x{height}+{x}+{y}")
-        except Exception:
-            pass
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
-        try:
-            win.grab_set()
-        except tk.TclError:
-            pass
-        win.wait_window()
+        self._import_flow.show_report(entries, summary)
 
     # ------------------------------------------------------------------ #
     #  Окно «Добавить контрагента»

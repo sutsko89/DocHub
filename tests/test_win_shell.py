@@ -4,13 +4,27 @@
 no-op: здесь это проверяется на фейковых окнах без настоящего Tk. Чистые
 хелперы WM_DPICHANGED (масштаб из wparam, прямоугольник-подсказка из
 lparam) тестируются напрямую — они не обращаются к Win32.
+
+Windows-раннер CI (2.15.0): тесты секции «не-Windows» помечены
+``skipif(win32)`` — на Windows эти функции идут по ветке реального Win32
+(SHGetKnownFolderPath, GetMonitorInfo, ShowWindow), и подмена фейковым
+окном на них не действует: сами функции при этом покрыты smoke-тестом на
+реальном приложении.
 """
 from __future__ import annotations
 
 import ctypes
 import os
+import sys
+
+import pytest
 
 import win_shell
+
+not_win32 = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="тест закрепляет не-Windows ветку (фейк не подменяет Win32-API)",
+)
 
 
 class FakeWindow:
@@ -85,6 +99,7 @@ def test_message_constants():
 # --------------------------------------------------------------------------- #
 #  Папка «Документы» (п. 6.2)
 # --------------------------------------------------------------------------- #
+@not_win32
 def test_documents_known_folder_returns_path(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("USERPROFILE", raising=False)
@@ -95,10 +110,12 @@ def test_documents_known_folder_returns_path(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 #  Не-Windows: безопасные аналоги Tk
 # --------------------------------------------------------------------------- #
+@not_win32
 def test_workarea_uses_window_screen_size():
     assert win_shell.workarea(FakeWindow()) == (0, 0, 1366, 768)
 
 
+@not_win32
 def test_workarea_without_window_falls_back_to_defaults():
     assert win_shell.workarea(None) == (0, 0, 1920, 1080)
 
@@ -109,6 +126,7 @@ def test_make_borderless_sets_overrideredirect_and_keeps_taskbar_flag():
     assert ("overrideredirect", True) in fake.calls
 
 
+@not_win32
 def test_minimize_maximize_restore_on_linux_use_tk_analogs():
     fake = FakeWindow()
     win_shell.minimize_window(fake)
@@ -121,6 +139,7 @@ def test_minimize_maximize_restore_on_linux_use_tk_analogs():
     assert ("state", "normal") in fake.calls
 
 
+@not_win32
 def test_focus_window_on_linux_forces_focus():
     fake = FakeWindow()
     win_shell.focus_window(fake)

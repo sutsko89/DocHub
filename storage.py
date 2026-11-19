@@ -476,11 +476,32 @@ class DataStore:
             src = path + suffix
             if not os.path.exists(src):
                 continue
-            try:
-                os.replace(src, f"{path}.bad-{stamp}{suffix}")
+            destination = f"{path}.bad-{stamp}{suffix}"
+            moved_ok = False
+            last_exc: OSError | None = None
+            # На Windows только что записанный файл может быть на короткое
+            # время заблокирован антивирусным сканом (Defender): os.replace
+            # падает с PermissionError. Замена ретраится с растущей паузой
+            # (суммарно ~0,4 с) — операция разовая, старт приложения это не
+            # тормозит. 2.15.0: без ретраев CI-сборка на Windows-раннере
+            # стабильно теряла .bad-копию (файл занят сразу после записи).
+            for attempt in range(5):
+                try:
+                    os.replace(src, destination)
+                    moved_ok = True
+                    break
+                except OSError as replace_exc:
+                    last_exc = replace_exc
+                    time.sleep(0.02 * (attempt + 1))
+            if moved_ok:
                 moved.append(os.path.basename(src))
-            except OSError:
+            else:
                 failed.append(os.path.basename(src))
+                if last_exc is not None:
+                    applog.get_logger("storage").error(
+                        "Не удалось убрать повреждённый файл %s: %s",
+                        src, last_exc,
+                    )
         self.load_warning = (
             "Файл базы реестра повреждён — программа запущена с пустым "
             f"реестром.\nОшибка: {exc}"

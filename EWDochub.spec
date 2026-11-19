@@ -10,13 +10,24 @@ from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
+# Каталог spec-файла: PyInstaller исполняет spec через exec без __file__
+# (PyInstaller 6.x), официальный глобал — SPECPATH. Fallback — каталог
+# текущего файла при выполнении вне PyInstaller (проверки линтером).
+try:
+    _SPEC_DIR = Path(SPECPATH)  # noqa: F821 — глобал PyInstaller
+except NameError:
+    try:
+        _SPEC_DIR = Path(__file__).resolve().parent
+    except NameError:
+        _SPEC_DIR = Path.cwd()
+
 # VersionInfo для exe — версия видна в свойствах файла (п. 6.1 плана).
 # Аудит 2.0.1: версия больше НЕ дублируется в spec — она читается из
 # APP_VERSION в main.py (единый источник), и бинарные filevers/prodvers
 # вычисляются из неё же (раньше строка была 2.0.1, а filevers=(1,5,0,0)).
 _match = re.search(
     r'APP_VERSION\s*=\s*"(\d+)\.(\d+)\.(\d+)"',
-    Path(__file__).with_name("main.py").read_text(encoding="utf-8"),
+    (_SPEC_DIR / "main.py").read_text(encoding="utf-8"),
 )
 if not _match:
     raise SystemExit("EWDochub.spec: не удалось прочитать APP_VERSION из main.py")

@@ -83,7 +83,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.10.0"
+APP_VERSION = "2.11.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -2117,7 +2117,7 @@ def main():
     """Точка входа: один экземпляр, логирование, корректное освобождение блокировки."""
     lock = single_instance.InstanceLock()
     if not lock.acquire():
-        # Второй экземпляр писал бы в тот же database.json и мог затереть данные.
+        # Второй экземпляр писал бы в ту же базу реестра и мог затереть данные.
         single_instance.activate_existing_window()
         single_instance.show_already_running()
         return

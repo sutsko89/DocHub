@@ -24,10 +24,15 @@ from datetime import datetime
 # изолируем тест от реальных данных пользователя, чтобы результат был детерминированным.
 os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "dogovor_smoke_appdata")
 
+# Тест не ходит в сеть: авто-проверка обновлений (2.15.0) глушится целиком;
+# сетевые функции updater в этом тесте не подменяются и не вызываются.
+os.environ["EWDOCHUB_NO_UPDATE_CHECK"] = "1"
+
 import main as m
 import reconcile
 import settings_controller
 import storage
+import updater
 import document_importer as di
 from docx import Document as _Doc
 
@@ -1556,6 +1561,41 @@ try:
           f"6.2: папка документов по умолчанию в «Документах»: {_def_dir}")
     check(m.open_file(os.path.join(tempfile.gettempdir(), "smoke_missing_6_2.docx")) is False,
           "6.2: open_file возвращает False при неудаче открытия (файла нет на диске)")
+
+    # 2.15: проверка обновлений — страница «Настройки» и логика updater
+    # (без сетевых вызовов: только разбор версий/ответа и виджеты).
+    app._select_page("settings")
+    app.root.update()
+    check(hasattr(app, "_update_check_button") and hasattr(app, "_update_status_var"),
+          "2.15: на «Настройках» есть кнопка проверки обновлений и статус версии")
+    check(str(m.APP_VERSION) in app._update_status_var.get(),
+          f"2.15: статус показывает установленную версию {m.APP_VERSION}")
+    check(app._update_auto_var.get() is True,
+          "2.15: авто-проверка обновлений включена по умолчанию")
+    check(app._update_flow.busy is False and app._update_flow.result_queue is None,
+          "2.15: глушилка EWDOCHUB_NO_UPDATE_CHECK отключила автопроверку при старте")
+    check(updater.parse_version("v2.16.0") == (2, 16, 0)
+          and updater.is_newer("2.15", "2.15.0") is False
+          and updater.is_newer("2.16.0", "2.15.0") is True,
+          "2.15: сравнение версий — v-префикс и выравнивание длины")
+    check(updater.parse_release_payload({"tag_name": "v1.0", "draft": True}) is None
+          and updater.parse_release_payload({"tag_name": ""}) is None,
+          "2.15: draft-релиз и ответ без тега не считаются релизом")
+    _upd_rel = updater.parse_release_payload({
+        "tag_name": "v2.16.0",
+        "html_url": "https://example.com/release/v2.16.0",
+        "assets": [{"name": "EW.DocHub-2.16.0-setup.exe",
+                    "browser_download_url": "https://example.com/EW.DocHub-2.16.0-setup.exe"}],
+    })
+    check(_upd_rel is not None and _upd_rel["version_str"] == "2.16.0"
+          and _upd_rel["installer_url"].endswith("-setup.exe"),
+          "2.15: из ответа GitHub извлекаются версия и ссылка на установщик")
+    _upd_settings: dict = {}
+    updater.mark_checked(_upd_settings)
+    check(not updater.auto_check_due(_upd_settings),
+          "2.15: суточный троттлинг — сразу после проверки автопроверка не нужна")
+    check(updater.check_enabled() is False,
+          "2.15: check_enabled() видит env-глушку smoke-прогона")
 
     # Реестр.
     app._select_page("registry")

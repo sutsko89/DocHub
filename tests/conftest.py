@@ -16,6 +16,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# Тесты не ходят в сеть: авто-проверка обновлений (2.15.0) глушится на весь
+# набор. updater.check_enabled() читает переменную при вызове — включая
+# момент, когда Tk-фикстура дёргает стартовый таймер maybe_auto_check.
+os.environ.setdefault("EWDOCHUB_NO_UPDATE_CHECK", "1")
+
 
 @pytest.fixture()
 def appdata(tmp_path, monkeypatch):

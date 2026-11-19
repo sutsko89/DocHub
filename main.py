@@ -46,6 +46,7 @@ import registry_controller
 import settings_controller
 import single_instance
 import storage
+import updater_controller
 import ui_macos as ui
 import win_shell
 
@@ -83,7 +84,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.14.0"
+APP_VERSION = "2.15.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -518,6 +519,12 @@ class ContractApp:
         # build_settings_page вызывается напрямую у контроллера.
         self._settings_flow = settings_controller.SettingsController(self)
 
+        # Проверка обновлений (2.15.0): тихая автопроверка при старте и
+        # кнопка «Проверить обновления» на странице «Настройки» —
+        # UpdateController. Создаётся ДО построения страниц: карточка
+        # «Обновления» привязывает кнопку к контроллеру.
+        self._update_flow = updater_controller.UpdateController(self)
+
         # Единый «текущий контрагент» и защита несохранённых данных (п. 4.2, 4.4).
         self._current_party_id = None
         self._current_party_vars: dict[str, tk.StringVar] = {}
@@ -549,6 +556,10 @@ class ContractApp:
         # Автоочистка старой корзины и сверка «реестр ↔ папка документов».
         self.root.after(900, self._cleanup_expired_trash)
         self.root.after(1500, self._registry_flow.scan_consistency)
+        # Тихая автопроверка обновлений (2.15.0): после всех стартовых задач,
+        # не чаще раза в сутки, выключается пользователем и env-глушкой
+        # EWDOCHUB_NO_UPDATE_CHECK (тесты/smoke не ходят в сеть).
+        self.root.after(2200, self._update_flow.maybe_auto_check)
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Escape>", self._on_escape)

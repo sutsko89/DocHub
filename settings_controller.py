@@ -56,6 +56,7 @@ import tkinter as tk
 
 import dadata_client as dadata
 import ui_macos as ui
+import updater
 import win_shell
 
 
@@ -85,7 +86,7 @@ class SettingsController:
 
         _page, left, _right, _textbox = app._make_page(
             "settings", "Настройки",
-            "Тема оформления, папка документов и ключ DaData.",
+            "Тема оформления, папка документов, ключ DaData и обновления.",
         )
 
         # -- Тема -------------------------------------------------------- #
@@ -191,6 +192,41 @@ class SettingsController:
             width=int(130 * app.scale), height=int(28 * app.scale),
         ).pack(side="left", padx=(int(10 * app.scale), 0))
 
+        # -- Обновления (2.15.0) ----------------------------------------- #
+        # Текущая версия + кнопка «Проверить обновления» (ручная проверка,
+        # guard в UpdateController) + переключатель тихой автопроверки
+        # при старте (раз в сутки, хранится в settings.json).
+        card = ui.Card(left, labels_above=True)
+        card.grid(row=3, column=0, sticky="new", padx=int(4 * app.scale), pady=(0, int(12 * app.scale)))
+        card.section("Обновления")
+        app._update_status_var = tk.StringVar(value=app._update_flow.status_text())
+        card.wide(
+            ctk.CTkLabel(
+                card.body, textvariable=app._update_status_var,
+                font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
+                anchor="w", justify="left",
+                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+            ),
+            pady=(int(2 * app.scale), int(6 * app.scale)),
+        )
+        update_buttons = ctk.CTkFrame(card.body, fg_color="transparent")
+        card.wide(update_buttons)
+        app._update_check_button = ui.secondary_button(
+            update_buttons, "Проверить обновления", app._update_flow.check_now,
+            width=int(170 * app.scale), height=int(30 * app.scale),
+        )
+        app._update_check_button.pack(side="left")
+        app._update_auto_var = tk.BooleanVar(
+            value=updater.auto_check_enabled(app._settings))
+        auto_switch = ctk.CTkSwitch(
+            card.body, text="Проверять автоматически",
+            variable=app._update_auto_var,
+            command=app._settings_flow.toggle_auto_update_check,
+            font=ui.font(12),
+        )
+        card.wide(auto_switch, pady=(int(8 * app.scale), int(2 * app.scale)))
+        auto_switch.grid_configure(sticky="w")
+
     # ------------------------------------------------------------------ #
     #  Ключ DaData
     # ------------------------------------------------------------------ #
@@ -246,6 +282,15 @@ class SettingsController:
         app._dadata_key_status_var.set(app._settings_flow.dadata_key_status_text())
         ui.alert(app.root, "Ключ удалён",
                  "Ключ DaData удалён из профиля пользователя.", "success")
+
+    # ------------------------------------------------------------------ #
+    #  Обновления (2.15.0)
+    # ------------------------------------------------------------------ #
+    def toggle_auto_update_check(self):
+        """Переключатель «Проверять автоматически»: сохраняется немедленно."""
+        app = self.app
+        app._settings["auto_update_check"] = bool(app._update_auto_var.get())
+        app._persist_settings()
 
     # ------------------------------------------------------------------ #
     #  Папка документов: выбор и немедленное сохранение

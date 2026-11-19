@@ -127,6 +127,16 @@ def test_settings_page_shows_key_status_without_value(app):
         "статус без подстановки значения ключа (аудит 2.0.1)"
 
 
+def test_settings_page_update_widgets_created(app):
+    """Карточка «Обновления» (2.15.0): статус версии, кнопка, переключатель."""
+    import main
+
+    assert main.APP_VERSION in app._update_status_var.get()
+    assert app._update_check_button is not None
+    assert app._update_auto_var.get() is True, "авто-проверка включена по умолчанию"
+    assert app._update_flow.busy is False, "автопроверка не стартовала (env-глушка в conftest)"
+
+
 # --------------------------------------------------------------------------- #
 #  Трассы переменных ведут в контроллеры напрямую (v2.12.0)
 # --------------------------------------------------------------------------- #

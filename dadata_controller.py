@@ -22,8 +22,6 @@ from __future__ import annotations
 
 import queue
 import threading
-import threading
-import threading
 from collections.abc import Callable
 from typing import Any
 

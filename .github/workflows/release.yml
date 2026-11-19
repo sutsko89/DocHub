@@ -16,6 +16,11 @@ on:
   push:
     tags: ["v*"]
 
+# Публикация релиза (2.15.0): на тегах setup.exe и SHA-256 выкладываются
+# в GitHub Releases встроенным GITHUB_TOKEN.
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Windows — exe + установщик + SHA-256
@@ -70,5 +75,26 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-# Публикация в GitHub Releases (softprops/action-gh-release) — после начала
-# подписи сертификатом, чтобы релиз сразу содержал подписанный setup.exe.
+      - name: Публикация GitHub Release (только теги)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: EW.DocHub ${{ github.ref_name }}
+          files: |
+            installer/*-setup.exe
+            installer/SHA256SUMS.txt
+          body: |
+            Установщик Windows: скачать **EW.DocHub-*-setup.exe** ниже и запустить.
+            Контрольная сумма SHA-256 — в файле `SHA256SUMS.txt` рядом с установщиком.
+
+            Требования: Windows 10/11 x64. После установки в программе нет ни данных,
+            ни ключей — реестр пуст, ключ DaData вводится в «Настройках» (п. 6.1).
+            Проверка новых версий — «Настройки → Обновления» (2.15.0).
+
+            Установщик не подписан сертификатом: SmartScreen может показать
+            «неизвестный издатель» — «Подробнее → Выполнить в любом случае».
+          fail_on_unmatched_files: true
+
+# Публикация в GitHub Releases (шаг softprops/action-gh-release выше) — на тегах
+# с 2.15.0. Подпись сертификатом добавляется шагом signtool (см. шапку файла):
+# тогда в release попадает уже подписанный setup.exe.

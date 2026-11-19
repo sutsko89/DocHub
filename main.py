@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import copy
 import counterparty_controller
-import ctypes
 import json
 import os
 import platform
@@ -48,6 +47,7 @@ import settings_controller
 import single_instance
 import storage
 import ui_macos as ui
+import win_shell
 
 # Печатные формы вынесены в document_builder (п. 9.1 плана); имена
 # реэкспортируются, чтобы main.py, smoke_test.py и тесты работали как раньше.
@@ -83,21 +83,15 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.12.1"
+APP_VERSION = "2.13.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
 # Масштабирование берём на себя: иначе customtkinter масштабирует повторно.
 ScalingTracker.deactivate_automatic_dpi_awareness = True
 
-if sys.platform == "win32":
-    try:  # чёткий текст на экранах с масштабированием (125 %, 150 % и т. д.)
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
+# Per-Monitor DPI awareness (п. 6.3) — до создания первого окна Tk.
+win_shell.enable_dpi_awareness()
 
 
 # ---------- Кэш шаблонов печатных форм (п. 5.5 этапа 5) ----------
@@ -110,43 +104,6 @@ if sys.platform == "win32":
 SETTINGS_DIR_NAME = "DogovorGenerator"
 MIN_WINDOW_WIDTH = 1120  # логические пиксели
 MIN_WINDOW_HEIGHT = 620
-
-
-def _user_documents_dir() -> str:
-    """Папка «Документы» пользователя (п. 6.2): видимое место вместо скрытого %APPDATA%."""
-    if sys.platform == "win32":
-        try:
-            import uuid as _uuid
-
-            class _GUID(ctypes.Structure):
-                _fields_ = [
-                    ("Data1", ctypes.c_ulong),
-                    ("Data2", ctypes.c_ushort),
-                    ("Data3", ctypes.c_ushort),
-                    ("Data4", ctypes.c_ubyte * 8),
-                ]
-
-            guid = _GUID()
-            known = _uuid.UUID("FDD39AD0-238F-46AF-ADB4-6C85480369C7")  # FOLDERID_Documents
-            guid.Data1, guid.Data2, guid.Data3 = (
-                known.time_low, known.time_mid, known.time_hi_version,
-            )
-            guid.Data4[:] = known.bytes[8:]
-            out = ctypes.c_void_p()
-            hr = ctypes.windll.shell32.SHGetKnownFolderPath(
-                ctypes.byref(guid), 0, None, ctypes.byref(out)
-            )
-            if hr == 0 and out.value:
-                documents = ctypes.wstring_at(out.value)
-                ctypes.windll.ole32.CoTaskMemFree(out)
-                return documents
-            if out.value:
-                ctypes.windll.ole32.CoTaskMemFree(out)
-        except Exception:
-            pass
-        profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
-        return os.path.join(profile, "Documents")
-    return os.path.join(os.path.expanduser("~"), "Documents")
 
 
 def settings_path() -> str:
@@ -777,15 +734,19 @@ class ContractApp:
         # Хэндлы верхней кромки делаем детьми шапки: они должны быть под
         # кнопками окна, иначе «n»/«nw»/«ne» перекрывают красный ховер
         # кнопки «закрыть» и перехватывают клики по ней.
+        # Курсоры — системные имена Windows (п. 6.3): «top_side» и родственные
+        # X-имена не во всех средах resolves, «size_*» есть в любой Windows.
+        # TclError при создании хэндла отлавливается ниже — окно остаётся
+        # работоспособным и без курсоров растяжения (Xvfb и минималистичные X).
         specs = (
-            ("n",  "top_side",            "chrome",  dict(relx=0.0, rely=0.0, relwidth=1.0, height=t), self.titlebar),
-            ("nw", "top_left_corner",     "chrome",  dict(width=c, height=c), self.titlebar),
-            ("ne", "top_right_corner",    "chrome",  dict(relx=1.0, x=-c, width=c, height=c), self.titlebar),
-            ("s",  "bottom_side",         "window",  dict(relx=0.0, rely=1.0, y=-t, relwidth=1.0, height=t), self.root),
-            ("w",  "left_side",           "sidebar", dict(rely=0.0, relheight=1.0, width=t), self.root),
-            ("e",  "right_side",          "content", dict(relx=1.0, x=-t, rely=0.0, relheight=1.0, width=t), self.root),
-            ("sw", "bottom_left_corner",  "sidebar", dict(rely=1.0, y=-c, width=c, height=c), self.root),
-            ("se", "bottom_right_corner", "window",  dict(relx=1.0, rely=1.0, x=-c, y=-c, width=c, height=c), self.root),
+            ("n",  "size_ns",            "chrome",  dict(relx=0.0, rely=0.0, relwidth=1.0, height=t), self.titlebar),
+            ("nw", "size_nwse",          "chrome",  dict(width=c, height=c), self.titlebar),
+            ("ne", "size_nesw",          "chrome",  dict(relx=1.0, x=-c, width=c, height=c), self.titlebar),
+            ("s",  "size_ns",            "window",  dict(relx=0.0, rely=1.0, y=-t, relwidth=1.0, height=t), self.root),
+            ("w",  "size_we",            "sidebar", dict(rely=0.0, relheight=1.0, width=t), self.root),
+            ("e",  "size_we",            "content", dict(relx=1.0, x=-t, rely=0.0, relheight=1.0, width=t), self.root),
+            ("sw", "size_nesw",          "sidebar", dict(rely=1.0, y=-c, width=c, height=c), self.root),
+            ("se", "size_nwse",          "window",  dict(relx=1.0, rely=1.0, x=-c, y=-c, width=c, height=c), self.root),
         )
         self._resize_handles = []
         for edge, cursor, color_key, place_kwargs, parent in specs:
@@ -1407,84 +1368,43 @@ class ContractApp:
         return "break"
 
     # ------------------------------------------------------------------ #
-    #  Drag&drop файлов в окно (п. 4.5)
+    #  Drag&drop файлов в окно (п. 4.5) и смена DPI монитора (п. 6.3)
     # ------------------------------------------------------------------ #
     def _enable_drop_files(self) -> None:
         """Принимает файлы, перетащенные в окно, через WM_DROPFILES.
 
-        Дополнительных зависимостей не требуется. При любой ошибке
-        возможность просто отключается — остаётся кнопка «Добавить документы…».
+        Win32-обвязка (DragAcceptFiles, подкласс WndProc) вынесена в
+        win_shell (п. 9.3): один хук на окно обслуживает и WM_DROPFILES,
+        и WM_DPICHANGED (п. 6.3). Колбэки уходят в цикл Tk через
+        after(0) — выполняются в главном потоке. При любой ошибке
+        возможность просто отключается — остаётся кнопка
+        «Добавить документы…», а геометрию при смене DPI правит Tk.
         """
-        if sys.platform != "win32":
-            return
-        try:
-            user32 = ctypes.windll.user32
-            shell32 = ctypes.windll.shell32
-            user32.GetParent.restype = ctypes.c_void_p
-            user32.GetParent.argtypes = [ctypes.c_void_p]
-            shell32.DragAcceptFiles.argtypes = [ctypes.c_void_p, ctypes.c_bool]
-            hwnd = user32.GetParent(ctypes.c_void_p(self.root.winfo_id()))
-            if not hwnd:
-                hwnd = self.root.winfo_id()
-            shell32.DragAcceptFiles(ctypes.c_void_p(hwnd), True)
+        win_shell.install_window_hooks(
+            self.root,
+            on_files=self._import_flow.start,
+            on_dpi_changed=self._on_dpichanged,
+        )
 
-            GWLP_WNDPROC = -4
-            user32.GetWindowLongPtrW.restype = ctypes.c_void_p
-            user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            user32.SetWindowLongPtrW.restype = ctypes.c_void_p
-            user32.SetWindowLongPtrW.argtypes = [
-                ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
-            ]
-            user32.CallWindowProcW.restype = ctypes.c_longlong
-            user32.CallWindowProcW.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
-                ctypes.c_ulonglong, ctypes.c_longlong,
-            ]
-            old_proc = user32.GetWindowLongPtrW(ctypes.c_void_p(hwnd), GWLP_WNDPROC)
-            if not old_proc:
-                return
+    def _on_dpichanged(self, dpi: int, rect: tuple[int, int, int, int]) -> None:
+        """Окно перенесли на монитор с другим масштабом (п. 6.3).
 
-            wndproc_type = ctypes.WINFUNCTYPE(
-                ctypes.c_longlong, ctypes.c_void_p, ctypes.c_uint,
-                ctypes.c_ulonglong, ctypes.c_longlong,
-            )
-
-            def handler(h, msg, wparam, lparam):
-                if msg == 0x0233:  # WM_DROPFILES
-                    try:
-                        count = shell32.DragQueryFileW(
-                            ctypes.c_void_p(wparam), 0xFFFFFFFF, None, 0
-                        )
-                        files: list[str] = []
-                        for index in range(count):
-                            length = shell32.DragQueryFileW(
-                                ctypes.c_void_p(wparam), index, None, 0
-                            )
-                            buffer = ctypes.create_unicode_buffer(length + 1)
-                            shell32.DragQueryFileW(
-                                ctypes.c_void_p(wparam), index, buffer, length + 1
-                            )
-                            if buffer.value:
-                                files.append(buffer.value)
-                        shell32.DragFinish(ctypes.c_void_p(wparam))
-                        if files:
-                            self.root.after(
-                                0, lambda f=list(files): self._import_flow.start(f)
-                            )
-                        return 0
-                    except Exception:
-                        pass
-                return user32.CallWindowProcW(old_proc, h, msg, wparam, lparam)
-
-            self._drop_proc = wndproc_type(handler)
-            self._drop_old_proc = old_proc
-            self._drop_hwnd = hwnd
-            user32.SetWindowLongPtrW(
-                ctypes.c_void_p(hwnd), GWLP_WNDPROC,
-                ctypes.cast(self._drop_proc, ctypes.c_void_p),
-            )
-        except Exception as exc:
-            self._log.warning("Drag&drop недоступен: %s", type(exc).__name__)
+        Окно встаёт в подсказанный Windows прямоугольник (иначе после
+        переноса вылезает за границы монитора), масштаб интерфейса
+        пересчитывается — диалоги, тосты и меню, созданные после
+        переноса, используют новый масштаб. Уже построенные страницы под
+        новый масштаб не пересобираются: живая пересборка интерфейса —
+        отдельная задача (см. «Известные долги» README).
+        """
+        self.scale = max(1.0, dpi / 96.0)
+        ui.set_scale(self.scale)
+        x, y, width, height = rect
+        if width > 0 and height > 0:
+            self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self._refresh_scrollbars()
+        self._log.info(
+            "Смена DPI монитора: %d → масштаб интерфейса %.2f", dpi, self.scale,
+        )
 
     # ------------------------------------------------------------------ #
     #  Навигация и статус

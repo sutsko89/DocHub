@@ -232,6 +232,33 @@ def test_dadata_guard_blocks_second_click(app):
     app._dadata_flow.busy = False
 
 
+def test_on_dpichanged_recomputes_scale_and_geometry(app):
+    """Перенос окна на монитор 150 % (п. 6.3): масштаб и геометрия обновлены.
+
+    Обратный порядок относительно suggested rect: win_shell передаёт
+    (x, y, ширина, высота). После проверки состояние откатывается —
+    фикстура модульная, следующие тесты ждут прежний масштаб.
+    """
+    old_scale = app.scale
+    old_geometry = app.root.geometry()
+    try:
+        app._on_dpichanged(144, (10, 20, 1210, 820))
+        assert app.scale == 1.5
+        assert main.ui.SCALE == 1.5
+        geo = app.root.geometry()
+        # Позиция из подсказанного прямоугольника обязана совпасть точно;
+        # размер может подрезаться менеджером окружения (Xvfb без WM
+        # подрезает запрошенный размер внутренней логикой CustomTkinter) —
+        # важен сам факт применения новой геометрии.
+        assert geo.endswith("+10+20"), geo
+        assert geo != old_geometry
+    finally:
+        app.scale = old_scale
+        main.ui.set_scale(old_scale)
+        app.root.geometry(old_geometry)
+        app.root.update()
+
+
 def test_store_uses_isolated_profile(app):
     import storage as st
 

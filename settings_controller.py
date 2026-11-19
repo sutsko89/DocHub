@@ -33,13 +33,14 @@ Tk-диалогов для импорта и проверка выхода пу�
   ``self.app._persist_settings``: иначе при аварийном завершении выбор
   терялся бы до закрытия программы.
 
-Зависимости от модуля main (``main.SETTINGS_DIR_NAME``,
-``main._user_documents_dir``, ширины разметки ``main.ENTRY_WIDTH`` /
-``main.LEFT_PANEL_WIDTH``) берутся поздним импортом внутри методов: модуль
-main импортирует этот контроллер, поэтому верхнеуровневый импорт дал бы
-цикл, а к моменту любого вызова метода main уже полностью инициализирован.
-Остальные зависимости — ``ui_macos``, ``dadata_client``, ``tkinter`` —
-импортируются напрямую.
+Зависимости от модуля main (``main.SETTINGS_DIR_NAME``, ширины разметки
+``main.ENTRY_WIDTH`` / ``main.LEFT_PANEL_WIDTH``) берутся поздним импортом
+внутри методов: модуль main импортирует этот контроллер, поэтому
+верхнеуровневый импорт дал бы цикл, а к моменту любого вызова метода main
+уже полностью инициализирован. Папка «Документы» берётся напрямую из
+``win_shell.documents_known_folder`` (п. 9.3). Остальные зависимости —
+``ui_macos``, ``win_shell``, ``dadata_client``, ``tkinter`` — импортируются
+напрямую.
 
 Поведение один в один повторяет код, вынесенный из main.py версии 2.8.0.
 """
@@ -55,6 +56,7 @@ import tkinter as tk
 
 import dadata_client as dadata
 import ui_macos as ui
+import win_shell
 
 
 class SettingsController:
@@ -281,9 +283,9 @@ class SettingsController:
         к прежнему месту в профиле пользователя.
         """
         app = self.app
-        import main  # поздний импорт: константы и хелпер main.py (см. докстринг)
+        import main  # поздний импорт: константы main.py (см. докстринг)
 
-        base = os.path.join(main._user_documents_dir(), "EW.DocHub")
+        base = os.path.join(win_shell.documents_known_folder(), "EW.DocHub")
         try:
             os.makedirs(base, exist_ok=True)
             return base

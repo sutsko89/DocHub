@@ -33,6 +33,7 @@ import pytest
 import dadata_client as dadata
 import main
 import settings_controller as scc
+import win_shell
 from settings_controller import SettingsController
 
 
@@ -272,7 +273,7 @@ def test_open_folder_button_routes_through_app_facade(app):
 #  Папка документов по умолчанию (п. 6.2)
 # --------------------------------------------------------------------------- #
 def test_default_documents_dir_creates_visible_folder(app, flow, monkeypatch, tmp_path):
-    monkeypatch.setattr(main, "_user_documents_dir", lambda: str(tmp_path / "Документы"))
+    monkeypatch.setattr(win_shell, "documents_known_folder", lambda: str(tmp_path / "Документы"))
     result = flow.default_documents_dir(interactive=False)
 
     assert result == str(tmp_path / "Документы" / "EW.DocHub")
@@ -283,7 +284,7 @@ def test_default_documents_dir_fallback_to_appdata(app, flow, alerts, monkeypatc
     # «Документы» — файл: создать папку внутри нельзя → возврат в профиль.
     documents_file = tmp_path / "Документы"
     documents_file.write_text("x", encoding="utf-8")
-    monkeypatch.setattr(main, "_user_documents_dir", lambda: str(documents_file))
+    monkeypatch.setattr(win_shell, "documents_known_folder", lambda: str(documents_file))
     result = flow.default_documents_dir(interactive=False)
 
     assert result == os.path.join(os.environ["APPDATA"],
@@ -306,7 +307,7 @@ def test_documents_dir_custom_ok_resets_retries(app, flow, tmp_path):
 
 
 def test_documents_dir_no_custom_uses_default(app, flow, monkeypatch, tmp_path):
-    monkeypatch.setattr(main, "_user_documents_dir", lambda: str(tmp_path / "Документы"))
+    monkeypatch.setattr(win_shell, "documents_known_folder", lambda: str(tmp_path / "Документы"))
     assert flow.documents_dir() == str(tmp_path / "Документы" / "EW.DocHub")
 
 
@@ -432,7 +433,7 @@ def test_documents_dir_for_import_broken_raises(app, flow, tmp_path):
 
 
 def test_documents_dir_for_import_no_custom(app, flow, monkeypatch, tmp_path):
-    monkeypatch.setattr(main, "_user_documents_dir", lambda: str(tmp_path / "Документы"))
+    monkeypatch.setattr(win_shell, "documents_known_folder", lambda: str(tmp_path / "Документы"))
     assert flow.documents_dir_for_import() == str(tmp_path / "Документы" / "EW.DocHub")
 
 

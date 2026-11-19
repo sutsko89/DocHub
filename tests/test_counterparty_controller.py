@@ -1,0 +1,429 @@
+"""Юнит-тесты CounterpartyController — шестой контроллер декомпозиции ContractApp.
+
+Аудит 2.0.1 (P2 «контроллеры»): страница «Добавить контрагента» и окно
+редактирования карточки переехали в counterparty_controller.py и проверяются
+без Tk — контроллер получает фейковое приложение (duck typing) и настоящее
+хранилище DataStore, а smoke-тест продолжает покрывать GUI-путь целиком
+(сборка страницы, «Заполнить по ИНН», окно редактирования — только Tk).
+
+Контракты, закреплённые тестами (из аудита 2.0.1):
+  * сбор данных карточки: значения читаются и очищаются; сбой чтения любого
+    поля возвращает None (не пустую строку) и пишется в журнал;
+  * у ИП фактический адрес повторяет юридический;
+  * сохранение при сбое сборки показывает ошибку и не пишет реестр;
+  * ошибки валидации подсвечивают поля и не доходят до хранилища;
+  * дубликат ИНН — выбор из трёх исходов (п. 4.1): «Открыть существующего»
+    выбирает существующую карточку и уводит на договор, «Отмена» ничего не
+    меняет, «Создать всё равно» создаёт дубль;
+  * сбой записи реестра не оставляет «фантом» в памяти (п. 9.2);
+  * успешное сохранение сбрасывает baseline карточки, обновляет списки и
+    сразу переходит к договору с уже выбранным контрагентом;
+  * фасады ContractApp с прежними именами делегируют контроллеру, а защита
+    несохранённых данных (п. 4.4) видит карточку через тот же конвейер.
+"""
+from __future__ import annotations
+
+import logging
+from types import SimpleNamespace
+
+import pytest
+
+import counterparty_controller as cc
+import main
+import storage
+from document_builder import F
+from render_helpers import IP_FIELDS, OOO_FIELDS
+
+CounterpartyController = cc.CounterpartyController
+
+# Поля документа (номер/дата) в карточку контрагента не входят.
+DOCUMENT_KEYS = (F.NUMBER, F.DAY, F.MONTH)
+
+
+def ooo_card() -> dict:
+    return {k: str(v) for k, v in OOO_FIELDS.items() if k not in DOCUMENT_KEYS}
+
+
+def ip_card() -> dict:
+    return {k: str(v) for k, v in IP_FIELDS.items() if k not in DOCUMENT_KEYS}
+
+
+# --------------------------------------------------------------------------- #
+#  Фейки: приложение и виджеты
+# --------------------------------------------------------------------------- #
+class FakeVar:
+    """Минимальный аналог tk.StringVar (без Tk: подменяет cc.tk.StringVar)."""
+
+    def __init__(self, value=""):
+        self._value = value
+
+    def get(self) -> str:
+        return self._value
+
+    def set(self, value) -> None:
+        self._value = value
+
+
+class FakeEntry:
+    """Минимальный аналог поля ввода с подсветкой ошибки."""
+
+    def __init__(self, value=""):
+        self._value = value
+        self.error_marks: list[bool] = []
+
+    def get(self) -> str:
+        return self._value
+
+    def set_error(self, on: bool) -> None:
+        self.error_marks.append(on)
+
+
+class BrokenEntry:
+    """Поле, чтение которого падает (уничтоженный виджет, сбой Tk)."""
+
+    def get(self):
+        raise RuntimeError("widget destroyed")
+
+
+class FakeFrame:
+    """Минимальный аналог кадра «Юр. лицо / ИП»."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.raised = 0
+
+    def tkraise(self) -> None:
+        self.raised += 1
+
+
+class FakeApp:
+    """Duck-typed приложение: только то, что трогает CounterpartyController."""
+
+    def __init__(self, store: storage.DataStore):
+        self.root = object()  # первый аргумент ui.alert — заглушен
+        self.store = store
+        self._log = logging.getLogger("test-counterparty-controller")
+        self.calls: list = []
+        self.notifications: list = []
+        self.choice_calls: list = []
+        self.choice_result: str | None = None
+        self.current_party = None
+
+        # Состояние страницы остаётся на приложении (шаг 6 декомпозиции).
+        self._cp_entries: dict[str, dict] = {"ooo": {}, "ip": {}}
+        self._cp_error_vars: dict[str, dict] = {"ooo": {}, "ip": {}}
+        self._cp_type_var = FakeVar("Юр. лицо")
+        self._cp_frames = {"ooo": FakeFrame("ooo"), "ip": FakeFrame("ip")}
+        # Контроллер создаётся здесь же, как в ContractApp.__init__.
+        self._counterparty_flow = CounterpartyController(self)
+
+    # -- хуки, оставшиеся на приложении ------------------------------------- #
+    def _cp_collect(self, mode):
+        # Фасад ContractApp._cp_collect: FakeApp — не наследник ContractApp,
+        # для _form_signature нужен тот же маршрут через контроллер.
+        return self._counterparty_flow.collect(mode)
+
+    def _choice_dialog(self, title, message, options):
+        self.choice_calls.append((title, message, options))
+        return self.choice_result
+
+    def _reset_form_baseline(self, page):
+        self.calls.append(("baseline", page))
+
+    def _set_current_party(self, rec, source=None):
+        self.current_party = rec
+        self.calls.append(("set_party", rec))
+
+    def _select_page(self, key):
+        self.calls.append(("page", key))
+
+    def _refresh_party_combo_values(self):
+        self.calls.append("combo")
+
+    def _update_status(self):
+        self.calls.append("status")
+
+    def refresh_registry(self):
+        self.calls.append("registry")
+
+    def _notify(self, message, path=None):
+        self.notifications.append(message)
+
+
+def seed_entries(app: FakeApp, mode: str, card: dict) -> None:
+    """Заполняет состояние страницы фейковыми полями по словарю реквизитов."""
+    app._cp_entries[mode] = {key: FakeEntry(value) for key, value in card.items()}
+
+
+# --------------------------------------------------------------------------- #
+#  Фикстуры
+# --------------------------------------------------------------------------- #
+@pytest.fixture()
+def ui_stub(monkeypatch):
+    """Перехват ui.alert: запись текстов (выбор исходов — через FakeApp)."""
+    state = {"alerts": []}
+
+    def fake_alert(root, *args, **kwargs):
+        state["alerts"].append((args, kwargs))
+
+    monkeypatch.setattr(cc.ui, "alert", fake_alert)
+    return state
+
+
+@pytest.fixture()
+def app(store):
+    return FakeApp(store)
+
+
+@pytest.fixture()
+def flow(app):
+    return app._counterparty_flow
+
+
+@pytest.fixture()
+def tk_vars(monkeypatch):
+    """tk.StringVar -> FakeVar: пути ошибок создают переменные без Tk."""
+    monkeypatch.setattr(cc.tk, "StringVar", FakeVar)
+
+
+# --------------------------------------------------------------------------- #
+#  collect: сбор данных карточки
+# --------------------------------------------------------------------------- #
+def test_collect_reads_values_and_strips(app, flow):
+    seed_entries(app, "ooo", {"ooo": ooo_card()}["ooo"])
+    app._cp_entries["ooo"][F.INN] = FakeEntry(f" {OOO_FIELDS[F.INN]} ")
+    data = flow.collect("ooo")
+    assert data[F.INN] == OOO_FIELDS[F.INN]
+    assert data[F.SHORT_NAME] == OOO_FIELDS[F.SHORT_NAME]
+
+
+def test_collect_failure_returns_none_and_logs(app, flow, caplog):
+    seed_entries(app, "ooo", ooo_card())
+    app._cp_entries["ooo"][F.KPP] = BrokenEntry()
+    with caplog.at_level(logging.WARNING, logger="test-counterparty-controller"):
+        assert flow.collect("ooo") is None
+    assert "Не удалось прочитать поле карточки" in caplog.text
+    assert F.KPP in caplog.text
+
+
+def test_collect_ip_copies_legal_address_to_fact(app, flow):
+    seed_entries(app, "ip", ip_card())
+    data = flow.collect("ip")
+    assert data[F.FACT_ADDRESS] == IP_FIELDS[F.LEGAL_ADDRESS]
+
+
+# --------------------------------------------------------------------------- #
+#  error_var_for / on_type_change
+# --------------------------------------------------------------------------- #
+def test_error_var_for_creates_and_reuses_var(app, flow, tk_vars):
+    get = flow.error_var_for("ooo")
+    var = get(F.INN)
+    assert get(F.INN) is var, "переменная ошибки переиспользуется"
+    assert get(F.KPP) is not var, "у каждого поля своя переменная"
+
+
+def test_on_type_change_raises_mode_frame(app, flow):
+    flow.on_type_change("ИП")
+    assert app._cp_frames["ip"].raised == 1
+    assert app._cp_frames["ooo"].raised == 0
+    flow.on_type_change("Юр. лицо")
+    assert app._cp_frames["ooo"].raised == 1
+
+
+# --------------------------------------------------------------------------- #
+#  save_card: сбой сборки и ошибки валидации
+# --------------------------------------------------------------------------- #
+def test_save_card_collect_failure_alerts_and_saves_nothing(app, flow, ui_stub):
+    seed_entries(app, "ooo", ooo_card())
+    app._cp_entries["ooo"][F.INN] = BrokenEntry()
+    flow.save_card()
+    assert ui_stub["alerts"], "пользователю показано сообщение о сбое"
+    assert "Не удалось прочитать поля формы" in ui_stub["alerts"][0][0][0]
+    assert app.store.counterparties == [], "до хранилища дело не дошло"
+
+
+def test_save_card_validation_errors_highlight_and_write_nothing(
+        app, flow, ui_stub, tk_vars):
+    seed_entries(app, "ooo", ooo_card())
+    app._cp_entries["ooo"][F.INN] = FakeEntry("")  # пустой ИНН — ошибка
+    flow.save_card()
+    assert ui_stub["alerts"], "ошибки валидации показаны"
+    assert ui_stub["alerts"][0][0][0] == "Ошибки в данных"
+    var = app._cp_error_vars["ooo"][F.INN]
+    assert var.get() == "Заполните поле"
+    # Подсветка: сначала сброс ошибки у всех полей, потом установка у сбойных.
+    assert app._cp_entries["ooo"][F.INN].error_marks == [False, True]
+    assert app.store.counterparties == [], "ошибочные данные не пишутся"
+
+
+def test_save_card_valid_data_shows_no_errors(app, flow, ui_stub):
+    seed_entries(app, "ooo", ooo_card())
+    flow.save_card()  # до диалога выбора при дубликате ИНН не доходит
+    assert not ui_stub["alerts"]
+    assert not app.choice_calls
+
+
+# --------------------------------------------------------------------------- #
+#  save_card: дубликат ИНН — три исхода (п. 4.1)
+# --------------------------------------------------------------------------- #
+def test_save_card_duplicate_inn_open_existing(app, flow, ui_stub):
+    seed_entries(app, "ooo", ooo_card())
+    existing = app.store.add_counterparty(
+        "ooo", ooo_card(), save=False)
+    app.choice_result = "open"
+    flow.save_card()
+
+    assert len(app.choice_calls) == 1
+    title, message, options = app.choice_calls[0]
+    assert title == "Контрагент с таким ИНН уже есть"
+    assert OOO_FIELDS[F.INN] in message
+    assert [opt[0] for opt in options] == ["open", "create", "cancel"]
+
+    assert app.current_party == existing, "выбрана существующая карточка"
+    assert app.calls == [
+        ("baseline", "counterparty"), ("set_party", existing),
+        ("page", "contract"),
+    ]
+    assert len(app.store.counterparties) == 1, "дубль не создан"
+
+
+def test_save_card_duplicate_inn_cancel_changes_nothing(app, flow, ui_stub):
+    seed_entries(app, "ooo", ooo_card())
+    app.store.add_counterparty("ooo", ooo_card(), save=False)
+    app.choice_result = "cancel"
+    flow.save_card()
+
+    assert len(app.choice_calls) == 1
+    assert app.calls == [], "ни карточка, ни страница не изменились"
+    assert len(app.store.counterparties) == 1
+
+
+def test_save_card_duplicate_inn_create_anyway(app, flow, ui_stub):
+    seed_entries(app, "ooo", ooo_card())
+    app.store.add_counterparty("ooo", ooo_card(), save=False)
+    app.choice_result = "create"
+    flow.save_card()
+
+    assert len(app.store.counterparties) == 2, "дубль создан по явному выбору"
+    names = [call[0] if isinstance(call, tuple) else call for call in app.calls]
+    assert names == ["baseline", "combo", "status", "registry",
+                     "set_party", "page"]
+
+
+# --------------------------------------------------------------------------- #
+#  save_card: запись в реестр
+# --------------------------------------------------------------------------- #
+def test_save_card_store_failure_removes_phantom(app, flow, ui_stub,
+                                                 monkeypatch):
+    seed_entries(app, "ooo", ooo_card())
+
+    def broken_add(mode, data):
+        rec = {"id": "cp-broken", "type": mode, "fields": dict(data)}
+        app.store.counterparties.append(rec)  # «фантом» в памяти
+        app.store.last_error = "Не удалось записать файл реестра"
+        return rec
+
+    monkeypatch.setattr(app.store, "add_counterparty", broken_add)
+    flow.save_card()
+    assert app.store.counterparties == [], "«фантом» удалён из памяти"
+    assert ui_stub["alerts"], "пользователю показана ошибка"
+    assert ui_stub["alerts"][0][0][0] == "Не удалось сохранить контрагента"
+    assert app.calls == [], "хуки успеха не выполнялись"
+
+
+def test_save_card_success_flow(app, flow, ui_stub):
+    seed_entries(app, "ooo", ooo_card())
+    flow.save_card()
+    assert len(app.store.counterparties) == 1
+    rec = app.store.counterparties[0]
+    assert rec["type"] == "ooo"
+    assert rec["fields"][F.INN] == OOO_FIELDS[F.INN]
+    assert app.calls == [
+        ("baseline", "counterparty"), "combo", "status", "registry",
+        ("set_party", rec), ("page", "contract"),
+    ]
+    assert app.notifications, "тост показан"
+    assert "ООО «Ромашка»" in app.notifications[0]
+    assert "добавлен в реестр программы" in app.notifications[0]
+
+
+def test_save_card_ip_mode_writes_fact_address(app, flow):
+    app._cp_type_var.set("ИП")
+    seed_entries(app, "ip", ip_card())
+    flow.save_card()
+    rec = app.store.counterparties[0]
+    assert rec["type"] == "ip"
+    assert rec["fields"][F.FACT_ADDRESS] == IP_FIELDS[F.LEGAL_ADDRESS]
+
+
+# --------------------------------------------------------------------------- #
+#  Фасады ContractApp и защита несохранённых данных (п. 4.4)
+# --------------------------------------------------------------------------- #
+def test_form_signature_reads_card_through_controller(app, flow):
+    seed_entries(app, "ooo", ooo_card())
+    signature = main.ContractApp._form_signature(app, "counterparty")
+    expected = tuple(sorted(flow.collect("ooo").items()))
+    assert signature == expected
+
+
+def test_form_signature_degrades_to_none_on_widget_failure(app, flow):
+    seed_entries(app, "ooo", ooo_card())
+    app._cp_entries["ooo"][F.INN] = BrokenEntry()
+    assert main.ContractApp._form_signature(app, "counterparty") is None
+
+
+class RecordingFlow:
+    """Контроллер-двойник: записывает вызовы фасадов."""
+
+    def __init__(self):
+        self.calls = []
+
+    def build_counterparty_page(self, *args, **kwargs):
+        self.calls.append(("build_counterparty_page", args, kwargs))
+
+    def build_cp_fields(self, *args, **kwargs):
+        self.calls.append(("build_cp_fields", args, kwargs))
+
+    def add_field(self, *args, **kwargs):
+        self.calls.append(("add_field", args, kwargs))
+
+    def error_var_for(self, *args, **kwargs):
+        self.calls.append(("error_var_for", args, kwargs))
+
+    def on_type_change(self, *args, **kwargs):
+        self.calls.append(("on_type_change", args, kwargs))
+
+    def collect(self, *args, **kwargs):
+        self.calls.append(("collect", args, kwargs))
+
+    def save_card(self, *args, **kwargs):
+        self.calls.append(("save_card", args, kwargs))
+
+    def edit_counterparty(self, *args, **kwargs):
+        self.calls.append(("edit_counterparty", args, kwargs))
+
+
+def test_facade_delegates():
+    flow = RecordingFlow()
+    app = SimpleNamespace(_counterparty_flow=flow)
+
+    main.ContractApp._build_counterparty_page(app)
+    main.ContractApp._build_cp_fields(app, "card", "ooo")
+    main.ContractApp._cp_add_field(app, "card", "ooo", F.INN, "ИНН *",
+                                   kind="digits", max_len=12)
+    main.ContractApp._cp_error_var_for(app, "ooo")
+    main.ContractApp._on_cp_type_change(app, "ИП")
+    main.ContractApp._cp_collect(app, "ooo")
+    main.ContractApp._cp_save(app)
+    main.ContractApp._edit_counterparty(app, {"id": "cp-1"})
+
+    names = [call[0] for call in flow.calls]
+    assert names == [
+        "build_counterparty_page", "build_cp_fields", "add_field",
+        "error_var_for", "on_type_change", "collect", "save_card",
+        "edit_counterparty",
+    ]
+    assert flow.calls[2][2] == {
+        "kind": "digits", "width": None, "required": False,
+        "stretch": True, "max_len": 12, "hint": None,
+    }, "ключевые аргументы переданы как есть"

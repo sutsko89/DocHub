@@ -1406,8 +1406,12 @@ try:
     check(any("ООО Ромашка" in base for base in app._party_duplicate_bases()),
           "4.1: одинаковые карточки помечаются дубликатами в списках")
     app.store.counterparties.remove(_dup_party)
-    _cp_src_start = _main_src.index("def _cp_save")
-    _cp_src = _main_src[_cp_src_start:_cp_src_start + 3000]
+    # _cp_save с шага 6 декомпозиции живёт в counterparty_controller —
+    # исходник читаем оттуда (def save_card).
+    with open("counterparty_controller.py", encoding="utf-8") as _cpf:
+        _cp_ctrl_src = _cpf.read()
+    _cp_src_start = _cp_ctrl_src.index("def save_card")
+    _cp_src = _cp_ctrl_src[_cp_src_start:_cp_src_start + 3000]
     check("find_by_inn" in _cp_src and "Открыть существующего" in _cp_src,
           "4.1: при создании карточки ИНН проверяется на дубликат")
     check(app.store.find_by_inn("7701234567")["id"] == party_rec["id"],

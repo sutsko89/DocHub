@@ -12,6 +12,7 @@ import logging
 
 import pytest
 
+import counterparty_controller
 import main
 from document_builder import F
 
@@ -52,6 +53,9 @@ def make_app(entries: dict) -> "main.ContractApp":
     app = object.__new__(_FormHarness)
     app._cp_entries = entries
     app._cp_type_var = FakeVar("Юр. лицо")
+    # Сбор/сохранение карточки с шага 6 декомпозиции живёт в контроллере:
+    # фасады ContractApp._cp_collect / _cp_save делегируют ему — нужен и он.
+    app._counterparty_flow = counterparty_controller.CounterpartyController(app)
     app._log = logging.getLogger("test-main-forms")
     app._form_baseline = {}
     app.root = None  # алерты замокаются; настоящий root не нужен

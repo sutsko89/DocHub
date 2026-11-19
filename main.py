@@ -36,6 +36,7 @@ import applog
 import dadata_client as dadata
 import dadata_controller
 import document_importer as importer
+import document_save_controller
 import import_controller
 import lifecycle_controller
 import reconcile
@@ -78,7 +79,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -535,6 +536,10 @@ class ContractApp:
         # декомпозиции ContractApp, аудит 2.0.1 P2). Создаётся ДО построения
         # страниц: _build_registry_page уже идёт через контроллер.
         self._registry_flow = registry_controller.RegistryController(self)
+        # Спецификация и сохранение документов — тоже контроллер (шаг 5
+        # декомпозиции ContractApp, аудит 2.0.1 P2). Создаётся ДО построения
+        # страниц: _build_spec_page уже идёт через контроллер.
+        self._doc_save_flow = document_save_controller.DocumentSaveController(self)
 
         # Единый «текущий контрагент» и защита несохранённых данных (п. 4.2, 4.4).
         self._current_party_id = None
@@ -1460,183 +1465,47 @@ class ContractApp:
             )
 
     # ------------------------------------------------------------------ #
-    #  Страница «Спецификация»
+    #  Спецификация и сохранение документов — DocumentSaveController
     # ------------------------------------------------------------------ #
+    #  Код страницы «Спецификация» — таблица позиций, договор-основание,
+    #  предпросмотр — переехал в document_save_controller.DocumentSave-
+    #  Controller (пятый шаг декомпозиции ContractApp, аудит 2.0.1 P2).
+    #  Состояние страницы остаётся на приложении с прежними именами — его
+    #  читают защита несохранённых данных (п. 4.2, 4.4), страницы договора
+    #  и доп. соглашения и smoke-тест; здесь остаются фасады с прежними
+    #  именами для внешних вызывающих.
     def _build_spec_page(self):
-        _page, left, right, textbox = self._make_page(
-            "spec", "Спецификация",
-            "Позиции поставки к договору; справа — таблица позиций и текст документа.",
-            with_text=True, text_title="Предпросмотр спецификации (только чтение)",
-        )
-        self.spec_text = textbox
-
-        # -- Правая область: таблица позиций + предпросмотр ---------------- #
-        # Заголовок правой области убираем — в табличной части только строки.
-        top_label = right.grid_slaves(row=0, column=0)
-        if top_label:
-            top_label[0].grid_remove()
-        textbox.grid_forget()
-        right.grid_rowconfigure(1, weight=0)
-        right.grid_rowconfigure(2, weight=1)
-
-        self.spec_table = SpecTable(right, scale=self.scale)
-        self.spec_table.grid(row=1, column=0, sticky="ew",
-                             padx=int(12 * self.scale), pady=(int(4 * self.scale), 0))
-
-        textbox.grid(row=2, column=0, sticky="nsew",
-                     padx=int(12 * self.scale), pady=(int(4 * self.scale), int(12 * self.scale)))
-        self.spec_table.on_change = self._on_spec_item_changed
-
-        # -- Контрагент -------------------------------------------------- #
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=0, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("Контрагент")
-
-        self.spec_party_var = tk.StringVar(value="")
-        self.spec_party_combo = ui.option_menu(
-            card.body, ["— выберите контрагента —"],
-            width=int(ENTRY_WIDTH * self.scale), variable=self.spec_party_var,
-        )
-        card.wide(self.spec_party_combo, pady=(int(2 * self.scale), int(10 * self.scale)))
-        self.spec_party_var.trace_add("write", self._on_spec_party_changed)
-        self.spec_party_var.trace_add("write", lambda *_: self._on_party_selected("spec"))
-
-        # -- Договор-основание -------------------------------------------- #
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=1, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("Договор-основание")
-
-        self.spec_contract_var = tk.StringVar(value="")
-        self.spec_contract_combo = ui.option_menu(
-            card.body, ["— нет сохранённых договоров —"],
-            width=int(ENTRY_WIDTH * self.scale), variable=self.spec_contract_var,
-        )
-        card.wide(self.spec_contract_combo, pady=(int(2 * self.scale), int(4 * self.scale)))
-        self.spec_contract_info_var = tk.StringVar(value="Договор-основание не выбран.")
-        card.wide(
-            ctk.CTkLabel(
-                card.body, textvariable=self.spec_contract_info_var,
-                font=ui.font(11), text_color=ui.COLORS["text_secondary"],
-                anchor="w", justify="left",
-                wraplength=int((LEFT_PANEL_WIDTH - 40) * self.scale),
-            ),
-            pady=(int(2 * self.scale), int(2 * self.scale)),
-        )
-        self.spec_contract_var.trace_add("write", self._regenerate_spec)
-        self.spec_contract_var.trace_add("write", lambda *_: self._update_contract_info("spec"))
-        self.spec_contract_var.trace_add("write", lambda *_: self._on_doc_field_changed("spec", F.NUMBER))
-
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=2, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("Спецификация")
-
-        self.spec_number_var = tk.StringVar()
-        number = ui.entry(
-            card.body, width=int(SHORT_WIDTH * self.scale),
-            textvariable=self.spec_number_var,
-        )
-        self._page_widgets[("spec", F.NUMBER)] = number
-        card.row("Номер спецификации", number, required=True,
-                 error_var=self._error_var_for("spec", F.NUMBER))
-        self.spec_number_var.trace_add("write", lambda *_: self._on_doc_field_changed("spec", F.NUMBER))
-
-        self.spec_day_var = tk.StringVar()
-        self.spec_month_var = tk.StringVar(value=MONTHS_GENITIVE[datetime.now().month - 1])
-        self._add_date_row(card, "spec", self.spec_day_var, self.spec_month_var)
-        self.spec_day_var.trace_add("write", self._regenerate_spec)
-        self.spec_month_var.trace_add("write", self._regenerate_spec)
-
-        # -- Условия поставки -------------------------------------------- #
-        card = ui.Card(left, labels_above=True)
-        card.grid(row=3, column=0, sticky="new", padx=int(4 * self.scale), pady=(0, int(12 * self.scale)))
-        card.section("Условия поставки")
-
-        self.spec_delivery_term_var = tk.StringVar()
-        delivery_term = ui.entry(
-            card.body, width=int(ENTRY_WIDTH * self.scale),
-            textvariable=self.spec_delivery_term_var,
-        )
-        self._page_widgets[("spec", F.DELIVERY_TERM)] = delivery_term
-        card.row(F.DELIVERY_TERM, delivery_term,
-                 hint="Например: 30 дней с момента подписания договора.")
-
-        self.spec_payment_terms_var = tk.StringVar()
-        payment_terms = ui.entry(
-            card.body, width=int(ENTRY_WIDTH * self.scale),
-            textvariable=self.spec_payment_terms_var,
-        )
-        self._page_widgets[("spec", F.PAYMENT_TERMS)] = payment_terms
-        card.row(F.PAYMENT_TERMS, payment_terms,
-                 hint="Например: оплата в течение 10 банковских дней после отгрузки.")
-
-        self.spec_delivery_basis_var = tk.StringVar()
-        delivery_basis = ui.entry(
-            card.body, width=int(ENTRY_WIDTH * self.scale),
-            textvariable=self.spec_delivery_basis_var,
-        )
-        self._page_widgets[("spec", F.DELIVERY_BASIS)] = delivery_basis
-        card.row(F.DELIVERY_BASIS, delivery_basis,
-                 hint="Например: самовывоз со склада поставщика.")
-
-        self.spec_prices_until_var = tk.StringVar(value=prices_valid_until_default())
-        prices_until = ui.entry(
-            card.body, width=int(ENTRY_WIDTH * self.scale),
-            textvariable=self.spec_prices_until_var,
-        )
-        card.row("Цены действительны до", prices_until,
-                 hint="Автоматически — последний день текущего месяца")
-
-        self.spec_delivery_term_var.trace_add("write", self._regenerate_spec)
-        self.spec_payment_terms_var.trace_add("write", self._regenerate_spec)
-        self.spec_delivery_basis_var.trace_add("write", self._regenerate_spec)
-
-        # -- Позиции (подсказка) ------------------------------------------- #
+        """Строит страницу «Спецификация» (контроллер сохранения документов)."""
+        self._doc_save_flow.build_spec_page()
 
     @property
     def _spec_rows(self) -> list[dict]:
-        """Строки позиций (StringVar «name», «qty», «unit», «price»)."""
-        return self.spec_table.rows
+        """Строки позиций страницы «Спецификация» (контроллер сохранения)."""
+        return self._doc_save_flow.spec_rows
 
     def _add_spec_row(self, name="", qty="", price="", unit=""):
-        """Совместимость: добавление строки в таблицу позиций."""
-        return self.spec_table.add_row(
-            {"name": name, "qty": qty, "unit": unit, "price": price}
-        )
+        """Добавляет строку в таблицу позиций (контроллер сохранения)."""
+        return self._doc_save_flow.add_spec_row(name=name, qty=qty, price=price, unit=unit)
 
     def _remove_spec_row(self):
-        self.spec_table.remove_last()
+        """Удаляет последнюю строку таблицы позиций (контроллер сохранения)."""
+        self._doc_save_flow.remove_spec_row()
 
     def _spec_items(self) -> list[dict]:
-        """Позиции с заполненным наименованием; суммы считаются на лету."""
-        return self.spec_table.get_items()
+        """Позиции с заполненным наименованием (контроллер сохранения)."""
+        return self._doc_save_flow.spec_items()
 
     def _spec_total(self) -> Decimal:
-        return sum(
-            (item["qty"] * item["price"] for item in self._spec_items()),
-            Decimal("0"),
-        )
+        """Сумма позиций спецификации (контроллер сохранения)."""
+        return self._doc_save_flow.spec_total()
 
     def _on_spec_item_changed(self, *_args):
-        self._regenerate_spec()
+        """Пересобирает предпросмотр после правки ячейки таблицы (контроллер)."""
+        self._doc_save_flow.on_spec_item_changed(*_args)
 
     def _on_spec_party_changed(self, *_args):
-        rec = self._party_from_var(self.spec_party_var)
-        contracts = self.store.contracts_for(rec["id"]) if rec else []
-        if contracts:
-            values = [self._contract_display(c) for c in contracts]
-        else:
-            values = ["— нет сохранённых договоров —"]
-        self.spec_contract_combo.set_values(values)
-        self.spec_contract_var.set(values[0] if contracts else "")
-        if contracts:
-            self.spec_contract_info_var.set(
-                f"Договор-основание: {values[0]} — подставлен автоматически, проверьте."
-            )
-        else:
-            self.spec_contract_info_var.set(
-                "Договор-основание не выбран: сохраните договор поставки."
-            )
-        self._regenerate_spec()
+        """Подставляет договор-основание при выборе контрагента (контроллер)."""
+        self._doc_save_flow.on_spec_party_changed(*_args)
 
     # ------------------------------------------------------------------ #
     #  Страница «Реестр» — рендер и сверки в RegistryController
@@ -2050,466 +1919,90 @@ class ContractApp:
         except (ValueError, OSError):
             return False
 
+    # ------------------------------------------------------------------ #
+    #  Сохранение документов — запись и сценарии в DocumentSaveController
+    # ------------------------------------------------------------------ #
+    #  Папки контрагентов, транзакция «файл + запись реестра» (п. 9.2),
+    #  печатные формы из шаблонов и записей, предпросмотр спецификации,
+    #  подтверждение повтора номера (п. 4.1) и save_contract /
+    #  save_additional / save_spec переехали в
+    #  document_save_controller.DocumentSaveController (пятый шаг
+    #  декомпозиции ContractApp, аудит 2.0.1 P2); здесь остаются фасады
+    #  с прежними именами — страницы форм, Ctrl+S и smoke-тест продолжают
+    #  работать как раньше. Открытие файла после сохранения идёт через
+    #  фасад _open_file: smoke-тест подменяет модульное main.open_file.
     def _persist_document(self, draft: dict) -> dict:
-        """Пишет .docx и регистрирует запись через сервисный слой (п. 9.2).
-
-        При сбое записи реестра файл удаляется, запись не добавляется —
-        результат возвращается вызывающему коду для показа сообщения.
-        """
-        docs_dir = self._party_documents_dir(
-            self.store.get_counterparty(draft.get("party_id"))
-        )
-        return services.save_document(self.store, draft, docs_dir)
+        """Пишет .docx и регистрирует запись (контроллер сохранения)."""
+        return self._doc_save_flow.persist_document(draft)
 
     def _party_documents_dir(self, party_rec: dict | None,
                              interactive: bool = True) -> str:
-        """Индивидуальная папка контрагента внутри общей папки документов.
-
-        Все документы реестра хранятся по пути <папка документов>/<контрагент>/.
-        Имя папки санитизируется, итоговый путь проверяется на выход за
-        пределы папки документов.
-        """
-        base = self._documents_dir(interactive=interactive)
-        if party_rec is None:
-            return base
-        folder = safe_filename(storage.display_name(party_rec), "Контрагент")
-        path = os.path.normpath(os.path.join(base, folder))
-        if (
-            not self._is_inside_directory(base, path)
-            or os.path.normcase(path) == os.path.normcase(os.path.normpath(base))
-        ):
-            self._log.error(
-                "Имя папки контрагента выходит за пределы папки документов",
-            )
-            ui.alert(
-                self.root, "Недопустимое имя папки",
-                "Имя контрагента не может быть использовано как папка. "
-                "Документ будет сохранён в общую папку документов.",
-                "warning",
-            )
-            return base
-        try:
-            os.makedirs(path, exist_ok=True)
-        except OSError as exc:
-            self._log.warning(
-                "Не удалось создать папку контрагента: %s", type(exc).__name__,
-            )
-            ui.alert(
-                self.root, "Не удалось создать папку контрагента",
-                f"{path}\n\n{exc}\n\n"
-                "Документ будет сохранён в общую папку документов.",
-                "warning",
-            )
-            return base
-        return path
+        """Индивидуальная папка контрагента (контроллер сохранения)."""
+        return self._doc_save_flow.party_documents_dir(party_rec, interactive=interactive)
 
     def _render_contract_docx(self, data: dict, is_ip: bool) -> "Document":
-        """Договор из шаблона: печатная форма сохраняется без искажений."""
-        return services.render_contract(data, is_ip)
+        """Договор из шаблона (контроллер сохранения)."""
+        return self._doc_save_flow.render_contract_docx(data, is_ip)
 
     def _render_additional_docx(self, data: dict, is_ip: bool, number: str,
                                 limit_display: str, term: str) -> "Document":
-        """Доп. соглашение из шаблона с подстановкой лимита и отсрочки."""
-        return services.render_additional(data, is_ip, number, limit_display, term)
+        """Доп. соглашение из шаблона (контроллер сохранения)."""
+        return self._doc_save_flow.render_additional_docx(
+            data, is_ip, number, limit_display, term)
 
     def _render_spec_docx(self, rec: dict) -> "Document":
-        """Спецификация из шаблона (ООО/ИП) — сборка в сервисном слое (п. 9.2)."""
-        return services.render_spec(rec, self.store, get_spec_settings())
+        """Спецификация из шаблона (контроллер сохранения)."""
+        return self._doc_save_flow.render_spec_docx(rec)
 
     def _rec_is_ip(self, rec: dict) -> bool:
-        """Признак ИП у сохранённой записи (учитывая старые записи реестра)."""
-        return services.rec_is_ip(rec, self.store)
+        """Признак ИП у сохранённой записи (контроллер сохранения)."""
+        return self._doc_save_flow.rec_is_ip(rec)
 
     def _build_record_docx(self, rec: dict) -> "Document":
-        """Собирает .docx записи реестра по её типу (сервисный слой)."""
-        return services.build_record_docx(rec, self.store)
+        """Собирает .docx записи реестра по её типу (контроллер сохранения)."""
+        return self._doc_save_flow.build_record_docx(rec)
 
     def _write_docx(self, doc, rec: dict) -> str:
-        """Пишет .docx в папку контрагента атомарно (сервисный слой, п. 9.2)."""
-        directory = self._party_documents_dir(
-            self.store.get_counterparty(rec.get("party_id"))
-        )
-        return services.write_docx(doc, rec, self.store, directory)
+        """Пишет .docx в папку контрагента атомарно (контроллер сохранения)."""
+        return self._doc_save_flow.write_docx(doc, rec)
 
     def _save_and_open_document(self, rec: dict) -> str:
-        """Готовит .docx в индивидуальной папке контрагента и открывает его в Word."""
-        path = self._write_docx(self._build_record_docx(rec), rec)
-        open_file(path)
-        return path
+        """Готовит .docx и открывает его в Word (контроллер сохранения)."""
+        return self._doc_save_flow.save_and_open_document(rec)
 
     def _persist_document_result_alert(self, result: dict):
-        """Показывает сообщение при сбое транзакции сохранения (п. 9.2)."""
-        ui.alert(
-            self.root, "Не удалось сохранить документ",
-            f"{result['error']}\n\n"
-            "Файл удалён, запись в реестр не добавлена.",
-            "error",
-        )
+        """Сообщение при сбое транзакции сохранения (контроллер сохранения)."""
+        self._doc_save_flow.persist_document_result_alert(result)
 
     def _regenerate_spec(self, *_args):
-        """Откладывает пересборку предпросмотра спецификации (п. 5.6).
-
-        Раньше предпросмотр пересобирался на каждый символ в любом из шести
-        полей и в каждой ячейке таблицы позиций. Теперь, как и у договора
-        и доп. соглашения, пересборка откладывается на 120 мс.
-        """
-        pending = getattr(self, "_spec_preview_after", None)
-        if pending:
-            try:
-                self.root.after_cancel(pending)
-            except Exception:
-                pass
-        self._spec_preview_after = self.root.after(120, self._render_spec_preview)
+        """Откладывает пересборку предпросмотра спецификации (контроллер)."""
+        self._doc_save_flow.regenerate_spec(*_args)
 
     def _flush_spec_preview(self):
-        """Синхронно дособирает отложенный предпросмотр (перед чтением текста)."""
-        pending = getattr(self, "_spec_preview_after", None)
-        if pending:
-            try:
-                self.root.after_cancel(pending)
-            except Exception:
-                pass
-            self._spec_preview_after = None
-        self._render_spec_preview()
+        """Синхронно дособирает отложенный предпросмотр (контроллер)."""
+        self._doc_save_flow.flush_spec_preview()
 
     def _render_spec_preview(self):
-        self._spec_preview_after = None
-        party = self._party_from_var(self.spec_party_var)
-        if party is None:
-            self._set_text(self.spec_text, "Выберите контрагента и договор-основание слева.")
-            return
-        contract = self._contract_from_var(self.spec_contract_var, party["id"])
-        data = dict(party.get("fields", {}))
+        """Собирает текст предпросмотра спецификации (контроллер)."""
+        self._doc_save_flow.render_spec_preview()
 
-        lines: list[str] = []
-        spec = get_spec_settings()
-        if contract is not None:
-            lines.append(
-                f"Приложение № {spec['spec_appendix_number']} к Договору поставки "
-                f"{self._contract_display(contract)}"
-            )
-        lines.append("")
-        number = self.spec_number_var.get().strip() or "б/н"
-        lines.append(f"СПЕЦИФИКАЦИЯ № {number}")
-        lines.append(
-            f"г. {spec['spec_city']}    «{self.spec_day_var.get().strip() or '__'}» "
-            f"{self.spec_month_var.get().strip() or '__'} {spec['spec_year']} г."
-        )
-        lines.append("")
-        lines.append(f"Поставщик: {spec['spec_supplier']}")
-        lines.append(f"Покупатель: {storage.display_name(party)}, "
-                     f"ИНН {data.get(F.INN, '')}, {data.get(F.LEGAL_ADDRESS, '')}")
-        lines.append("")
-        prices_until = prices_valid_until_default()
-        self.spec_prices_until_var.set(prices_until)
-        lines.append(f"Цены в Спецификации действительны до {prices_until}.")
-        lines.append("Наименование, количество и стоимость:")
-
-        items = self._spec_items()
-        if items:
-            lines.append("№   Наименование                Кол-во   Ед. изм.   Цена, руб.     Сумма, руб.")
-            for index, item in enumerate(items, start=1):
-                amount = (item["qty"] * item["price"]).quantize(
-                    Decimal("0.01"), rounding=ROUND_HALF_UP
-                )
-                lines.append(
-                    f"{index}.  {item['name']}   —   {format_quantity(item['qty'])} "
-                    f"{item['unit']} × {format_amount(item['price'])} = "
-                    f"{format_amount(amount)} руб."
-                )
-            total = sum((i["qty"] * i["price"] for i in items), Decimal("0"))
-            lines.append(
-                f"Итого: {format_amount(total)} руб. ({amount_in_words_ru(total)})"
-            )
-            lines.append(
-                f"в т.ч. НДС {spec['spec_vat_rate']}%: "
-                f"{format_amount(spec_vat_amount_from_items(items, spec['spec_vat_rate']))} руб."
-            )
-        else:
-            lines.append("Позиции не заполнены — заполните таблицу позиций справа.")
-        lines.append("")
-        conditions = [
-            (F.DELIVERY_TERM, self.spec_delivery_term_var.get().strip()),
-            (F.PAYMENT_TERMS, self.spec_payment_terms_var.get().strip()),
-            (F.DELIVERY_BASIS, self.spec_delivery_basis_var.get().strip()),
-        ]
-        for condition_label, condition_value in conditions:
-            if condition_value:
-                lines.append(f"{condition_label}: {condition_value}")
-        lines.append("")
-        lines.append(
-            f"Подписи Сторон: от Поставщика — {spec['spec_supplier_signatory']}, "
-            f"от Покупателя — {data.get(F.DIRECTOR, data.get(F.IP_NAME, ''))}"
-        )
-        self._set_text(self.spec_text, "\n".join(lines))
-
-    # ------------------------------------------------------------------ #
-    #  Сохранение документов в реестр
-    # ------------------------------------------------------------------ #
     def _confirm_document_duplicate(
         self, party_id, kind: str, number: str, date_text: str
     ) -> bool:
-        """Предупреждает о документе с тем же номером у того же контрагента (п. 4.1)."""
-        number = str(number or "").strip()
-        if not number:
-            return True
-        for rec in self.store.documents_for(party_id):
-            if rec.get("kind") != kind:
-                continue
-            if str(rec.get("number", "")).strip() != number:
-                continue
-            existing_date = str(rec.get("date", "")).strip()
-            title = storage.KIND_LABELS.get(kind, "Документ")
-            details = f"{title} № {number}"
-            if existing_date:
-                details += f" от {existing_date}"
-            return ui.confirm(
-                self.root, "Повтор номера",
-                f"У этого контрагента уже есть {details}.\n\n"
-                "Создать ещё один документ с тем же номером?",
-                ok_text="Создать ещё", cancel_text="Отмена",
-            )
-        return True
+        """Предупреждает о повторе номера документа (контроллер сохранения)."""
+        return self._doc_save_flow.confirm_document_duplicate(party_id, kind, number, date_text)
 
     def save_contract(self):
-        try:
-            rec = self._party_from_var(self.contract_party_var)
-            if rec is None:
-                ui.alert(self.root, "Контрагент не выбран",
-                         "Выберите контрагента из списка или добавьте нового "
-                         "через кнопку «Добавить контрагента».", "error")
-                return
-
-            data = dict(rec.get("fields", {}))
-            data[F.NUMBER] = self.contract_number_var.get().strip()
-            data[F.DAY] = self.contract_day_var.get().strip()
-            data[F.MONTH] = self.contract_month_var.get().strip()
-            is_ip = rec.get("type") == "ip"
-
-            errors = validate_contract_fields(data, is_ip)
-            if errors:
-                self._clear_page_errors("contract")
-                for key, message in errors.items():
-                    self._set_page_error("contract", key, message)
-                for key in (F.NUMBER, F.DAY):
-                    self._focus_page_widget("contract", key)
-                    break
-                ui.alert(
-                    self.root, "Ошибки в данных",
-                    "Проверьте подсвеченные поля:\n\n"
-                    + "\n".join(f"• {error}" for error in errors.values()),
-                    "error",
-                )
-                return
-
-            date_text = f"{data[F.DAY]} {data[F.MONTH]}".strip()
-            if not self._confirm_document_duplicate(
-                rec["id"], storage.KIND_CONTRACT, data[F.NUMBER], date_text
-            ):
-                return
-            extra = {"day": data[F.DAY], "month": data[F.MONTH], "is_ip": is_ip}
-            draft = {
-                "kind": storage.KIND_CONTRACT,
-                "party_id": rec["id"],
-                "number": data[F.NUMBER],
-                "date": date_text,
-                "data": data,
-                "extra": extra,
-                "text": "",
-            }
-            # Файл и запись реестра — транзакция сервисного слоя (п. 9.2):
-            # при сбое записи реестра файл удаляется, запись не добавляется.
-            result = self._persist_document(draft)
-            if not result["ok"]:
-                self._persist_document_result_alert(result)
-                return
-            path = result["path"]
-            self._reset_form_baseline("contract")
-            self.refresh_registry()
-            self._update_status()
-            opened = open_file(path)
-            self._notify(
-                f"Договор № {data[F.NUMBER]} от {date_text} для "
-                f"{storage.display_name(rec)} сохранён"
-                + (" и открыт." if opened else "."),
-                path,
-            )
-        except Exception as exc:
-            ui.alert(self.root, "Ошибка", f"Не удалось сохранить договор:\n{exc}", "error")
+        """Сохраняет договор поставки (контроллер сохранения)."""
+        self._doc_save_flow.save_contract()
 
     def save_additional(self):
-        try:
-            party = self._party_from_var(self.addl_party_var)
-            if party is None:
-                ui.alert(self.root, "Контрагент не выбран",
-                         "Выберите контрагента из списка слева.", "error")
-                return
-            contract = self._contract_from_var(self.addl_contract_var, party["id"])
-            if contract is None:
-                ui.alert(self.root, "Договор не выбран",
-                         "Выберите договор-основание. Если договоров нет — создайте "
-                         "договор поставки на соответствующей странице.", "error")
-                return
-
-            limit_display = self._limit_var.get().strip()
-            limit = digits_only(limit_display)
-            term = self.term_var.get().strip()
-            number = self.addl_number_var.get().strip() or "б/н"
-
-            errors = {}
-            if not limit:
-                errors[F.LIMIT] = "Заполните поле"
-            if not term:
-                errors[F.TERM] = "Заполните поле"
-            elif not term.isdigit():
-                errors[F.TERM] = "Должно быть целое число дней"
-            if errors:
-                self._clear_page_errors("additional")
-                for key, message in errors.items():
-                    self._set_page_error("additional", key, message)
-                ui.alert(
-                    self.root, "Не хватает данных",
-                    "Проверьте подсвеченные поля:\n\n"
-                    + "\n".join(f"• {error}" for error in errors.values()),
-                    "error",
-                )
-                return
-
-            contract_number = contract.get("number") or ""
-            date_text = contract.get("date") or ""
-            if number and number != "б/н" and not self._confirm_document_duplicate(
-                party["id"], storage.KIND_ADDITIONAL, number, date_text
-            ):
-                return
-            extra = {
-                "contract_id": contract["id"],
-                "contract_number": contract_number,
-                "limit": limit_display,
-                "limit_digits": limit,
-                "term": term,
-                "is_ip": party.get("type") == "ip",
-            }
-            draft = {
-                "kind": storage.KIND_ADDITIONAL,
-                "party_id": party["id"],
-                "number": number,
-                "date": date_text,
-                "data": dict(contract.get("data") or {}),
-                "extra": extra,
-                "text": "",
-            }
-            result = self._persist_document(draft)
-            if not result["ok"]:
-                self._persist_document_result_alert(result)
-                return
-            path = result["path"]
-            self._reset_form_baseline("additional")
-            self.refresh_registry()
-            self._update_status()
-            opened = open_file(path)
-            self._notify(
-                f"Доп. соглашение № {number} к договору № {contract_number or 'б/н'} "
-                "сохранено"
-                + (" и открыто." if opened else "."),
-                path,
-            )
-        except Exception as exc:
-            ui.alert(self.root, "Ошибка", f"Не удалось сохранить доп. соглашение:\n{exc}", "error")
+        """Сохраняет доп. соглашение (контроллер сохранения)."""
+        self._doc_save_flow.save_additional()
 
     def save_spec(self):
-        try:
-            party = self._party_from_var(self.spec_party_var)
-            if party is None:
-                ui.alert(self.root, "Контрагент не выбран",
-                         "Выберите контрагента из списка слева.", "error")
-                return
-            contract = self._contract_from_var(self.spec_contract_var, party["id"])
-            if contract is None:
-                ui.alert(self.root, "Договор не выбран",
-                         "Выберите договор-основание. Если договоров нет — создайте "
-                         "договор поставки на соответствующей странице.", "error")
-                return
-
-            number = self.spec_number_var.get().strip()
-            if not number:
-                self._set_page_error("spec", F.NUMBER, "Заполните поле")
-                self._focus_page_widget("spec", F.NUMBER)
-                ui.alert(self.root, "Не хватает данных",
-                         "Укажите номер спецификации.", "error")
-                return
-
-            items = self._spec_items()
-            if not items:
-                ui.alert(self.root, "Нет позиций",
-                         "Добавьте хотя бы одну позицию с наименованием.", "error")
-                return
-            for item in items:
-                if item["qty"] <= 0:
-                    ui.alert(self.root, "Проверьте позиции",
-                             f"У позиции «{item['name']}» должно быть количество больше нуля.", "error")
-                    return
-                if item["price"] <= 0:
-                    ui.alert(self.root, "Проверьте позиции",
-                             f"У позиции «{item['name']}» должна быть цена больше нуля.", "error")
-                    return
-
-            # Предпросмотр собирается с задержкой — перед сохранением
-            # дособираем его синхронно, чтобы текст записи был актуальным.
-            self._flush_spec_preview()
-            text = self.spec_text.get("1.0", "end").strip()
-            date_text = f"{self.spec_day_var.get().strip()} {self.spec_month_var.get().strip()}".strip()
-            contract_number = contract.get("number") or ""
-            if not self._confirm_document_duplicate(
-                party["id"], storage.KIND_SPEC, number, date_text
-            ):
-                return
-
-            # Decimal не сериализуется в JSON — сохраняем кол-во/цены float'ами.
-            total = sum((i["qty"] * i["price"] for i in items), Decimal("0"))
-            items_json = [
-                {"name": i["name"], "qty": float(i["qty"]),
-                 "unit": i["unit"], "price": float(i["price"])}
-                for i in items
-            ]
-            extra = {
-                "contract_id": contract["id"],
-                "contract_number": contract_number,
-                "items": items_json,
-                "total": float(total),
-                "spec_day": self.spec_day_var.get().strip(),
-                "spec_month": self.spec_month_var.get().strip(),
-                "prices_until": self.spec_prices_until_var.get().strip(),
-                "delivery_term": self.spec_delivery_term_var.get().strip(),
-                "payment_terms": self.spec_payment_terms_var.get().strip(),
-                "delivery_basis": self.spec_delivery_basis_var.get().strip(),
-                "is_ip": party.get("type") == "ip",
-            }
-            draft = {
-                "kind": storage.KIND_SPEC,
-                "party_id": party["id"],
-                "number": number,
-                "date": date_text,
-                "data": dict(party.get("fields", {})),
-                "extra": extra,
-                "text": text,
-            }
-            result = self._persist_document(draft)
-            if not result["ok"]:
-                self._persist_document_result_alert(result)
-                return
-            path = result["path"]
-            self._reset_form_baseline("spec")
-            self.refresh_registry()
-            self._update_status()
-            opened = open_file(path)
-            self._notify(
-                f"Спецификация № {number} к договору № {contract_number or 'б/н'} "
-                "сохранена"
-                + (" и открыта." if opened else "."),
-                path,
-            )
-        except Exception as exc:
-            ui.alert(self.root, "Ошибка", f"Не удалось сохранить спецификацию:\n{exc}", "error")
+        """Сохраняет спецификацию (контроллер сохранения)."""
+        self._doc_save_flow.save_spec()
 
     # ------------------------------------------------------------------ #
     #  Реестр: экспорт и удаление — оркестрация в LifecycleController

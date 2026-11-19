@@ -83,7 +83,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.13.0"
+APP_VERSION = "2.14.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 

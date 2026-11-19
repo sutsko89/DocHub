@@ -11,8 +11,12 @@
 
 from __future__ import annotations
 
+import base64
+import ctypes
 import json
 import os
+import ssl
+import sys
 import urllib.error
 import urllib.request
 
@@ -25,6 +29,13 @@ TIMEOUT = 10  # секунд
 KEY_DIR_NAME = "DogovorGenerator"
 LEGACY_KEY_DIR_NAME = "DogovorPostavki"  # прежнее расположение файла ключа
 KEY_FILE_NAME = "dadata_key.txt"
+
+# Защита ключа на диске (аудит 2.0.1, P1/P2). На Windows ключ шифруется
+# DPAPI (CryptProtectData, контекст CurrentUser): файл может прочитать только
+# процесс того же пользователя Windows. На других платформах (разработка, CI)
+# шифрование недоступно — ключ пишется открытым текстом, как раньше; поставка
+# ориентирована только на Windows.
+KEY_ENC_PREFIX = "DPAPI:v1:"
 
 
 def get_api_key() -> str:
@@ -53,29 +64,88 @@ def legacy_key_storage_path() -> str:
     return os.path.join(_profile_dir(LEGACY_KEY_DIR_NAME), KEY_FILE_NAME)
 
 
-def load_api_key() -> str:
-    """Читает ключ из нового расположения, затем из прежнего (миграция)."""
-    for path in (key_storage_path(), legacy_key_storage_path()):
+# --------------------------------------------------------------------------- #
+#  DPAPI: шифрование ключа на диске (аудит 2.0.1)
+# --------------------------------------------------------------------------- #
+def _dpapi_available() -> bool:
+    """DPAPI доступен только на Windows; в dev/CI — открытый текст."""
+    return sys.platform == "win32"
+
+
+def dpapi_available() -> bool:
+    """Публичный признак «ключ на диске шифруется» — для статуса в настройках."""
+    return _dpapi_available()
+
+
+def _dpapi_protect(plaintext: str) -> str | None:
+    """Шифрует строку DPAPI (CurrentUser). None — шифрование не удалось."""
+    if not _dpapi_available():
+        return None
+    try:
+        from ctypes import wintypes
+
+        class _DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.c_void_p)]
+
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        CRYPTPROTECT_UI_FORBIDDEN = 0x1
+        raw = plaintext.encode("utf-8")
+        buffer = ctypes.create_string_buffer(raw, len(raw))
+        blob_in = _DATA_BLOB(len(raw), ctypes.cast(buffer, ctypes.c_void_p))
+        blob_out = _DATA_BLOB()
+        ok = crypt32.CryptProtectData(
+            ctypes.byref(blob_in), "EW.DocHub dadata key", None, None, None,
+            CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out),
+        )
+        if not ok or not blob_out.pbData:
+            return None
         try:
-            with open(path, "r", encoding="utf-8") as file:
-                key = file.read().strip()
-        except OSError:
-            continue
-        if key:
-            return key
-    return ""
+            encrypted = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            return KEY_ENC_PREFIX + base64.b64encode(encrypted).decode("ascii")
+        finally:
+            kernel32.LocalFree(blob_out.pbData)
+    except Exception:
+        return None
 
 
-def save_api_key(key: str) -> bool:
-    """Атомарно сохраняет ключ. Возвращает False, если записать не удалось."""
-    key = (key or "").strip()
-    if not key or any(ch.isspace() for ch in key):
-        return False
-    path = key_storage_path()
+def _dpapi_unprotect(stored: str) -> str | None:
+    """Расшифровывает строку DPAPI. None — не удалось (чужой профиль, битые данные)."""
+    if not _dpapi_available() or not stored.startswith(KEY_ENC_PREFIX):
+        return None
+    try:
+        from ctypes import wintypes
+
+        class _DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.c_void_p)]
+
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        CRYPTPROTECT_UI_FORBIDDEN = 0x1
+        blob = base64.b64decode(stored[len(KEY_ENC_PREFIX):], validate=True)
+        buffer = ctypes.create_string_buffer(blob, len(blob))
+        blob_in = _DATA_BLOB(len(blob), ctypes.cast(buffer, ctypes.c_void_p))
+        blob_out = _DATA_BLOB()
+        ok = crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None,
+            CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out),
+        )
+        if not ok or not blob_out.pbData:
+            return None
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData).decode("utf-8")
+        finally:
+            kernel32.LocalFree(blob_out.pbData)
+    except Exception:
+        return None
+
+
+def _write_key_file(path: str, payload: str) -> bool:
+    """Атомарно записывает подготовленное значение ключа."""
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as file:
-            file.write(key)
+            file.write(payload)
         os.replace(tmp, path)
         return True
     except OSError:
@@ -85,6 +155,51 @@ def save_api_key(key: str) -> bool:
         except OSError:
             pass
         return False
+
+
+def load_api_key() -> str:
+    """Читает ключ из нового расположения, затем из прежнего (миграция).
+
+    Зашифрованный файл (DPAPI) расшифровывается; прежний открытый текст на
+    Windows единожды мигрирует в зашифрованный вид. Битый/чужой шифроконтейнер
+    не роняет программу — ключ считается незаданным.
+    """
+    for path in (key_storage_path(), legacy_key_storage_path()):
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                stored = file.read().strip()
+        except OSError:
+            continue
+        if not stored:
+            continue
+        if stored.startswith(KEY_ENC_PREFIX):
+            key = _dpapi_unprotect(stored)
+            if key:
+                return key
+            # Шифроконтейнер не читается (другой пользователь, сбой) —
+            # молча подставлять чужой ключ нельзя, но и падать незачем.
+            continue
+        # Прежний формат — открытый текст. На Windows мигрируем в DPAPI.
+        if _dpapi_available():
+            migrated = _dpapi_protect(stored)
+            if migrated:
+                _write_key_file(path, migrated)
+        return stored
+    return ""
+
+
+def save_api_key(key: str) -> bool:
+    """Атомарно сохраняет ключ. Возвращает False, если записать не удалось.
+
+    На Windows ключ шифруется DPAPI; если шифрование недоступно/не удалось,
+    ключ сохраняется открытым текстом (прежнее поведение) — потерять ключ
+    из-за сбоя шифрования хуже, чем оставить его без шифра.
+    """
+    key = (key or "").strip()
+    if not key or any(ch.isspace() for ch in key):
+        return False
+    payload = _dpapi_protect(key) or key
+    return _write_key_file(key_storage_path(), payload)
 
 
 def clear_api_key() -> bool:
@@ -127,7 +242,22 @@ def fetch_party(inn: str, api_key: str) -> dict:
             ) from exc
         raise DadataError(f"Сервис DaData вернул ошибку {exc.code}.") from exc
     except urllib.error.URLError as exc:
+        # TLS-ошибки приходят обёрнутыми в URLError (reason = ssl.SSLError):
+        # пользователь за MITM-прокси должен видеть проблему с сертификатом,
+        # а не «нет интернета» (аудит 2.0.1, P3).
+        if isinstance(getattr(exc, "reason", None), ssl.SSLError):
+            raise DadataError(
+                "Ошибка сертификата при соединении с api.dadata.ru (TLS). "
+                "Проверьте системную дату, антивирус и прокси, которые могут "
+                "перехватывать трафик."
+            ) from exc
         raise DadataError("Нет соединения с api.dadata.ru — проверьте интернет.") from exc
+    except ssl.SSLError as exc:
+        raise DadataError(
+            "Ошибка сертификата при соединении с api.dadata.ru (TLS). "
+            "Проверьте системную дату, антивирус и прокси, которые могут "
+            "перехватывать трафик."
+        ) from exc
     except TimeoutError as exc:
         raise DadataError("Сервис DaData не отвечает — попробуйте ещё раз.") from exc
 

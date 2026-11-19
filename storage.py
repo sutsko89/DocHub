@@ -35,10 +35,48 @@ from datetime import datetime, timedelta
 
 import applog
 
+# Единый источник имён полей (п. 9.6): storage пишет и читает ключи так же,
+# как их задаёт карточка контрагента и печатные формы. Цикла импорта нет:
+# document_builder не зависит от storage.
+from document_builder import F
+
 SETTINGS_DIR_NAME = "DogovorGenerator"
 
 DB_FILENAME = "database.db"              # источник правды (SQLite)
 LEGACY_JSON_FILENAME = "database.json"   # реестр прежних версий (только чтение)
+
+# v2.13.0: опечатка «(Покупь)» в имени поля исправлена на «(Покупатель)».
+# Каноническое имя — document_builder.F.FULL_NAME; старая строка нужна
+# только для миграции записей при загрузке (см. _normalize_field_names).
+LEGACY_FULL_NAME_FIELD = "Полное название компании (Покупь)"
+
+
+def _rename_field_key(payload: dict) -> None:
+    """Переименовывает один ключ в словаре полей: старый → канонический.
+
+    Если канонический ключ уже заполнен (обе версии в одной записи),
+    остаётся новое значение — старое отбрасывается, чтобы предпросмотр
+    и печатная форма не увидели расхождения.
+    """
+    if LEGACY_FULL_NAME_FIELD not in payload:
+        return
+    value = payload.pop(LEGACY_FULL_NAME_FIELD)
+    payload.setdefault(F.FULL_NAME, value)
+
+
+def _normalize_field_names(rec: dict) -> None:
+    """Миграция имён полей v2.13.0 для записи реестра (идемпотентно).
+
+    Затрагивает карточку контрагента (``fields``) и сохранённые данные
+    документа (``data`` — копия полей карточки на момент сохранения).
+    """
+    fields = rec.get("fields")
+    if isinstance(fields, dict):
+        _rename_field_key(fields)
+    data = rec.get("data")
+    if isinstance(data, dict):
+        _rename_field_key(data)
+
 
 SQLITE_SCHEMA_VERSION = 1
 SCHEMA_VERSION = 2              # схема старого JSON-реестра (для переноса)
@@ -238,6 +276,11 @@ class DataStore:
         self.counterparties = legacy["counterparties"]
         self.documents = legacy["documents"]
         self._seq = legacy["seq"]
+        # Старый JSON тоже несёт ключ «(Покупь)» — нормализуем до первой записи.
+        for rec in self.counterparties:
+            _normalize_field_names(rec)
+        for rec in self.documents:
+            _normalize_field_names(rec)
         if not self.save():
             self.load_warning = (
                 "Реестр прочитан из старого файла database.json, но записать "
@@ -395,6 +438,7 @@ class DataStore:
             if rec is None:
                 dropped += 1
             else:
+                _normalize_field_names(rec)
                 parties.append(rec)
         for row in conn.execute(
             "SELECT id, kind, party_id, number, date, data, extra, text, "
@@ -404,6 +448,7 @@ class DataStore:
             if rec is None:
                 dropped += 1
             else:
+                _normalize_field_names(rec)
                 documents.append(rec)
         if dropped:
             applog.get_logger("storage").warning(
@@ -608,6 +653,8 @@ class DataStore:
             "fields": dict(fields),
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
+        # Защита от старых callers, передающих ключ «(Покупь)» (v2.13.0).
+        _normalize_field_names(rec)
         self.counterparties.append(rec)
         if save:
             self.save()
@@ -638,6 +685,8 @@ class DataStore:
             return None
         previous = rec.get("fields")
         rec["fields"] = dict(fields)
+        # Защита от старых callers, передающих ключ «(Покупь)» (v2.13.0).
+        _normalize_field_names(rec)
         if not self.save():
             rec["fields"] = previous
             return None
@@ -674,7 +723,7 @@ class DataStore:
             return None
         keys = (
             "Сокращенное название компании",
-            "Полное название компании (Покупь)",
+            F.FULL_NAME,
             "ФИО ИП",
         )
         for rec in self.counterparties:
@@ -937,7 +986,7 @@ def display_name(rec: dict) -> str:
     if rec.get("type") == "ip":
         return f"ИП {fields.get('ФИО ИП', '').strip()}".strip()
     return fields.get("Сокращенное название компании", "").strip() or \
-        fields.get("Полное название компании (Покупь)", "").strip() or "Без названия"
+        fields.get(F.FULL_NAME, "").strip() or "Без названия"
 
 
 def display_with_inn(rec: dict) -> str:

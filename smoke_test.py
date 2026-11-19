@@ -479,36 +479,45 @@ with open(storage.legacy_json_path(), "w", encoding="utf-8") as _fh:
                "counterparties": [{"id": 3, "type": "ooo",
                                    "fields": {"ИНН": "7701234567"}}],
                "documents": []}, _fh, ensure_ascii=False)
+# На CI-раннере Windows свежесозданная база может несколько секунд быть
+# занята антивирусным сканом — миграция повторяется, при неудачных попытках
+# печатается diag с load_warning (виден в CI-логе).
 _migrated = storage.DataStore()
+for _attempt in range(4):
+    if ([rec["id"] for rec in _migrated.counterparties] == [3]
+            and os.path.exists(storage.legacy_json_path() + ".migrated")):
+        break
+    print(f"diag: миграция попытка {_attempt + 1}: "
+          f"cp={len(_migrated.counterparties)}, "
+          f"warning={_migrated.load_warning!r}")
+    time.sleep(1.0 * (_attempt + 1))
+    _migrated = storage.DataStore()
 check([rec["id"] for rec in _migrated.counterparties] == [3],
       "реестр: данные перенесены из старого JSON в базу")
 check(os.path.exists(storage.legacy_json_path() + ".migrated"),
       "реестр: перенесённый JSON сохранён как .migrated")
 _reloaded = storage.DataStore()
+for _attempt in range(3):
+    if [rec["id"] for rec in _reloaded.counterparties] == [3]:
+        break
+    print(f"diag: перечитывание попытка {_attempt + 1}: "
+          f"warning={_reloaded.load_warning!r}")
+    time.sleep(1.0 * (_attempt + 1))
+    _reloaded = storage.DataStore()
 check([rec["id"] for rec in _reloaded.counterparties] == [3],
       "реестр: перенесённые данные читаются из базы повторным запуском")
 
 # ---------- Сбой записи реестра (п. 1.5) ----------
-def _remove_file_with_retry(path, attempts=10, delay=0.25):
-    """Удаляет файл с ретраями: на Windows свежесозданные файлы несколько
-    секунд могут быть заблокированы антивирусным сканом (WinError 32)."""
-    for _attempt in range(1, attempts + 1):
-        try:
-            os.remove(path)
-            return True
-        except FileNotFoundError:
-            return True
-        except OSError:
-            if _attempt >= attempts:
-                raise
-            time.sleep(delay * _attempt)
-    return False
-
-
+# Отдельный APPDATA: путь базы заранее занят КАТАЛОГОМ, поэтому save()
+# честно падает без манипуляций с только что созданным файлом — на
+# Windows-раннере os.remove свежесозданной базы может падать из-за
+# антивирусной блокировки (WinError 32).
+_appdata_ro_backup = os.environ["APPDATA"]
+os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "smoke_storage_ro")
+shutil.rmtree(os.path.dirname(storage.db_path()), ignore_errors=True)
+os.makedirs(storage.db_path(), exist_ok=True)  # каталог вместо файла: база не открывается
 _ro = storage.DataStore()
 _ro_party = _ro.add_counterparty("ooo", {"ИНН": "7709999999"}, save=False)
-_remove_file_with_retry(storage.db_path())   # файл создаётся при загрузке — убираем
-os.makedirs(storage.db_path())  # каталог вместо файла: база не открывается
 check(_ro.save() is False and _ro.last_error,
       "save(): сбой записи возвращает False и last_error, а не ложный успех")
 _upd_id = _ro_party["id"]
@@ -516,7 +525,7 @@ check(_ro.update_counterparty(_upd_id, {"ИНН": "7700000001"}) is None,
       "update_counterparty: при сбое записи правки откатываются (None)")
 check(_ro.get_counterparty(_upd_id)["fields"]["ИНН"] == "7709999999",
       "update_counterparty: данные не изменились после сбоя")
-os.rmdir(storage.db_path())
+shutil.rmtree(os.path.dirname(storage.db_path()), ignore_errors=True)
 os.environ["APPDATA"] = _appdata_main
 
 # ---------- Атомарная запись .docx и настроек (п. 1.7) ----------

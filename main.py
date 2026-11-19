@@ -39,6 +39,7 @@ import document_importer as importer
 import import_controller
 import lifecycle_controller
 import reconcile
+import registry_controller
 import single_instance
 import storage
 import ui_macos as ui
@@ -77,7 +78,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -530,6 +531,10 @@ class ContractApp:
         # (шаг декомпозиции ContractApp, аудит 2.0.1 P2): busy-анимация,
         # воркер и опрос очереди живут в dadata_controller.DadataController.
         self._dadata_flow = dadata_controller.DadataController(self)
+        # Страница «Реестр»: рендер, поиск, выбор, сверка — контроллер (шаг 4
+        # декомпозиции ContractApp, аудит 2.0.1 P2). Создаётся ДО построения
+        # страниц: _build_registry_page уже идёт через контроллер.
+        self._registry_flow = registry_controller.RegistryController(self)
 
         # Единый «текущий контрагент» и защита несохранённых данных (п. 4.2, 4.4).
         self._current_party_id = None
@@ -1634,536 +1639,34 @@ class ContractApp:
         self._regenerate_spec()
 
     # ------------------------------------------------------------------ #
-    #  Страница «Реестр»
+    #  Страница «Реестр» — рендер и сверки в RegistryController
     # ------------------------------------------------------------------ #
+    #  Построение страницы, поиск, выбор контрагента, рендер секций
+    #  (документы / «unknown» / корзина) и сверка реестра с папкой
+    #  документов переехали в registry_controller.RegistryController
+    #  (четвёртый шаг декомпозиции ContractApp, аудит 2.0.1 P2). Состояние
+    #  страницы остаётся на приложении с прежними именами — его читают
+    #  другие страницы, сценарии сохранения и smoke-тест; здесь остаются
+    #  фасады с прежними именами для внешних вызывающих.
     def _build_registry_page(self):
-        page = ctk.CTkFrame(self.content, fg_color="transparent")
-        page.grid(row=0, column=0, sticky="nsew")
-        self.pages["registry"] = page
-
-        header = ctk.CTkFrame(page, fg_color="transparent")
-        header.pack(fill="x", padx=int(24 * self.scale), pady=(int(18 * self.scale), int(6 * self.scale)))
-        title_row = ctk.CTkFrame(header, fg_color="transparent")
-        title_row.pack(fill="x")
-        ctk.CTkLabel(
-            title_row, text="Реестр", font=ui.font(20, "bold", display=True),
-            text_color=ui.COLORS["text"], anchor="w", height=26,
-        ).pack(side="left")
-        ui.ghost_button(
-            title_row, "Обновить", self.refresh_registry,
-            width=int(110 * self.scale), height=int(28 * self.scale),
-        ).pack(side="right")
-        ui.ghost_button(
-            title_row, "Добавить документы…", self._import_documents_dialog,
-            width=int(180 * self.scale), height=int(28 * self.scale),
-        ).pack(side="right", padx=(0, int(8 * self.scale)))
-        ctk.CTkLabel(
-            header, text="Список контрагентов. Выберите контрагента — ниже появятся его документы.",
-            font=ui.font(12), text_color=ui.COLORS["text_secondary"], anchor="w", height=16,
-        ).pack(anchor="w", pady=(int(2 * self.scale), 0))
-
-        search_bar = ctk.CTkFrame(page, fg_color="transparent")
-        search_bar.pack(fill="x", padx=int(24 * self.scale), pady=(0, int(8 * self.scale)))
-        self.registry_search_var = tk.StringVar()
-        # Поиск идёт и по названию, и по ИНН, с фильтрацией по мере ввода (п. 4.5).
-        self.registry_search_var.trace_add("write", self._on_registry_search_changed)
-        search_entry = ui.entry(
-            search_bar, width=int(280 * self.scale),
-            textvariable=self.registry_search_var,
-        )
-        search_entry.pack(side="left")
-        ui.ghost_button(
-            search_bar, "Найти", self._registry_apply_filter,
-            width=int(92 * self.scale), height=int(28 * self.scale),
-        ).pack(side="left", padx=(int(10 * self.scale), 0))
-        ui.ghost_button(
-            search_bar, "Показать всех", self._registry_reset_filter,
-            width=int(130 * self.scale), height=int(28 * self.scale),
-        ).pack(side="left", padx=(int(8 * self.scale), 0))
-
-        self.registry_list = ctk.CTkScrollableFrame(
-            page, fg_color="transparent", corner_radius=0,
-            scrollbar_button_color=ui.COLORS["scroll"],
-            scrollbar_button_hover_color=ui.COLORS["scroll_hover"],
-        )
-        self.registry_list.pack(fill="both", expand=True, padx=int(24 * self.scale), pady=(0, int(10 * self.scale)))
-        self.registry_list.grid_columnconfigure(0, weight=1)
-        self.scrollers.append(self.registry_list)
-
-        self._registry_selected_id = None
-        self._registry_rows: dict = {}
-        self._registry_docs_row = 1
-        self._registry_docs_frame = None
-        # Ленивый рендер (п. 9 этапа 5): при старте список не рисуется —
-        # реестр отрисуется при первом открытии страницы или при изменениях.
-        self._registry_rendered = False
-
-    # -- Реестр: список контрагентов и документы выбранного -------------- #
-    def _registry_parties(self) -> list[dict]:
-        """Активные контрагенты с учётом поиска по названию и ИНН (подстрока)."""
-        query = self.registry_search_var.get().strip().lower()
-        parties = self.store.active_counterparties()
-        if not query:
-            return parties
-        digits = digits_only(query)
-
-        def matches(rec: dict) -> bool:
-            fields = rec.get("fields") or {}
-            inn = str(fields.get(F.INN, "")).strip()
-            if digits and digits in inn:
-                return True
-            name_parts = (
-                storage.display_name(rec),
-                str(fields.get(F.FULL_NAME, "")),
-                str(fields.get(F.IP_NAME, "")),
-                str(fields.get(F.SHORT_NAME, "")),
-            )
-            haystack = " ".join(name_parts).lower()
-            return bool(query) and query in haystack
-
-        return [rec for rec in parties if matches(rec)]
-
-    def _on_registry_search_changed(self, *_args):
-        """Фильтрует реестр по мере ввода с небольшой задержкой."""
-        pending = getattr(self, "_registry_search_after", None)
-        if pending:
-            try:
-                self.root.after_cancel(pending)
-            except Exception:
-                pass
-        self._registry_search_after = self.root.after(200, self.refresh_registry)
-
-    def _registry_apply_filter(self):
-        pending = getattr(self, "_registry_search_after", None)
-        if pending:
-            try:
-                self.root.after_cancel(pending)
-            except Exception:
-                pass
-            self._registry_search_after = None
-        self.refresh_registry()
-
-    def _registry_reset_filter(self):
-        self.registry_search_var.set("")
-        self._registry_apply_filter()
-
-    def _select_registry_party(self, rec: dict):
-        """Клик по контрагенту: показать/скрыть его документы.
-
-        Частичное обновление (п. 5.1): строки контрагентов не пересоздаются,
-        перерисовываются только подсветка выбора и секция документов.
-        """
-        if self._registry_selected_id == rec.get("id"):
-            self._registry_selected_id = None
-        else:
-            self._registry_selected_id = rec.get("id")
-            # Выбор из реестра переносится на страницы документов (п. 4.2).
-            self._set_current_party(rec)
-        if not self._registry_rows:
-            # Страница ещё не отрисована (ленивый рендер) — рисуем целиком.
-            self.refresh_registry()
-            return
-        self._refresh_registry_selection()
-
-    @staticmethod
-    def _party_row_text(rec: dict, selected: bool) -> str:
-        """Текст строки контрагента в реестре (название, тип, ИНН, ID, адрес)."""
-        kind = "ИП" if rec.get("type") == "ip" else "Юр. лицо"
-        inn = str(rec.get("fields", {}).get(F.INN, "")).strip() or "—"
-        address = str(rec.get("fields", {}).get(F.LEGAL_ADDRESS, "")).strip()
-        if len(address) > 48:
-            address = address[:47].rstrip() + "…"
-        text = f"{storage.display_name(rec)}   ·   {kind}   ·   ИНН {inn}   ·   ID {rec.get('id')}"
-        if address:
-            text += f"   ·   {address}"
-        if selected:
-            text = "●  " + text
-        return text
-
-    def _refresh_registry_selection(self):
-        """Частичное обновление реестра при смене выбора (п. 5.1).
-
-        Строки контрагентов остаются теми же виджетами (меняется только
-        подсветка), секция документов выбранного пересобирается на своём
-        месте. Полная перерисовка нужна только при изменении состава списка
-        (поиск, добавление, удаление).
-        """
-        for party_id, entry in self._registry_rows.items():
-            selected = self._registry_selected_id == party_id
-            btn = entry["btn"]
-            try:
-                btn.configure(
-                    text=self._party_row_text(entry["rec"], selected),
-                    font=ui.font(12, "bold" if selected else "normal"),
-                    text_color=(ui.COLORS["text"] if selected
-                                else ui.COLORS["text_secondary"]),
-                )
-            except Exception:
-                pass
-        if self._registry_docs_frame is not None:
-            try:
-                self._registry_docs_frame.destroy()
-            except Exception:
-                pass
-            self._registry_docs_frame = None
-        self._render_registry_documents(self._registry_docs_row)
-        self.root.after(60, self._refresh_scrollbars)
+        """Строит страницу «Реестр» (контроллер реестра)."""
+        self._registry_flow.build_page()
 
     def refresh_registry(self):
-        """Перерисовывает реестр целиком (поиск, изменения состава).
+        """Перерисовывает реестр целиком (контроллер реестра)."""
+        self._registry_flow.refresh()
 
-        Длительные перерисовки (более 500 мс на больших объёмах) попадают
-        в журнал (п. 10 этапа 5); клик по контрагенту перерисовывает только
-        подсветку и секцию документов (_refresh_registry_selection, п. 5.1).
-        """
-        with applog.timed("Перерисовка реестра", 500, "ui"):
-            self._refresh_registry_full()
-        self._registry_rendered = True
+    def _registry_apply_filter(self):
+        """Применяет поиск и перерисовывает реестр (контроллер реестра)."""
+        self._registry_flow.apply_filter()
 
-    def _refresh_registry_full(self):
-        for child in self.registry_list.winfo_children():
-            try:
-                child.destroy()
-            except Exception:
-                pass
-        self._registry_docs_frame = None
+    def _select_registry_party(self, rec: dict):
+        """Клик по контрагенту: показать/скрыть его документы (контроллер)."""
+        self._registry_flow.select_party(rec)
 
-        parties = self._registry_parties()
-        query = self.registry_search_var.get().strip()
-        caption = (
-            f"Найдено по запросу «{query}»: {len(parties)}"
-            if query else f"Контрагенты ({len(parties)})"
-        )
-        ctk.CTkLabel(
-            self.registry_list, text=caption,
-            font=ui.font(14, "bold"), text_color=ui.COLORS["text"], anchor="w",
-        ).grid(row=0, column=0, sticky="ew", pady=(0, int(6 * self.scale)))
-
-        row_index = 1
-        self._registry_rows: dict = {}
-        if self._orphans:
-            banner = ctk.CTkFrame(
-                self.registry_list, fg_color=ui.COLORS["sidebar_hover"], corner_radius=8,
-            )
-            banner.grid(row=row_index, column=0, sticky="ew", pady=(0, int(8 * self.scale)))
-            banner.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(
-                banner,
-                text=f"В папке документов найдено файлов вне реестра: {len(self._orphans)}.\n"
-                     "Их можно восстановить в реестр или убрать в служебную папку _trash.",
-                font=ui.font(12), text_color=ui.COLORS["text"], anchor="w", justify="left",
-                wraplength=int(500 * self.scale),
-            ).grid(row=0, column=0, sticky="ew", padx=int(10 * self.scale),
-                   pady=int(8 * self.scale))
-            ui.ghost_button(
-                banner, "Разобрать", self._open_reconcile_dialog,
-                width=int(110 * self.scale), height=int(26 * self.scale),
-            ).grid(row=0, column=1, padx=(0, int(10 * self.scale)))
-            row_index += 1
-
-        if not parties:
-            empty_text = (
-                "Ничего не найдено — измените запрос (поиск идёт по названию и ИНН)."
-                if query else
-                "Пока нет ни одного контрагента.\n"
-                "Добавьте первого через кнопку «Добавить контрагента»."
-            )
-            ctk.CTkLabel(
-                self.registry_list, text=empty_text,
-                font=ui.font(12), text_color=ui.COLORS["text_tertiary"], justify="left",
-            ).grid(row=row_index, column=0, sticky="ew", pady=(0, int(12 * self.scale)))
-            row_index += 1
-
-        for rec in parties:
-            selected = self._registry_selected_id == rec.get("id")
-            text = self._party_row_text(rec, selected)
-            row = ctk.CTkFrame(self.registry_list, fg_color="transparent")
-            row.grid(row=row_index, column=0, sticky="ew", pady=1)
-            row.grid_columnconfigure(0, weight=1)
-            btn = ctk.CTkButton(
-                row,
-                text=text,
-                anchor="w",
-                font=ui.font(12, "bold" if selected else "normal"),
-                fg_color="transparent",
-                hover_color=ui.COLORS["sidebar_hover"],
-                text_color=ui.COLORS["text"] if selected else ui.COLORS["text_secondary"],
-                corner_radius=8,
-                height=int(30 * self.scale),
-                command=lambda r=rec: self._select_registry_party(r),
-            )
-            btn.grid(row=0, column=0, sticky="ew")
-            ui.ghost_button(
-                row, "Редактировать", lambda r=rec: self._edit_counterparty(r),
-                width=int(110 * self.scale), height=int(26 * self.scale),
-            ).grid(row=0, column=1, padx=(int(6 * self.scale), 0))
-            ui.ghost_button(
-                row, "Удалить", lambda r=rec: self._delete_counterparty(r),
-                width=int(92 * self.scale), height=int(26 * self.scale),
-            ).grid(row=0, column=2, padx=(int(6 * self.scale), 0))
-            self._registry_rows[rec.get("id")] = {"rec": rec, "frame": row, "btn": btn}
-            row_index += 1
-
-        self._registry_docs_row = row_index
-        row_index = self._render_registry_documents(row_index)
-        row_index = self._render_registry_unknown(row_index)
-        self._render_registry_trash(row_index)
-        self.root.after(60, self._refresh_scrollbars)
-
-    def _render_registry_documents(self, row_index: int) -> int:
-        """Документы выбранного контрагента под списком. Возвращает следующий row."""
-        holder = ctk.CTkFrame(self.registry_list, fg_color="transparent")
-        holder.grid(row=row_index, column=0, sticky="ew", pady=(int(10 * self.scale), 0))
-        holder.grid_columnconfigure(0, weight=1)
-        self._registry_docs_frame = holder
-
-        party = self.store.get_counterparty(self._registry_selected_id) \
-            if self._registry_selected_id is not None else None
-        if party is None:
-            ctk.CTkLabel(
-                holder, text="Выберите контрагента из списка — ниже появятся его документы.",
-                font=ui.font(12), text_color=ui.COLORS["text_tertiary"], justify="left",
-            ).grid(row=0, column=0, sticky="ew")
-            return row_index + 1
-
-        docs = self.store.documents_for(party["id"])
-        ctk.CTkLabel(
-            holder, text=f"Документы — {storage.display_name(party)} ({len(docs)})",
-            font=ui.font(14, "bold"), text_color=ui.COLORS["text"], anchor="w",
-        ).grid(row=0, column=0, sticky="ew", pady=(0, int(6 * self.scale)))
-
-        if not docs:
-            ctk.CTkLabel(
-                holder, text="У контрагента пока нет документов.",
-                font=ui.font(12), text_color=ui.COLORS["text_tertiary"], justify="left",
-            ).grid(row=1, column=0, sticky="ew")
-            return row_index + 1
-
-        for offset, rec in enumerate(docs, start=1):
-            kind_label = storage.KIND_LABELS.get(rec.get("kind"), rec.get("kind", ""))
-            number = rec.get("number") or "б/н"
-            date_text = rec.get("date") or ""
-            text = f"{kind_label} № {number}"
-            if date_text:
-                text += f" от {date_text}"
-
-            row = ctk.CTkFrame(holder, fg_color="transparent")
-            row.grid(row=offset, column=0, sticky="ew", pady=2)
-            row.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(
-                row, text=text, font=ui.font(12), text_color=ui.COLORS["text"], anchor="w",
-            ).grid(row=0, column=0, sticky="ew")
-            ui.ghost_button(
-                row, "Открыть Word", lambda d=rec: self.export_document(d),
-                width=int(120 * self.scale), height=int(26 * self.scale),
-            ).grid(row=0, column=1, padx=(int(8 * self.scale), 0))
-            ui.ghost_button(
-                row, "Удалить", lambda d=rec: self._delete_document(d),
-                width=int(92 * self.scale), height=int(26 * self.scale),
-            ).grid(row=0, column=2, padx=(int(6 * self.scale), 0))
-        return row_index + 1
-
-    def _render_registry_unknown(self, row_index: int) -> int:
-        """Неопознанные документы (папка «unknown») в конце реестра."""
-        docs = [
-            rec for rec in self.store.documents
-            if rec.get("kind") == storage.KIND_UNKNOWN
-            and not storage.is_deleted(rec)
-        ]
-        if not docs:
-            return row_index
-
-        holder = ctk.CTkFrame(self.registry_list, fg_color="transparent")
-        holder.grid(row=row_index, column=0, sticky="ew", pady=(int(10 * self.scale), 0))
-        holder.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            holder, text=f"Неопознанные документы ({len(docs)})",
-            font=ui.font(14, "bold"), text_color=ui.COLORS["text"], anchor="w",
-        ).grid(row=0, column=0, sticky="ew", pady=(0, int(2 * self.scale)))
-        ctk.CTkLabel(
-            holder,
-            text="Файлы, которые не удалось распознать, скопированы "
-                 "в папку «unknown» внутри папки документов.",
-            font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
-            anchor="w", justify="left",
-            wraplength=int(560 * self.scale),
-        ).grid(row=1, column=0, sticky="ew", pady=(0, int(4 * self.scale)))
-
-        for offset, rec in enumerate(docs, start=2):
-            source = str((rec.get("extra") or {}).get("source_file") or "")
-            name = os.path.basename(source) if source else "Документ"
-            row = ctk.CTkFrame(holder, fg_color="transparent")
-            row.grid(row=offset, column=0, sticky="ew", pady=2)
-            row.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(
-                row, text=name, font=ui.font(12),
-                text_color=ui.COLORS["text_secondary"], anchor="w",
-            ).grid(row=0, column=0, sticky="ew")
-            # Неопознанный файл нельзя запускать по клику: только показать в папке.
-            ui.ghost_button(
-                row, "Показать в папке",
-                lambda s=source: show_in_folder(s),
-                width=int(140 * self.scale), height=int(26 * self.scale),
-            ).grid(row=0, column=1, padx=(int(8 * self.scale), 0))
-            ui.ghost_button(
-                row, "Удалить", lambda d=rec: self._delete_document(d),
-                width=int(92 * self.scale), height=int(26 * self.scale),
-            ).grid(row=0, column=2, padx=(int(6 * self.scale), 0))
-        return row_index + 1
-
-    # -- Корзина в реестре ------------------------------------------------ #
-    def _render_registry_trash(self, row_index: int) -> int:
-        """Раздел «Корзина»: восстановление и окончательная очистка (п. 2.6)."""
-        trashed_parties = self.store.trashed_counterparties()
-        trashed_docs = [
-            rec for rec in self.store.trashed_documents()
-            if not rec.get("deleted_with_party")
-        ]
-        if not trashed_parties and not trashed_docs:
-            return row_index
-
-        holder = ctk.CTkFrame(self.registry_list, fg_color="transparent")
-        holder.grid(row=row_index, column=0, sticky="ew", pady=(int(12 * self.scale), 0))
-        holder.grid_columnconfigure(0, weight=1)
-        total = len(trashed_parties) + len(trashed_docs)
-        ctk.CTkLabel(
-            holder, text=f"Корзина ({total})",
-            font=ui.font(14, "bold"), text_color=ui.COLORS["text"], anchor="w",
-        ).grid(row=0, column=0, sticky="ew")
-        ui.ghost_button(
-            holder, "Очистить корзину", self._empty_trash,
-            width=int(150 * self.scale), height=int(26 * self.scale),
-        ).grid(row=0, column=1, padx=(int(8 * self.scale), 0))
-        ctk.CTkLabel(
-            holder,
-            text="Записи удалены из реестра, файлы на диске остались. "
-                 "Восстановление вернёт документы в работу.",
-            font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
-            anchor="w", justify="left", wraplength=int(560 * self.scale),
-        ).grid(row=1, column=0, columnspan=2, sticky="ew",
-               pady=(int(2 * self.scale), int(4 * self.scale)))
-
-        offset = 2
-        for party in trashed_parties:
-            docs = self.store.documents_for(party.get("id"), include_deleted=True)
-            row = ctk.CTkFrame(holder, fg_color="transparent")
-            row.grid(row=offset, column=0, columnspan=2, sticky="ew", pady=2)
-            row.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(
-                row,
-                text=f"Контрагент «{storage.display_name(party)}» · документов: {len(docs)}",
-                font=ui.font(12), text_color=ui.COLORS["text_secondary"], anchor="w",
-            ).grid(row=0, column=0, sticky="ew")
-            ui.ghost_button(
-                row, "Восстановить", lambda r=party: self._restore_counterparty(r),
-                width=int(120 * self.scale), height=int(26 * self.scale),
-            ).grid(row=0, column=1, padx=(int(8 * self.scale), 0))
-            ui.ghost_button(
-                row, "Удалить навсегда", lambda r=party: self._purge_counterparty(r),
-                width=int(140 * self.scale), height=int(26 * self.scale),
-            ).grid(row=0, column=2, padx=(int(6 * self.scale), 0))
-            offset += 1
-
-        for rec in trashed_docs:
-            kind_label = storage.KIND_LABELS.get(rec.get("kind"), "Документ")
-            number = rec.get("number") or "б/н"
-            date_text = rec.get("date") or ""
-            party_name = self.store.party_name(rec.get("party_id"))
-            text = f"{kind_label} № {number}"
-            if date_text:
-                text += f" от {date_text}"
-            text += f" · {party_name}"
-            row = ctk.CTkFrame(holder, fg_color="transparent")
-            row.grid(row=offset, column=0, columnspan=2, sticky="ew", pady=2)
-            row.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(
-                row, text=text, font=ui.font(12),
-                text_color=ui.COLORS["text_secondary"], anchor="w",
-            ).grid(row=0, column=0, sticky="ew")
-            ui.ghost_button(
-                row, "Восстановить", lambda d=rec: self._restore_document(d),
-                width=int(120 * self.scale), height=int(26 * self.scale),
-            ).grid(row=0, column=1, padx=(int(8 * self.scale), 0))
-            ui.ghost_button(
-                row, "Удалить навсегда", lambda d=rec: self._purge_document(d),
-                width=int(140 * self.scale), height=int(26 * self.scale),
-            ).grid(row=0, column=2, padx=(int(6 * self.scale), 0))
-            offset += 1
-        return row_index + 1
-
-    # -- Сверка реестра с папкой документов ------------------------------- #
     def _scan_documents_consistency(self) -> None:
-        """Фоновая сверка: ищет файлы документов вне реестра (п. 2.4)."""
-        try:
-            base = self._documents_dir(interactive=False)
-            orphans = reconcile.find_orphans(base, self.store)
-        except Exception as exc:  # noqa: BLE001 — фоновая задача не должна падать
-            self._log.warning("Сверка реестра с папкой не удалась: %s", type(exc).__name__)
-            return
-        self._orphans = orphans
-        if orphans:
-            self._log.info("Файлов вне реестра: %d", len(orphans))
-        if "registry" in self.pages:
-            self.refresh_registry()
-
-    def _open_reconcile_dialog(self) -> None:
-        """Диалог разбора файлов вне реестра: восстановить или убрать в _trash."""
-        base = self._documents_dir()
-        orphans = reconcile.find_orphans(base, self.store)
-        self._orphans = orphans
-        if not orphans:
-            ui.alert(
-                self.root, "Файлы вне реестра",
-                "Все файлы документов учтены в реестре.", "info",
-            )
-            self.refresh_registry()
-            return
-
-        preview = "\n".join(f"• {os.path.basename(path)}" for path in orphans[:8])
-        if len(orphans) > 8:
-            preview += f"\n• …и ещё {len(orphans) - 8}"
-        choice = self._choice_dialog(
-            "Файлы вне реестра",
-            f"В папке документов найдено файлов вне реестра: {len(orphans)}.\n\n"
-            f"{preview}\n\n"
-            "«Восстановить» — создать записи реестра (тип документа и контрагент "
-            "определяются по имени файла и папки).\n"
-            "«В корзину» — перенести файлы в служебную папку _trash внутри папки "
-            "документов.",
-            [
-                ("skip", "Оставить", False),
-                ("trash", "В корзину", False),
-                ("restore", "Восстановить в реестр", True),
-            ],
-        )
-        if choice == "restore":
-            added = reconcile.restore_orphans(self.store, base, orphans, safe_filename)
-            if self.store.last_error:
-                ui.alert(
-                    self.root, "Восстановление не удалось",
-                    self.store.last_error, "error",
-                )
-            else:
-                ui.alert(
-                    self.root, "Реестр восстановлен",
-                    f"Добавлено записей в реестр: {added}.\n\n"
-                    "Проверьте типы документов и контрагентов в реестре.",
-                    "success",
-                )
-            self._orphans = reconcile.find_orphans(base, self.store)
-            self._refresh_party_combo_values()
-            self.refresh_registry()
-            self._update_status()
-        elif choice == "trash":
-            moved = reconcile.move_orphans_to_trash(base, orphans)
-            ui.alert(
-                self.root, "Файлы перемещены",
-                f"Перемещено файлов: {moved}.\n\n"
-                f"Папка: {os.path.join(base, reconcile.TRASH_DIR_NAME)}",
-                "info",
-            )
-            self._orphans = reconcile.find_orphans(base, self.store)
-            self.refresh_registry()
+        """Фоновая сверка реестра с папкой документов (контроллер реестра)."""
+        self._registry_flow.scan_consistency()
 
     # ------------------------------------------------------------------ #
     #  Помощники страниц

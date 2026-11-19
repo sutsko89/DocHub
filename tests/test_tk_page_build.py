@@ -25,6 +25,7 @@ Xvfb (настоящий Tk + CustomTkinter) и проверяются ключ�
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -64,6 +65,22 @@ def app(tmp_path_factory):
     mp.setattr(main.ui, "confirm", lambda *args, **kwargs: True)
     mp.setattr(main.ui, "alert", lambda *args, **kwargs: None)
     application = main.ContractApp()
+    application.root.update()
+    # Гасим стартовые таймеры ContractApp (after 250/600/900/1500 мс от
+    # конструктора: онбординг «первый запуск» → страница «Контрагент»,
+    # очистка .docx.tmp, автоочистка корзины, сверка реестра). Без этого
+    # онбординг срабатывает внутри случайного теста, дёргает
+    # _select_page("counterparty") и перезаписывает футер — флак
+    # test_footer_save_button_follows_page (фикстура модульная, таймеры
+    # просрочены к моменту любого update() в тестах). time.sleep не
+    # возвращает управление раньше срока, поэтому после него все четыре
+    # таймера гарантированно просрочены и снимаются одним update().
+    time.sleep(1.8)
+    application.root.update()
+    # Онбординг уже дёрнул навигацию на «Контрагента» — возвращаем исходную
+    # страницу «Договор», чтобы тесты начинались в прежнем детерминированном
+    # состоянии (current_page == "contract"), но уже без стартовых таймеров.
+    application._select_page("contract")
     application.root.update()
     yield application
     try:

@@ -88,6 +88,10 @@
   оригинал удаляется; конкретная ошибка логируется. Касается реальных
   пользователей Windows, не только CI: `.bad-копия` больше не теряется
   из-за гонки со сканером.
+* **smoke_test.py форсирует UTF-8 вывод** (`sys.stdout.reconfigure`):
+  Windows-раннер CI запускает smoke в консоли cp1252, где кириллицы нет —
+  первый же `print("ok: …")` падал с UnicodeEncodeError. Дублируется
+  `PYTHONIOENCODING: utf-8` в шагах smoke обоих workflows.
 
 ### Релиз-инфраструктура
 * **`.github/workflows/release.yml` публикует GitHub Release** (раньше

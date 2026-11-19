@@ -38,6 +38,8 @@ jobs:
     name: Windows — pytest + smoke (GUI-сессия)
     runs-on: windows-latest
     timeout-minutes: 25
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

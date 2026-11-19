@@ -28,6 +28,13 @@ os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "dogovor_smoke_appda
 # сетевые функции updater в этом тесте не подменяются и не вызываются.
 os.environ["EWDOCHUB_NO_UPDATE_CHECK"] = "1"
 
+# Windows-консоль может быть в cp1252/cp1251 (без полной поддержки
+# кириллицы или вообще без неё): форсируем UTF-8 для вывода сводки,
+# иначе первый же print с русским текстом падает с UnicodeEncodeError
+# (2.15.0, Windows-раннер CI).
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import main as m
 import reconcile
 import settings_controller

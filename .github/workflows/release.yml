@@ -44,6 +44,8 @@ jobs:
 
       - name: smoke_test.py (графическая сессия)
         run: python smoke_test.py
+        env:
+          PYTHONIOENCODING: utf-8
 
       - name: Сборка приложения (PyInstaller)
         run: pyinstaller --noconfirm EWDochub.spec

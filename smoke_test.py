@@ -150,8 +150,17 @@ check(dadata.get_api_key() == "smoke-test-key", "dadata: сохранённый 
 with open(dadata.key_storage_path(), encoding="utf-8") as _kf:
     _stored_key = _kf.read()
 if dadata._dpapi_available():
-    check(_stored_key.startswith(dadata.KEY_ENC_PREFIX),
-          "dadata: на Windows ключ хранится зашифрованным (DPAPI)")
+    if _stored_key.startswith(dadata.KEY_ENC_PREFIX):
+        check(True, "dadata: на Windows ключ хранится зашифрованным (DPAPI)")
+    else:
+        # На CI-раннере DPAPI может быть неработоспособен в среде: проба
+        # шифрования отделяет «среда без DPAPI» от ошибки кода. Ключ в этом
+        # случае сохраняется открытым текстом (graceful degradation
+        # dadata.save_api_key) и остаётся доступным тому же пользователю.
+        _probe = dadata._dpapi_protect("smoke-probe")
+        check(_probe is None,
+              "dadata: DPAPI в этой среде не работает — ключ открытый текстом")
+        print("warn: DPAPI недоступен в среде (probe failed) — ключ без шифрования")
 else:
     check(not _stored_key.startswith(dadata.KEY_ENC_PREFIX),
           "dadata: без DPAPI (dev/CI) ключ хранится открытым текстом")
@@ -480,9 +489,25 @@ check([rec["id"] for rec in _reloaded.counterparties] == [3],
       "реестр: перенесённые данные читаются из базы повторным запуском")
 
 # ---------- Сбой записи реестра (п. 1.5) ----------
+def _remove_file_with_retry(path, attempts=10, delay=0.25):
+    """Удаляет файл с ретраями: на Windows свежесозданные файлы несколько
+    секунд могут быть заблокированы антивирусным сканом (WinError 32)."""
+    for _attempt in range(1, attempts + 1):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            if _attempt >= attempts:
+                raise
+            time.sleep(delay * _attempt)
+    return False
+
+
 _ro = storage.DataStore()
 _ro_party = _ro.add_counterparty("ooo", {"ИНН": "7709999999"}, save=False)
-os.remove(storage.db_path())   # файл создаётся при загрузке — убираем
+_remove_file_with_retry(storage.db_path())   # файл создаётся при загрузке — убираем
 os.makedirs(storage.db_path())  # каталог вместо файла: база не открывается
 check(_ro.save() is False and _ro.last_error,
       "save(): сбой записи возвращает False и last_error, а не ложный успех")

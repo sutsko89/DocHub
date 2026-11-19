@@ -84,6 +84,9 @@ SCHEMA_VERSION = 2              # схема старого JSON-реестра 
 BUSY_TIMEOUT_SECONDS = 5.0      # ждём освобождения базы вместо мгновенного сбоя
 SAVE_RETRIES = 3
 RETRY_DELAY_SECONDS = 0.25
+# Ретраи чтения при временной блокировке файла базы (антивирус/бэкап).
+LOAD_RETRIES = 5
+LOAD_RETRY_DELAY = 0.25
 TRASH_RETENTION_DAYS = 30
 BAD_COPY_RETENTION_DAYS = 30   # сколько дней хранить database.db.bad-*
 
@@ -225,13 +228,37 @@ class DataStore:
         log = applog.get_logger("storage")
         path = db_path()
         self._purge_stale_bad_copies(path)
+        # На Windows свежесозданный файл базы может быть несколько секунд
+        # заблокирован антивирусным сканом: sqlite3.connect падает с
+        # OperationalError «unable to open database file» / «locked». Это
+        # временная ошибка — чтение повторяется с растущей паузой (2.15.0:
+        # без ретраев CI-сборка на Windows-раннере получала пустой реестр
+        # вместо миграции, а пользователь мог увидеть пустой реестр при
+        # запуске сразу после установки).
         try:
-            with applog.timed("Чтение реестра", 500, "storage"):
-                conn = _connect_db(path)
+            for attempt in range(1, LOAD_RETRIES + 1):
                 try:
-                    parties, documents, seq = self._read_all(conn)
-                finally:
-                    conn.close()
+                    with applog.timed("Чтение реестра", 500, "storage"):
+                        conn = _connect_db(path)
+                        try:
+                            parties, documents, seq = self._read_all(conn)
+                        finally:
+                            conn.close()
+                    break
+                except sqlite3.OperationalError as exc:
+                    message = str(exc).lower()
+                    transient = (
+                        "unable to open" in message
+                        or "locked" in message
+                        or "busy" in message
+                    )
+                    if not transient or attempt >= LOAD_RETRIES:
+                        raise
+                    log.warning(
+                        "Чтение реестра повторяется (попытка %d из %d): %s",
+                        attempt, LOAD_RETRIES, type(exc).__name__,
+                    )
+                    time.sleep(LOAD_RETRY_DELAY * attempt)
         except sqlite3.DatabaseError as exc:
             if self._quarantine_corrupt_db(path, exc):
                 return  # повреждённая база убрана в .bad, предупреждение выставлено

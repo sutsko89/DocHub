@@ -38,6 +38,7 @@ import dadata_client as dadata
 import dadata_controller
 import document_importer as importer
 import document_page_controller
+import document_context_controller
 import document_save_controller
 import import_controller
 import lifecycle_controller
@@ -82,7 +83,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.10.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -568,6 +569,12 @@ class ContractApp:
         self._current_party_vars: dict[str, tk.StringVar] = {}
         self._syncing_party = False
         self._form_baseline: dict[str, tuple | None] = {}
+        # Оркестрация контекста — тоже контроллер (шаг 9 декомпозиции
+        # ContractApp, аудит 2.0.1 P2): списки контрагентов, перенос выбора
+        # между страницами и подтверждение потери изменений. Создаётся ДО
+        # построения страниц: _refresh_party_combo_values уже идёт через
+        # контроллер.
+        self._doc_context_flow = document_context_controller.DocumentContextController(self)
         self._registry_search_after = None
         self._toast_after = None
         self._toast_path: str | None = None
@@ -1376,170 +1383,65 @@ class ContractApp:
                 pass
 
     # ------------------------------------------------------------------ #
-    #  Контрагенты: выпадающие списки
+    #  Контрагенты и договоры на страницах — DocumentContextController
     # ------------------------------------------------------------------ #
+    #  Выпадающие списки контрагентов, единый «текущий контрагент» с
+    #  переносом выбора между страницами (п. 4.2), подсказка о договоре-
+    #  основании и явное имя договора переехали в
+    #  document_context_controller.DocumentContextController (девятый шаг
+    #  декомпозиции ContractApp, аудит 2.0.1 P2). Состояние контекста
+    #  (_current_party_id, _syncing_party, _current_party_vars) остаётся на
+    #  приложении; здесь — фасады с прежними именами: их вызывают
+    #  DocumentPageController, DocumentSaveController, RegistryController,
+    #  CounterpartyController и smoke-тест.
     def _party_duplicate_bases(self) -> set[str]:
-        """Названия, которые встречаются у нескольких карточек (п. 4.1)."""
-        counts: dict[str, int] = {}
-        for rec in self.store.active_counterparties():
-            base = storage.display_with_inn(rec)
-            counts[base] = counts.get(base, 0) + 1
-        return {base for base, count in counts.items() if count > 1}
+        """Названия, встречающиеся у нескольких карточек (контроллер)."""
+        return self._doc_context_flow.party_duplicate_bases()
 
     def _party_display(self, rec: dict, duplicates: set[str] | None = None) -> str:
-        """Имя в списке; при совпадении названий добавляется ID."""
-        base = storage.display_with_inn(rec)
-        if duplicates and base in duplicates:
-            return f"{base} · ID {rec.get('id')}"
-        return base
+        """Имя в списке; при совпадении добавляется ID (контроллер)."""
+        return self._doc_context_flow.party_display(rec, duplicates)
 
     def _party_display_values(self) -> list[str]:
-        recs = self.store.active_counterparties()
-        if not recs:
-            return ["— контрагентов нет —"]
-        duplicates = self._party_duplicate_bases()
-        return [self._party_display(rec, duplicates) for rec in recs]
+        """Имена всех активных контрагентов для списков (контроллер)."""
+        return self._doc_context_flow.party_display_values()
 
     def _refresh_party_combo_values(self):
-        """Обновляет списки и сбрасывает устаревший выбор (п. 4.2).
-
-        Если выбранного контрагента больше нет в реестре (удалён, переименован),
-        поле очищается — недействительное имя не должно оставаться на экране.
-        """
-        values = self._party_display_values()
-        valid = set(values)
-        placeholders = {"— контрагентов нет —"}
-        for combo, attr in (
-            (getattr(self, "contract_party_combo", None), "contract_party_var"),
-            (getattr(self, "addl_party_combo", None), "addl_party_var"),
-            (getattr(self, "spec_party_combo", None), "spec_party_var"),
-        ):
-            if combo is not None:
-                combo.set_values(values)
-            var = getattr(self, attr, None)
-            if var is None:
-                continue
-            current = var.get().strip()
-            if current and current not in valid and current not in placeholders:
-                var.set("")
-        if self._current_party_id is not None:
-            if self.store.get_counterparty(self._current_party_id) is None:
-                self._current_party_id = None
-        self._update_current_party_labels()
+        """Обновляет списки и сбрасывает устаревший выбор (контроллер)."""
+        self._doc_context_flow.refresh_party_combo_values()
 
     def _party_from_var(self, var: tk.StringVar) -> dict | None:
-        """Возвращает запись контрагента по выбранному значению списка."""
-        value = var.get().strip()
-        if not value:
-            return None
-        recs = self.store.active_counterparties()
-        duplicates = self._party_duplicate_bases()
-        for rec in recs:
-            if self._party_display(rec, duplicates) == value:
-                return rec
-        # Совместимость: значение могло быть установлено программно без ID.
-        for rec in recs:
-            if storage.display_with_inn(rec) == value:
-                return rec
-        return None
+        """Запись контрагента по значению списка (контроллер)."""
+        return self._doc_context_flow.party_from_var(var)
 
-    # -- Единый «текущий контрагент» (п. 4.2) --------------------------- #
     def _current_party_label(self) -> str:
-        if self._current_party_id is None:
-            return "Документ для: контрагент не выбран"
-        rec = self.store.get_counterparty(self._current_party_id)
-        if rec is None:
-            return "Документ для: выбранный контрагент не найден — выберите заново"
-        return f"Документ для: {self._party_display(rec, self._party_duplicate_bases())}"
+        """Подпись «Документ для: …» (контроллер контекста)."""
+        return self._doc_context_flow.current_party_label()
 
     def _update_current_party_labels(self) -> None:
-        text = self._current_party_label()
-        for var in getattr(self, "_current_party_vars", {}).values():
-            try:
-                var.set(text)
-            except Exception:
-                pass
+        """Обновляет подписи на всех страницах документов (контроллер)."""
+        self._doc_context_flow.update_current_party_labels()
 
     def _set_current_party(self, rec: dict | None, source: str | None = None) -> None:
-        """Запоминает контрагента и переносит выбор на все страницы документов."""
-        if not isinstance(rec, dict):
-            return
-        self._current_party_id = rec.get("id")
-        display = self._party_display(rec, self._party_duplicate_bases())
-        self._syncing_party = True
-        try:
-            for key, attr in (
-                ("contract", "contract_party_var"),
-                ("additional", "addl_party_var"),
-                ("spec", "spec_party_var"),
-            ):
-                if key == source:
-                    continue
-                var = getattr(self, attr, None)
-                if var is None:
-                    continue
-                try:
-                    if var.get() != display:
-                        var.set(display)
-                except Exception:
-                    pass
-        finally:
-            self._syncing_party = False
-        self._update_current_party_labels()
+        """Запоминает контрагента и переносит выбор (контроллер контекста)."""
+        self._doc_context_flow.set_current_party(rec, source=source)
 
     def _on_party_selected(self, key: str) -> None:
-        """Пользователь выбрал контрагента на одной из страниц документов."""
-        if getattr(self, "_syncing_party", False):
-            return
-        attr = {
-            "contract": "contract_party_var",
-            "additional": "addl_party_var",
-            "spec": "spec_party_var",
-        }.get(key)
-        var = getattr(self, attr, None) if attr else None
-        if var is None:
-            return
-        rec = self._party_from_var(var)
-        if rec is None:
-            if not var.get().strip():
-                self._current_party_id = None
-                self._update_current_party_labels()
-            return
-        self._set_current_party(rec, source=key)
+        """Пользователь выбрал контрагента на странице (контроллер)."""
+        self._doc_context_flow.on_party_selected(key)
 
     def _update_contract_info(self, page: str) -> None:
-        """Показывает выбранный договор-основание явно (п. 4.2)."""
-        if page == "additional":
-            var = getattr(self, "addl_contract_var", None)
-            info = getattr(self, "addl_contract_info_var", None)
-        else:
-            var = getattr(self, "spec_contract_var", None)
-            info = getattr(self, "spec_contract_info_var", None)
-        if var is None or info is None:
-            return
-        value = var.get().strip()
-        if not value or value.startswith("—"):
-            info.set("Договор-основание не выбран — укажите его явно.")
-        else:
-            info.set(f"Договор-основание: {value}")
+        """Показывает договор-основание явно (п. 4.2, контроллер)."""
+        self._doc_context_flow.update_contract_info(page)
 
     def _contract_display(self, rec: dict) -> str:
-        number = rec.get("number") or "б/н"
-        date_text = rec.get("date") or ""
-        return f"№ {number} от {date_text}" if date_text else f"№ {number}"
+        """Имя договора в списке основания (контроллер контекста)."""
+        return self._doc_context_flow.contract_display(rec)
 
     def _contract_from_var(self, var: tk.StringVar, party_id) -> dict | None:
-        value = var.get().strip()
-        if not value:
-            return None
-        for rec in self.store.contracts_for(party_id):
-            if self._contract_display(rec) == value:
-                return rec
-        return None
+        """Запись договора по значению списка (контроллер контекста)."""
+        return self._doc_context_flow.contract_from_var(var, party_id)
 
-    # ------------------------------------------------------------------ #
-    #  Формирование текста документов
-    # ------------------------------------------------------------------ #
     @staticmethod
     def _set_text(textbox, text: str):
         if textbox is None:
@@ -1986,110 +1888,47 @@ class ContractApp:
         self._dadata_flow.party_loaded(mode, info)
 
     # ------------------------------------------------------------------ #
-    #  Несохранённые данные (п. 4.4)
+    #  Несохранённые данные (п. 4.4) — DocumentContextController
     # ------------------------------------------------------------------ #
+    #  Подписи форм, baseline, «грязные» страницы, подтверждение при уходе
+    #  и сохранение текущей страницы переехали в
+    #  document_context_controller.DocumentContextController (девятый шаг
+    #  декомпозиции ContractApp, аудит 2.0.1 P2); здесь — фасады с
+    #  прежними именами. Подпись карточки идёт через _cp_collect
+    #  (контроллер карточки), сохранение — через фасады контроллера
+    #  сохранения; базовые подписи (_form_baseline) остаются на приложении.
     @staticmethod
     def _form_label(key: str) -> str:
-        return {
-            "contract": "Договор поставки",
-            "additional": "Доп. соглашение",
-            "spec": "Спецификация",
-            "counterparty": "Карточка контрагента",
-        }.get(key, key)
+        """Человекочитаемое имя страницы (контроллер контекста)."""
+        return document_context_controller.DocumentContextController.form_label(key)
 
     def _form_signature(self, key: str) -> tuple | None:
-        """Данные формы, потеря которых требует подтверждения.
-
-        Выбор контрагента/договора намеренно не входит в подпись: он
-        переносится между страницами (п. 4.2) и не является введёнными данными.
-
-        Аудит 2.0.1: при сбое чтения возвращается None, а не пустой кортеж —
-        None не совпадает ни с каким baseline, поэтому защита несохранённых
-        данных считает страницу «грязной» и просит подтверждение, вместо
-        того чтобы молча решить, что терять нечего.
-        """
-        try:
-            if key == "contract":
-                return (
-                    self.contract_number_var.get(),
-                    self.contract_day_var.get(),
-                    self.contract_month_var.get(),
-                )
-            if key == "additional":
-                return (
-                    self.addl_number_var.get(),
-                    self._limit_var.get(),
-                    self.term_var.get(),
-                )
-            if key == "spec":
-                items = tuple(
-                    (row["name"].get(), row["qty"].get(), row["unit"].get(), row["price"].get())
-                    for row in self._spec_rows
-                )
-                return (
-                    self.spec_number_var.get(),
-                    self.spec_day_var.get(),
-                    self.spec_month_var.get(),
-                    self.spec_delivery_term_var.get(),
-                    self.spec_payment_terms_var.get(),
-                    self.spec_delivery_basis_var.get(),
-                    self.spec_prices_until_var.get(),
-                    items,
-                )
-            if key == "counterparty":
-                mode = "ip" if self._cp_type_var.get() == "ИП" else "ooo"
-                data = self._cp_collect(mode)
-                if data is None:
-                    return None
-                return tuple(sorted(data.items()))
-        except Exception as exc:
-            # Сбой чтения формы — повод предположить несохранённые данные,
-            # а не «чистоту» страницы (аудит 2.0.1).
-            self._log.warning(
-                "Не удалось снять подпись формы «%s»: %s", key, type(exc).__name__,
-            )
-            return None
-        return None
+        """Снимок введённых данных страницы (контроллер контекста)."""
+        return self._doc_context_flow.form_signature(key)
 
     def _reset_form_baseline(self, key: str) -> None:
-        self._form_baseline[key] = self._form_signature(key)
+        """Фиксирует baseline страницы (контроллер контекста)."""
+        self._doc_context_flow.reset_form_baseline(key)
 
     def _reset_all_form_baselines(self) -> None:
-        for key in ("contract", "additional", "spec", "counterparty"):
-            self._reset_form_baseline(key)
+        """Фиксирует baseline всех страниц (контроллер контекста)."""
+        self._doc_context_flow.reset_all_form_baselines()
 
     def _is_form_dirty(self, key: str) -> bool:
-        if key not in self._form_baseline:
-            return False
-        return self._form_signature(key) != self._form_baseline[key]
+        """Страница отличается от baseline (контроллер контекста)."""
+        return self._doc_context_flow.is_form_dirty(key)
 
     def _dirty_pages(self) -> list[str]:
-        return [
-            key for key in ("contract", "additional", "spec", "counterparty")
-            if self._is_form_dirty(key)
-        ]
+        """Список страниц с несохранёнными данными (контроллер)."""
+        return self._doc_context_flow.dirty_pages()
 
     def _confirm_leave_page(self) -> bool:
-        key = self.current_page
-        if key not in self.pages or not self._is_form_dirty(key):
-            return True
-        return ui.confirm(
-            self.root, "Несохранённые изменения",
-            f"На странице «{self._form_label(key)}» есть несохранённые данные.\n\n"
-            "Перейти и потерять изменения?",
-            ok_text="Перейти", cancel_text="Остаться",
-        )
+        """Подтверждение потери изменений при уходе (контроллер)."""
+        return self._doc_context_flow.confirm_leave_page()
 
     def _save_current_page(self) -> None:
-        commands = {
-            "contract": self.save_contract,
-            "additional": self.save_additional,
-            "spec": self.save_spec,
-            "counterparty": self._cp_save,
-        }
-        command = commands.get(self.current_page)
-        if command is not None:
-            command()
+        """Ctrl+S / сохранение текущей страницы (контроллер контекста)."""
+        self._doc_context_flow.save_current_page()
 
     def _on_save_shortcut(self, _event=None):
         self._save_current_page()

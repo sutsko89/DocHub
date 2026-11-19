@@ -13,6 +13,7 @@ import logging
 import pytest
 
 import counterparty_controller
+import document_context_controller
 import main
 from document_builder import F
 
@@ -56,6 +57,9 @@ def make_app(entries: dict) -> "main.ContractApp":
     # Сбор/сохранение карточки с шага 6 декомпозиции живёт в контроллере:
     # фасады ContractApp._cp_collect / _cp_save делегируют ему — нужен и он.
     app._counterparty_flow = counterparty_controller.CounterpartyController(app)
+    # Подписи форм с шага 9 декомпозиции тоже в контроллере: фасад
+    # ContractApp._form_signature делегирует ему.
+    app._doc_context_flow = document_context_controller.DocumentContextController(app)
     app._log = logging.getLogger("test-main-forms")
     app._form_baseline = {}
     app.root = None  # алерты замокаются; настоящий root не нужен

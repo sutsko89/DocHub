@@ -29,6 +29,7 @@ from types import SimpleNamespace
 import pytest
 
 import counterparty_controller as cc
+import document_context_controller
 import main
 import storage
 from document_builder import F
@@ -114,8 +115,10 @@ class FakeApp:
         self._cp_error_vars: dict[str, dict] = {"ooo": {}, "ip": {}}
         self._cp_type_var = FakeVar("Юр. лицо")
         self._cp_frames = {"ooo": FakeFrame("ooo"), "ip": FakeFrame("ip")}
-        # Контроллер создаётся здесь же, как в ContractApp.__init__.
+        # Контроллеры создаются здесь же, как в ContractApp.__init__:
+        # карточка (шаг 6) и подписи форм (шаг 9).
         self._counterparty_flow = CounterpartyController(self)
+        self._doc_context_flow = document_context_controller.DocumentContextController(self)
 
     # -- хуки, оставшиеся на приложении ------------------------------------- #
     def _cp_collect(self, mode):

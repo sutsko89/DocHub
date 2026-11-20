@@ -293,13 +293,18 @@ def test_titlebar_drag_moves_window_manually(app, monkeypatch):
 
     monkeypatch.setattr(main.ui, "begin_native_move_deferred", lambda w: False)
     window = app.root
-    window.update_idletasks()
+    # Детерминированный старт в границах экрана: на CI-раннере окно может
+    # стоять у левого края (x0 = -128), а зажим в _move — max(x, -40) —
+    # тогда меняет арифметику переноса. Ожидание всё равно зажим-учётное.
+    window.geometry("+120+80")
+    window.update()
     x0, y0 = window.winfo_x(), window.winfo_y()
     try:
         app.drag._press(SimpleNamespace(x_root=x0 + 10, y_root=y0 + 5))
         app.drag._move(SimpleNamespace(x_root=x0 + 60, y_root=y0 + 45))
         window.update()
-        assert (window.winfo_x(), window.winfo_y()) == (x0 + 50, y0 + 40)
+        expected = (max(x0 + 50, -40), max(y0 + 40, 0))
+        assert (window.winfo_x(), window.winfo_y()) == expected
     finally:
         app.drag._release(SimpleNamespace(x_root=0, y_root=0))
         window.geometry(f"+{x0}+{y0}")

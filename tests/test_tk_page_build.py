@@ -64,7 +64,15 @@ def app(tmp_path_factory):
     mp.setenv("HOME", str(home))
     mp.setattr(main.ui, "confirm", lambda *args, **kwargs: True)
     mp.setattr(main.ui, "alert", lambda *args, **kwargs: None)
-    application = main.ContractApp()
+    try:
+        application = main.ContractApp()
+    except tk.TclError as exc:
+        # Probe при сборке модуля мог пройти (Tcl был доступен), а к моменту
+        # фикстуры Tk-окружение раннера сломалось (наблюдалось на Windows
+        # hostedtoolcache: "Can't find a usable init.tcl"). Это проблема
+        # окружения, не кода — модуль скипается, остальные тесты проходят.
+        mp.undo()
+        pytest.skip(f"Tk недоступен на раннере: {exc}")
     application.root.update()
     # Гасим стартовые таймеры ContractApp (after 250/600/900/1500 мс от
     # конструктора: онбординг «первый запуск» → страница «Контрагент»,

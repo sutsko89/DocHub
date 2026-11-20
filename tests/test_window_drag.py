@@ -106,9 +106,13 @@ def test_press_survives_native_dispatch_failure(monkeypatch):
 # --------------------------------------------------------------------------- #
 #  Ручной fallback: перенос окна по событиям
 # --------------------------------------------------------------------------- #
-def test_manual_drag_moves_window():
+def test_manual_drag_moves_window(monkeypatch):
+    # Ручной путь закрепляем явно: на Windows настоящий
+    # begin_native_move_deferred уходит в after_idle (нативный цикл) —
+    # тест же проверяет именно fallback.
     window = FakeDragWindow()
     drag = ui.WindowDrag(window)
+    monkeypatch.setattr(ui, "begin_native_move_deferred", lambda w: False)
     drag._press(event(150, 120))
     drag._move(event(160, 140))
     assert ("geometry", "+110+100") in window.calls
@@ -128,9 +132,10 @@ def test_move_is_noop_before_press_and_after_release():
     ), "после отпускания кнопки окно не двигается"
 
 
-def test_manual_drag_clamps_positions():
+def test_manual_drag_clamps_positions(monkeypatch):
     window = FakeDragWindow()
     drag = ui.WindowDrag(window)
+    monkeypatch.setattr(ui, "begin_native_move_deferred", lambda w: False)
     drag._press(event(150, 120))  # offset (50, 40)
     drag._move(event(20, 5))      # x = -30, y = -35 → зажим (-30, 0)
     assert ("geometry", "+-30+0") in window.calls

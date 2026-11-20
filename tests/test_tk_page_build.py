@@ -281,10 +281,17 @@ def test_store_uses_isolated_profile(app):
 #  Перетаскивание и растягивание окна (2.19.1): обработчики нажатия не
 #  выполняют блокирующей работы — модальный Win32-цикл уходит в after_idle.
 # --------------------------------------------------------------------------- #
-def test_titlebar_drag_moves_window_manually(app):
-    """Ручной путь (не-Windows): нажатие + движение по шапке переносит окно."""
+def test_titlebar_drag_moves_window_manually(app, monkeypatch):
+    """Ручной путь (fallback): нажатие + движение по шапке переносит окно.
+
+    Нативный вариант глушится явно: на Windows настоящий
+    begin_native_move_deferred планирует after_idle и ручной старт
+    не выполняется (это контракт test_resize_press_uses_deferred_*),
+    а здесь проверяется именно fallback-перенос.
+    """
     from types import SimpleNamespace
 
+    monkeypatch.setattr(main.ui, "begin_native_move_deferred", lambda w: False)
     window = app.root
     window.update_idletasks()
     x0, y0 = window.winfo_x(), window.winfo_y()

@@ -704,3 +704,104 @@ def test_download_tick_error_alerts(app, ui_stubs):
     assert len(ui_stubs["alerts"]) == 1
     assert "Обновление не удалось" in ui_stubs["alerts"][0][0]
     assert "Нет соединения" in ui_stubs["alerts"][0][1]
+
+
+# --------------------------------------------------------------------------- #
+#  download_tick: цикл опроса (регрессия 2.19.2 — зависание «0,0 МБ из 19,5 МБ»)
+# --------------------------------------------------------------------------- #
+class FakeProgress:
+    """Полоса прогресса-двойник: помнит установленные значения."""
+
+    def __init__(self):
+        self.values: list[float] = []
+
+    def set(self, value):
+        self.values.append(value)
+
+
+def test_download_tick_progress_keeps_polling(app, ui_stubs):
+    """Событие progress НЕ терминальное: after перевешивается, цикл живёт.
+
+    Регрессия 2.18.0: после первого пакета прогресса опрос умирал — окно
+    застывало на «0,0 МБ из 19,5 МБ», а финальное done никто не забирал.
+    """
+    flow = app._update_flow
+    scheduled: list = []
+    app.root = SimpleNamespace(after=lambda *a: scheduled.append(a))
+    flow.download_queue = queue.Queue()
+    flow.download_queue.put(("progress", 0, 20447232))
+    flow.download_tick()
+    assert scheduled, "после события прогресса after перевешивается"
+    assert scheduled[-1][0] == 80
+    assert scheduled[-1][1] == flow.download_tick
+    assert flow.download_queue is not None, "прогресс не завершает опрос"
+
+
+def test_download_tick_progress_updates_ui(app, ui_stubs):
+    flow = app._update_flow
+    flow._download_progress = FakeProgress()
+    flow._download_status_var = FakeVar("")
+    flow.download_queue = queue.Queue()
+    flow.download_queue.put(("progress", 5 * 1024 * 1024, 19.5 * 1024 * 1024))
+    flow.download_tick()
+    assert flow._download_progress.values, "полоса прогресса обновляется"
+    assert "5.0 МБ из" in flow._download_status_var.value
+
+
+def test_download_tick_phase_keeps_window_and_polling(app, ui_stubs):
+    """Фаза проверки суммы не закрывает окно и не останавливает опрос."""
+    flow = app._update_flow
+    scheduled: list = []
+    app.root = SimpleNamespace(after=lambda *a: scheduled.append(a))
+    flow._download_status_var = FakeVar("")
+    destroyed: list = []
+    flow.download_window = SimpleNamespace(
+        winfo_exists=lambda: True, destroy=lambda: destroyed.append("w"))
+    flow.download_queue = queue.Queue()
+    flow.download_queue.put(("phase", "Проверка целостности файла…"))
+    flow.download_tick()
+    assert flow._download_status_var.value == "Проверка целостности файла…"
+    assert destroyed == [], "фаза проверки не закрывает окно скачивания"
+    assert flow.download_queue is not None, "фаза проверки не завершает опрос"
+    assert scheduled, "после фазы опрос продолжается"
+
+
+def test_download_tick_drains_burst_then_confirms(app, ui_stubs, monkeypatch):
+    """Пачка progress+phase+done за один тик: осушается целиком до done."""
+    launched = []
+    monkeypatch.setattr(ucc, "run_installer_command", lambda p: launched.append(p))
+    flow = app._update_flow
+    flow._download_progress = FakeProgress()
+    flow._download_status_var = FakeVar("")
+    scheduled: list = []
+    app.root = SimpleNamespace(after=lambda *a: scheduled.append(a))
+    flow.download_window = SimpleNamespace(
+        winfo_exists=lambda: True, destroy=lambda: None)
+    flow.download_queue = queue.Queue()
+    for item in (("progress", 0, 20447232),
+                 ("progress", 1024 * 1024, 20447232),
+                 ("phase", "Проверка целостности файла…"),
+                 ("done", "/tmp/EW.DocHub-2.19.2-setup.exe")):
+        flow.download_queue.put(item)
+    flow.download_tick()
+    assert len(flow._download_progress.values) == 2, "оба события прогресса обработаны"
+    assert flow._download_status_var.value == "Проверка целостности файла…"
+    assert launched == ["/tmp/EW.DocHub-2.19.2-setup.exe"], "done доходит до установки"
+    assert len(ui_stubs["confirms"]) == 1, "перед установкой — подтверждение"
+    assert flow.download_queue is None, "терминальное событие останавливает опрос"
+    # run_installer запланировал закрытие приложения через after(500, close);
+    # опрос очереди (интервал 80) после done не возобновляется.
+    assert all(a[0] != 80 for a in scheduled), "после done опрос не планируется"
+
+
+def test_download_tick_cancelled_stops_polling(app, ui_stubs):
+    """Отмена — терминальное событие: опрос остановлен, без диалогов."""
+    flow = app._update_flow
+    scheduled: list = []
+    app.root = SimpleNamespace(after=lambda *a: scheduled.append(a))
+    flow.download_queue = queue.Queue()
+    flow.download_queue.put(("cancelled", None))
+    flow.download_tick()
+    assert flow.download_queue is None
+    assert ui_stubs["alerts"] == [] and ui_stubs["confirms"] == []
+    assert scheduled == [], "терминальное событие не планирует новый опрос"

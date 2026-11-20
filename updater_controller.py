@@ -365,44 +365,66 @@ class UpdateController:
             result_queue.put(("error", updater.human_error(exc)))
 
     def download_tick(self) -> None:
-        """Опрашивает очередь скачивания из главного потока Tk."""
+        """Опрашивает очередь скачивания из главного потока Tk.
+
+        Регрессия 2.18.0 (зависание «0,0 МБ из 19,5 МБ»): после события
+        ``progress`` цикл опроса не перевешивал ``after`` — опрос умирал
+        на первом же пакете прогресса, окно застывало, а финальное
+        ``done`` никто не забирал, хотя скачивание в рабочем потоке
+        продолжалось. Теперь за один тик очередь осушается пачкой, а
+        ``after`` перевешивается после КАЖДОГО не-терминального события;
+        остановка цикла — только на терминальном ``done``/``cancelled``/
+        ``error`` или при разрушении окна.
+        """
         result_queue = self.download_queue
         if result_queue is None:
             return
-        try:
-            item = result_queue.get_nowait()
-        except queue.Empty:
+        while True:
             try:
-                self.download_after = self.app.root.after(80, self.download_tick)
-            except Exception:
-                pass  # окно закрывается — цикл прервётся вместе с ним
+                item = result_queue.get_nowait()
+            except queue.Empty:
+                break  # событий больше нет — планируем следующий опрос
+            except (RuntimeError, AttributeError):
+                return  # окно закрывается — цикл прервётся вместе с ним
+            kind = item[0]
+            if kind == "progress":
+                self._show_progress(item[1], item[2])
+                continue  # не терминальное — цикл продолжается
+            if kind == "phase":
+                # Промежуточная фаза (проверка суммы): окно остаётся
+                # открытым, меняется только строка статуса.
+                self._set_download_status(item[1])
+                continue
+            # Терминальные события: done / cancelled / error.
+            self.download_queue = None
+            self._close_progress_window()
+            if kind == "done":
+                self._confirm_install(item[1])
+            elif kind == "cancelled":
+                pass  # окно закрыто — ничего не делаем
+            else:
+                ui.alert(
+                    self.app.root, "Обновление не удалось",
+                    str(item[1] or "Неизвестная ошибка скачивания.")
+                    + "\n\nСтраницу релизов можно открыть вручную:\n"
+                    + updater.PAGE_URL,
+                    "error",
+                )
             return
-        except (RuntimeError, AttributeError):
-            return
-        kind = item[0]
-        if kind == "progress":
-            self._show_progress(item[1], item[2])
-            return  # очередь продолжает опрашиваться
-        self.download_queue = None
-        self._close_progress_window()
-        if kind == "done":
-            self._confirm_install(item[1])
-        elif kind == "cancelled":
-            pass  # окно закрыто — ничего не делаем
-        elif kind == "phase":
-            # Промежуточная фаза (проверка суммы) — окно нужно вернуть.
-            self.download_queue = result_queue
-            if self.download_window is not None and self.download_window.winfo_exists():
-                self._download_status_var.set(item[1])
+        try:
             self.download_after = self.app.root.after(80, self.download_tick)
-        else:
-            ui.alert(
-                self.app.root, "Обновление не удалось",
-                str(item[1] or "Неизвестная ошибка скачивания.")
-                + "\n\nСтраницу релизов можно открыть вручную:\n"
-                + updater.PAGE_URL,
-                "error",
-            )
+        except Exception:
+            pass  # окно закрывается — цикл прервётся вместе с ним
+
+    def _set_download_status(self, text: str) -> None:
+        """Обновляет строку статуса окна скачивания (если окно живо)."""
+        var = self._download_status_var
+        if var is None:
+            return
+        try:
+            var.set(text)
+        except Exception:
+            pass  # окно уже разрушено
 
     def _show_progress(self, done: int, total: int) -> None:
         """Обновляет полосу и статус скачивания."""

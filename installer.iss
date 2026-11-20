@@ -20,7 +20,7 @@
 #define MyAppExeName "EW.DocHub.exe"
 ; Версия релиза: синхронизируется с APP_VERSION (main.py) скриптом
 ; tools/bump_version.py. В EWDochub.spec версия из main.py читается напрямую.
-#define MyAppVersion "2.19.1"
+#define MyAppVersion "2.19.2"
 
 [Setup]
 AppId={{7B4E6F2A-91C4-4A3E-9B5D-2C8A1D6E4F10}
@@ -82,10 +82,14 @@ Name: "{group}\Удалить {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; 2.18.0: после тихого обновления (/VERYSILENT) программа запускается сама —
-; обновление выглядит для пользователя как «приложение перезапустилось».
-; При обычной (не тихой) установке чекбокс «Запустить» работает как раньше.
-Filename: "{app}\{#MyAppExeName}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall skipifnotsilent
+; 2.19.2: две записи запуска.
+; 1. Чекбокс «Запустить EW.DocHub» на странице «Завершение» — при обычной
+;    интерактивной установке (skipifsilent: в тихом режиме финальной
+;    страницы нет). Галочка по умолчанию включена, пользователь может снять.
+Filename: "{app}\{#MyAppExeName}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall skipifsilent
+; 2. Тихое обновление (/VERYSILENT, автообновление 2.18.0): программа
+;    запускается сама — обновление выглядит как «приложение перезапустилось».
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait skipifnotsilent
 
 [Messages]
 SetupAppTitle=Установка — {#MyAppName}

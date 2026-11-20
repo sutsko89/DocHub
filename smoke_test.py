@@ -1674,7 +1674,8 @@ try:
     check(bool(_smoke_closed) and _smoke_closed[0][1] == "close",
           "2.18.0: приложение закрывается после запуска установки")
 
-    # 2.18.0: рабочий поток скачивания отдаёт done при корректной сумме.
+    # 2.18.0: рабочий поток скачивания отдаёт progress/phase/done при
+    # корректной сумме.
     import shutil as _shutil
     _rel = {"installer_name": "EW.DocHub-2.18.0-smoke-setup.exe",
             "sums_url": "https://github.com/x/SHA256SUMS.txt"}
@@ -1684,8 +1685,13 @@ try:
     _orig_ft = updater.fetch_text
 
     def _fake_download(url, dest, **kwargs):
-        # Стаб без сети: настоящий download_file создаёт каталог назначения.
+        # Стаб без сети: настоящий download_file создаёт каталог назначения
+        # и отчитывается прогрессом — стаб повторяет оба контракта.
         os.makedirs(os.path.dirname(dest), exist_ok=True)
+        _cb = kwargs.get("progress_cb")
+        if callable(_cb):
+            _cb(0, len(b"setup-payload"))
+            _cb(len(b"setup-payload"), len(b"setup-payload"))
         return _shutil.copy(_inst_path, dest)
 
     updater.download_file = _fake_download
@@ -1697,10 +1703,26 @@ try:
     _kinds = []
     while not _q.empty():
         _kinds.append(_q.get_nowait())
-    check(any(item[0] == "done" for item in _kinds),
-          "2.18.0: скачивание и проверка SHA-256 завершаются успехом")
+    check(any(item[0] == "progress" for item in _kinds),
+          "2.19.2: рабочий поток отчитывается событиями прогресса")
     check(any(item[0] == "phase" for item in _kinds),
           "2.18.0: после скачивания идёт фаза проверки целостности")
+    check(any(item[0] == "done" for item in _kinds),
+          "2.18.0: скачивание и проверка SHA-256 завершаются успехом")
+
+    # 2.19.2: тик с событием прогресса обязан перевешивать after — иначе
+    # цикл опроса умирает и окно застывает («0,0 МБ из 19,5 МБ» навсегда).
+    _scheduled: list = []
+    _orig_after2 = app.root.after
+    app.root.after = lambda *a: _scheduled.append(a)
+    _upd_flow.download_queue = _queue.Queue()
+    _upd_flow.download_queue.put(("progress", 0, 20447232))
+    _upd_flow.download_tick()
+    app.root.after = _orig_after2
+    _upd_flow.download_queue = None
+    check(bool(_scheduled) and _scheduled[-1][0] == 80
+          and _scheduled[-1][1] == _upd_flow.download_tick,
+          "2.19.2: событие прогресса продолжает цикл опроса очереди")
 
     # Реестр.
     app._select_page("registry")

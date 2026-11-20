@@ -4,12 +4,12 @@ name: Release
 # не в CI»): PyInstaller + Inno Setup на windows-latest, SHA-256 рядом с артефактами.
 # Триггеры: ручной запуск и теги вида v2.1.0.
 #
-# Подпись (организационный шаг — нужен OV/EV-сертификат):
-#   1. Добавьте шаг с signtool sign /fd SHA256 /tr <timestamp> /td SHA256
-#      для dist\EW.DocHub\EW.DocHub.exe и для installer\*-setup.exe.
-#   2. Раскомментируйте SignTool/SignedUninstaller в installer.iss
-#      (инструкции в шапке файла).
-# После этого SmartScreen перестанет показывать «неизвестный издатель».
+# Подпись (2.16.0): шаги signtool выполняются автоматически, когда в секретах
+# репозитория заданы SIGN_CERT_PFX (base64 сертификата .pfx) и
+# SIGN_CERT_PASSWORD. Подписываются EW.DocHub.exe и setup.exe с RFC-3161
+# таймштампом (SHA-256). Секретов нет — шаги пропускаются, сборка остаётся
+# рабочей. Инструкции по получению сертификата — в README («Подпись кода»).
+# После включения подписи SmartScreen перестаёт показывать «неизвестный издатель».
 
 on:
   workflow_dispatch:
@@ -29,6 +29,10 @@ jobs:
     defaults:
       run:
         shell: pwsh
+    env:
+      # Секреты подписи (2.16.0): пустые — шаги signtool пропускаются.
+      SIGN_CERT_PFX: ${{ secrets.SIGN_CERT_PFX }}
+      SIGN_CERT_PASSWORD: ${{ secrets.SIGN_CERT_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -50,6 +54,11 @@ jobs:
       - name: Сборка приложения (PyInstaller)
         run: pyinstaller --noconfirm EWDochub.spec
 
+      - name: Подпись EW.DocHub.exe (signtool, опционально)
+        if: env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != ''
+        run: |
+          ./tools/sign_artifact.ps1 "dist\EW.DocHub\EW.DocHub.exe"
+
       - name: Сборка установщика (Inno Setup)
         run: |
           choco install innosetup -y --no-progress
@@ -59,7 +68,14 @@ jobs:
           & $iscc installer.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup завершился с ошибкой $LASTEXITCODE" }
 
-      - name: SHA-256 артефактов
+      - name: Подпись setup.exe (signtool, опционально)
+        if: env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != ''
+        run: |
+          $setup = Get-ChildItem "installer\*-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "Установщик не найден в installer\" }
+          ./tools/sign_artifact.ps1 $setup.FullName
+
+      - name: SHA-256 артефактов (после подписи)
         run: |
           $setup = Get-ChildItem "installer\*-setup.exe" | Select-Object -First 1
           if (-not $setup) { throw "Установщик не найден в installer\" }
@@ -98,5 +114,6 @@ jobs:
           fail_on_unmatched_files: true
 
 # Публикация в GitHub Releases (шаг softprops/action-gh-release выше) — на тегах
-# с 2.15.0. Подпись сертификатом добавляется шагом signtool (см. шапку файла):
-# тогда в release попадает уже подписанный setup.exe.
+# с 2.15.0. Подпись артефактов — шагами sign_artifact.ps1 (2.16.0): при заданных
+# секретах SIGN_CERT_PFX/SIGN_CERT_PASSWORD в release попадает уже подписанный
+# setup.exe, SHA-256 считается по подписанному файлу.

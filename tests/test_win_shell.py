@@ -153,6 +153,36 @@ def test_workarea_without_window_falls_back_to_defaults():
     assert win_shell.workarea(None) == (0, 0, 1920, 1080)
 
 
+@not_win32
+def test_workarea_at_follows_root_screen_on_linux():
+    """Не-Windows: единая рабочая область экрана Tk для любой точки (2.20.0)."""
+    root = FakeWindow(screen=(1366, 768))
+    assert win_shell.workarea_at(root, 100, 200) == (0, 0, 1366, 768)
+    assert win_shell.workarea_at(root, -50, 5000) == (0, 0, 1366, 768)
+
+
+@not_win32
+def test_workarea_at_without_root_falls_back_to_defaults():
+    assert win_shell.workarea_at(None, 0, 0) == (0, 0, 1920, 1080)
+
+
+@not_win32
+def test_workarea_at_survives_win32_failure(monkeypatch):
+    """Сбой MonitorFromPoint/GetMonitorInfoW не роняет вызов (2.20.0):
+    ветка win32 с полностью сломанным windll уходит в каскад fallback'ей
+    workarea() и завершается крайним fallback 1920×1080 без исключения."""
+    monkeypatch.setattr(win_shell.sys, "platform", "win32")
+
+    class Boom:
+        def __getattr__(self, name):
+            raise OSError("win32 сбой")
+
+    # На Linux windll нет вовсе — создаём атрибут (raising=False),
+    # чтобы ветка win32 получила сломанную обвязку.
+    monkeypatch.setattr(win_shell.ctypes, "windll", Boom(), raising=False)
+    assert win_shell.workarea_at(FakeWindow(), 10, 20) == (0, 0, 1920, 1080)
+
+
 def test_make_borderless_sets_overrideredirect_and_keeps_taskbar_flag():
     fake = FakeWindow()
     win_shell.make_borderless(fake)
@@ -160,15 +190,19 @@ def test_make_borderless_sets_overrideredirect_and_keeps_taskbar_flag():
 
 
 @not_win32
-def test_minimize_maximize_restore_on_linux_use_tk_analogs():
+def test_minimize_maximize_restore_on_linux_use_workarea_geometry():
     fake = FakeWindow()
     win_shell.minimize_window(fake)
     assert ("iconify",) in fake.calls
+    # 2.20.0: разворот задаётся геометрией рабочей области на всех
+    # платформах — state('zoomed') бездействовал для overrideredirect.
     win_shell.maximize_window(fake)
-    assert ("state", "zoomed") in fake.calls
+    assert ("geometry", "1366x768+0+0") in fake.calls
+    # Явная геометрия возврата применяется на всех платформах (2.20.0).
+    win_shell.restore_window(fake, "900x600+10+20")
+    assert ("geometry", "900x600+10+20") in fake.calls
     win_shell.restore_window(fake)
-    # На Linux Tk сам помнит геометрию до разворота: явная геометрия
-    # (как в ветке Windows из-за overrideredirect) здесь не нужна.
+    # Без геометрии — системный аналог: state('normal').
     assert ("state", "normal") in fake.calls
 
 

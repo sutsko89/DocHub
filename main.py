@@ -86,7 +86,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.19.3"
+APP_VERSION = "2.20.0"
 
 # Уведомление о сроках доп. соглашений (2.18.0): раз в сутки, ключ
 # settings.json — как у автопроверки обновлений (updater.SETTINGS_KEY_TS).
@@ -472,6 +472,9 @@ class ContractApp:
         self.scrollers: list[ctk.CTkScrollableFrame] = []
         self.current_page = "contract"
         self._zoomed = False
+        # Прилипание к краям монитора (2.20.0): None | "left" | "right".
+        # Разворачивание ('max') живёт в _zoomed, половины — здесь.
+        self._snap_zone = None
         self._fullscreen = False
         self._fullscreen_restore = ""
         self._restore_geometry = ""
@@ -480,6 +483,10 @@ class ContractApp:
         self.root.minsize(self._min_width, self._min_height)
         self._resize_origin = None
         self._resize_start = None
+        self._resize_edge = None
+        # Плавное растягивание (2.20.0): опрос курсора ~60 Гц вместо рваных
+        # <B1-Motion> — тот же механизм, что и в плавном переносе шапки.
+        self._resize_poller = ui.PointerPoller(self.root, self._resize_poll_step)
 
         self._digits_vcmd = self.root.register(validate_digits_input)
         self._phone_vcmd = self.root.register(validate_phone_input)
@@ -656,7 +663,16 @@ class ContractApp:
         )
         self.lights.pack(side="right")
 
-        self.drag = ui.WindowDrag(self.root, on_start=self._start_move)
+        # Прилипание (2.20.0): snap_resolver вычисляет зону у краёв
+        # рабочей области монитора под курсором (верх — разворачивание,
+        # лево/право — половины), snap_apply применяет её при отпускании
+        # кнопки; SnapPreview показывает полупрозрачный предпросмотр.
+        self.drag = ui.WindowDrag(
+            self.root,
+            on_start=self._start_move,
+            snap_resolver=self._snap_resolver,
+            snap_apply=self._snap_apply,
+        )
         self.drag.attach(self.titlebar)
         self.titlebar.bind("<Double-Button-1>", lambda _event: self.toggle_zoom())
 
@@ -674,11 +690,12 @@ class ContractApp:
             pass
 
     def _start_move(self, event=None):
-        """Перетаскивание развёрнутого окна: восстанавливаем размер
+        """Перетаскивание развёрнутого/прилипшего окна: восстанавливаем размер
         и ставим окно под курсор (пропорциональный перенос)."""
-        if not self._zoomed:
+        if not self._zoomed and self._snap_zone is None:
             return
         self._zoomed = False
+        self._snap_zone = None
         self.lights.set_zoomed(False)
         ui.restore_window(self.root)
         geometry = self._restore_geometry or f"{int(BASE_WIDTH * self.scale)}x{int(BASE_HEIGHT * self.scale)}"
@@ -704,9 +721,13 @@ class ContractApp:
         """Настоящая максимизация окна (Win32 SW_MAXIMIZE / SW_RESTORE)."""
         if self._fullscreen:
             self.toggle_fullscreen()
-        if not self._zoomed:
+        if not self._zoomed and self._snap_zone is None:
             self._restore_geometry = self.root.geometry()
+            self._snap_zone = None
             ui.maximize_window(self.root)
+            # 2.20.0: раскладка доедает за один проход до отрисовки —
+            # разворачивание выглядит атомарным шагом, а не «квадратами».
+            self.root.update_idletasks()
             self._zoomed = True
         else:
             # Геометрию возвращаем вручную: максимизация задаётся без SW_MAXIMIZE,
@@ -714,6 +735,7 @@ class ContractApp:
             ui.restore_window(self.root, self._restore_geometry)
             self.root.update_idletasks()
             self._zoomed = False
+            self._snap_zone = None
         self.lights.set_zoomed(self._zoomed)
 
     def toggle_fullscreen(self):
@@ -748,6 +770,51 @@ class ContractApp:
 
     def minimize(self):
         ui.minimize_window(self.root)
+
+    def _snap_resolver(self, cursor_x, cursor_y, win_x, win_y, win_w):
+        """Зона прилипания для текущего положения окна (2.20.0).
+
+        Рабочая область берётся монитора ПОД КУРСОРом (workarea_at):
+        окно тянут к краю конкретного монитора. Кромки окна сравниваются
+        с краями области в ui.snap_zone; возвращает (зона, прямоугольник)
+        или None, если зона не активна.
+        """
+        area = ui.workarea_at(self.root, cursor_x, cursor_y)
+        zone = ui.snap_zone(win_x, win_y, win_w, area, edge=ui.px(ui.SNAP_EDGE))
+        if zone is None:
+            return None
+        return zone, ui.snap_rect(zone, area)
+
+    def _snap_apply(self, zone, rect, start_geometry=""):
+        """Прилипание к краю монитора (2.20.0): верх — вся рабочая область,
+        лево/право — половина. Прежняя геометрия запоминается в
+        _restore_geometry: двойной клик по шапке, кнопка «развернуть» и
+        перетаскивание возвращают окно к прежнему размеру (как в Windows)."""
+        if zone not in ("max", "left", "right") or rect is None:
+            return
+        if self._fullscreen:
+            return  # в полноэкранном режиме (F11) прилипание не применяется
+        try:
+            self._restore_geometry = start_geometry or self.root.geometry()
+        except Exception:
+            self._restore_geometry = ""
+        if zone == "max":
+            self._snap_zone = None
+            self._zoomed = True
+            ui.maximize_window(self.root)
+        else:
+            x, y, width, height = rect
+            width = max(int(width), self._min_width)
+            height = max(int(height), self._min_height)
+            try:
+                self.root.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
+            except tk.TclError:
+                return
+            self._zoomed = False
+            self._snap_zone = zone
+        # Раскладка доедает за один проход — прилипание без «квадратов».
+        self.root.update_idletasks()
+        self.lights.set_zoomed(True)
 
     @staticmethod
     def _parse_geometry(geometry: str):
@@ -789,6 +856,7 @@ class ContractApp:
             handle.place(**place_kwargs)
             handle.bind("<ButtonPress-1>", lambda event, e=edge: self._resize_press(event, e))
             handle.bind("<B1-Motion>", lambda event, e=edge: self._resize_drag(event, e))
+            handle.bind("<ButtonRelease-1>", self._resize_release, add="+")
             handle.bind("<Double-Button-1>", lambda _event, e=edge: self.toggle_zoom())
             ui.register_theme_listener(
                 lambda h=handle, key=color_key: self._sync_handle_theme(h, key)
@@ -808,8 +876,9 @@ class ContractApp:
             pass
 
     def _resize_press(self, event, edge):
-        if self._zoomed:
+        if self._zoomed or self._snap_zone is not None:
             self._zoomed = False
+            self._snap_zone = None
             self.lights.set_zoomed(False)
             ui.restore_window(self.root)
         self.root.update_idletasks()
@@ -821,12 +890,30 @@ class ContractApp:
             self.root.winfo_width(), self.root.winfo_height(),
         )
         self._resize_start = (event.x_root, event.y_root)
+        self._resize_edge = edge
+        # Плавное растягивание (2.20.0): пулер тянет кромку ~60 Гц по
+        # актуальной позиции курсора — Tk доставляет <B1-Motion> рвано.
+        self._resize_poller.start()
 
     def _resize_drag(self, event, edge):
+        self._resize_edge = edge
+        self._resize_step(event.x_root, event.y_root)
+
+    def _resize_poll_step(self, x, y):
+        """Тик пулера растягивания (2.20.0): тянет кромку по актуальной
+        позиции курсора; без незавершённого нажатия пулер останавливается."""
+        if self._resize_origin is None or self._resize_start is None:
+            self._resize_poller.stop()
+            return
+        if self._resize_edge is None:
+            return
+        self._resize_step(x, y)
+
+    def _resize_step(self, cursor_x, cursor_y):
         if self._resize_origin is None or self._resize_start is None:
             return
-        dx = event.x_root - self._resize_start[0]
-        dy = event.y_root - self._resize_start[1]
+        dx = cursor_x - self._resize_start[0]
+        dy = cursor_y - self._resize_start[1]
         x, y, width, height = self._resize_origin
         # Рабочая область ТОГО монитора, где окно сейчас (п. 6.3): иначе
         # при частичном переносе на второй монитор растягивание зажималось
@@ -835,19 +922,26 @@ class ContractApp:
         max_w = max(area_w, self._min_width)
         max_h = max(area_h, self._min_height)
 
-        if "e" in edge:
+        if "e" in self._resize_edge:
             width = min(max(width + dx, self._min_width), max_w)
-        if "s" in edge:
+        if "s" in self._resize_edge:
             height = min(max(height + dy, self._min_height), max_h)
-        if "w" in edge:
+        if "w" in self._resize_edge:
             right = x + width
             x = min(max(x + dx, right - max_w), right - self._min_width)
             width = right - x
-        if "n" in edge:
+        if "n" in self._resize_edge:
             bottom = y + height
             y = min(max(y + dy, bottom - max_h), bottom - self._min_height)
             height = bottom - y
         self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _resize_release(self, _event=None):
+        """Отпускание кнопки на кромке: плавный цикл растягивания остановлен."""
+        self._resize_poller.stop()
+        self._resize_edge = None
+        self._resize_origin = None
+        self._resize_start = None
 
     # ------------------------------------------------------------------ #
     #  Настройки между запусками

@@ -30,7 +30,7 @@ SCALE = 1.0
 from win_shell import (
     DRAG_EDGE_MARGIN, virtual_screen_bounds, enable_rounded_corners,
     focus_window, make_borderless, maximize_window, minimize_window,
-    refresh_taskbar, restore_window, workarea,
+    refresh_taskbar, restore_window, workarea, workarea_at,
 )
 
 
@@ -654,11 +654,204 @@ class WindowControls(tk.Canvas):
 # --------------------------------------------------------------------------- #
 #  Перетаскивание окна за шапку
 # --------------------------------------------------------------------------- #
+#: Ширина зоны прилипания у краёв рабочей области, логические пиксели
+#: (2.20.0; в вызовах масштабируется через px()).
+SNAP_EDGE = 16
+
+
+def snap_zone(
+    win_x: int, win_y: int, win_w: int,
+    area: tuple[int, int, int, int], edge: int = SNAP_EDGE,
+) -> Optional[str]:
+    """Зона прилипания для положения окна (чистая функция — тесты без Tk).
+
+    ``area`` — рабочая область монитора ПОД КУРСОРом (x, y, w, h).
+    Кромки ОКНА сравниваются с краями области: верхняя кромка в полосе
+    ``edge`` у верха — разворачивание ('max'), левая/правая — половина
+    области ('left'/'right'). Углы дают половину по горизонтали (как
+    прилипание Windows 10), а не четверть. Симметричная полоса ±edge:
+    окно, вдвинутое дальше за край (переезд на соседний монитор),
+    прилипание отменяет.
+    """
+    ax, ay, aw, ah = area
+    if aw <= 0 or ah <= 0 or edge <= 0 or win_w <= 0:
+        return None
+    dx_left = win_x - ax
+    dx_right = (ax + aw) - (win_x + win_w)
+    dy_top = win_y - ay
+    near_left = abs(dx_left) <= edge
+    near_right = abs(dx_right) <= edge
+    near_top = abs(dy_top) <= edge
+    if near_top and not (near_left or near_right):
+        return "max"
+    if near_left:
+        return "left"
+    if near_right:
+        return "right"
+    return None
+
+
+def snap_rect(
+    zone: str, area: tuple[int, int, int, int],
+) -> Optional[tuple[int, int, int, int]]:
+    """Прямоугольник прилипания (x, y, w, h) для зоны (чистая функция)."""
+    ax, ay, aw, ah = area
+    if zone == "max":
+        return ax, ay, aw, ah
+    if zone == "left":
+        return ax, ay, aw // 2, ah
+    if zone == "right":
+        right_w = aw - aw // 2
+        return ax + aw - right_w, ay, right_w, ah
+    return None
+
+
+class SnapPreview(tk.Toplevel):
+    """Полупрозрачная подложка прилипания — предпросмотр Aero-стиля (2.20.0).
+
+    Пока переносимое окно держит зону прилипания, подложка показывает
+    прямоугольник, куда окно встанет при отпускании кнопки: верх — вся
+    рабочая область, лево/право — половина. Окно без рамки, поверх всех;
+    на средах без альфы (X11 без композитора) рисуется сплошным цветом.
+    """
+
+    def __init__(self, master: tk.Misc):
+        super().__init__(master)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.configure(bg=resolve(COLORS["accent"]))
+        try:
+            self.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            self.attributes("-alpha", 0.25)
+        except tk.TclError:
+            pass
+        self._rect: Optional[tuple[int, int, int, int]] = None
+
+    def show_rect(self, rect: tuple[int, int, int, int]) -> None:
+        if rect == self._rect:
+            return  # прямоугольник не изменился — не дёргаем перерисовку
+        self._rect = rect
+        x, y, w, h = rect
+        try:
+            self.geometry(f"{max(w, 1)}x{max(h, 1)}+{x}+{y}")
+            self.deiconify()
+            self.lift()
+        except tk.TclError:
+            self._rect = None
+
+    def hide(self) -> None:
+        self._rect = None
+        try:
+            self.withdraw()
+        except tk.TclError:
+            pass
+
+
+class PointerPoller:
+    """Опрос позиции курсора с постоянным темпом (2.20.0 — против дёрганости).
+
+    Tk на Windows доставляет <B1-Motion> рвано: при захвате указателя
+    события идут пачками и с внутренними паузами, поэтому окно двигается
+    «квадратами», отставая от курсора. Пулер каждые ~16 мс сам спрашивает
+    актуальную позицию (winfo_pointerx/winfo_pointery — прямой опрос ОС,
+    мимо очереди событий) и вызывает callback(x, y) — движение идёт
+    ровными шагами ~60 Гц независимо от доставки событий. <B1-Motion>
+    остаётся для мгновенной реакции: оба пути сходятся в один шаг переноса.
+    """
+
+    def __init__(
+        self, window: tk.Misc,
+        callback: Callable[[int, int], None], interval_ms: int = 16,
+    ):
+        self._window = window
+        self._callback = callback
+        self._interval = max(8, int(interval_ms))
+        self._after_id: Optional[str] = None
+        self._active = False
+
+    def start(self) -> None:
+        if self._active:
+            return
+        self._active = True
+        self._schedule()
+
+    def stop(self) -> None:
+        self._active = False
+        if self._after_id is not None:
+            try:
+                self._window.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _schedule(self) -> None:
+        after = getattr(self._window, "after", None)
+        if after is None:
+            # Duck-typed окно без after (unit-тесты): пулер не заводится,
+            # перенос продолжает работать от <B1-Motion>.
+            self._active = False
+            return
+        try:
+            self._after_id = after(self._interval, self._tick)
+        except Exception:
+            self._active = False
+
+    def _tick(self) -> None:
+        self._after_id = None
+        if not self._active:
+            return
+        try:
+            x = int(self._window.winfo_pointerx())
+            y = int(self._window.winfo_pointery())
+        except Exception:
+            self._active = False  # окно уничтожено посреди переноса
+            return
+        try:
+            self._callback(x, y)
+        except Exception:
+            self._active = False
+            return
+        self._schedule()
+
+
 class WindowDrag:
-    def __init__(self, window: tk.Misc, on_start: Optional[Callable[[], None]] = None):
+    """Перенос окна за шапку + прилипание к краям монитора.
+
+    Нативный модальный цикл (2.17.0 — синхронный SendMessageW из
+    обработчика нажатия, 2.19.1 — отложенный via after_idle) ронял
+    процесс на ряде машин с Windows 11 без traceback и с пустым
+    crash.log: вложенный message loop перекачивает сообщения окна через
+    Tk-обработчики, Tcl не рассчитан на такую ре-entrant обработку —
+    повреждение памяти завершается fast-fail, который не ловит даже
+    faulthandler. Поэтому (2.19.3+) перенос — ТОЛЬКО ручной, через
+    geometry(); плавность даёт PointerPoller, а Aero Snap эмулируется
+    вручную (2.20.0): зоны у краёв рабочей области + подложка SnapPreview
+    + применение при отпускании кнопки (snap_resolver/snap_apply).
+    """
+
+    def __init__(
+        self, window: tk.Misc, on_start: Optional[Callable[[], None]] = None,
+        snap_resolver: Optional[Callable[..., object]] = None,
+        snap_apply: Optional[Callable[..., None]] = None,
+        poll_interval_ms: int = 16,
+        preview_factory: Optional[Callable[[], object]] = None,
+    ):
         self._window = window
         self._on_start = on_start
         self._offset: Optional[tuple[int, int]] = None
+        self._start_geometry = ""
+        self._bounds: Optional[tuple[int, int, int, int]] = None
+        self._last_applied: Optional[tuple[int, int]] = None
+        self._snap_resolver = snap_resolver
+        self._snap_apply = snap_apply
+        self._zone: Optional[str] = None
+        self._zone_rect: Optional[tuple[int, int, int, int]] = None
+        self._preview: Optional[object] = None
+        self._preview_factory = preview_factory
+        self._poller = PointerPoller(window, self._on_poll, poll_interval_ms)
 
     def attach(self, *widgets: tk.Misc) -> None:
         for widget in widgets:
@@ -669,50 +862,128 @@ class WindowDrag:
     def _press(self, event) -> None:
         if self._on_start is not None:
             self._on_start(event)
-        # 2.19.3: ТОЛЬКО ручной перенос. Нативный модальный цикл
-        # (2.17.0 — синхронный SendMessageW из обработчика, 2.19.1 —
-        # отложенный via after_idle) на ряде машин с Windows 11 ронял
-        # процесс без traceback и с пустым crash.log: внутри цикла
-        # Windows перекачивает сообщения окна через Tk-обработчики,
-        # Tcl не рассчитан на такую ре-entrant обработку — повреждение
-        # памяти завершается fast-fail, который не ловит даже
-        # faulthandler. Ручной перенос через geometry() работал во всех
-        # версиях до 2.17.0 без единого вылета (app.log: смерти только
-        # в эпоху нативного переноса).
         try:
             # Геометрия могла измениться в on_start (восстановление из
-            # максимизации) — пересчитываем окно, чтобы оно не «убегало».
+            # максимизации/прилипания) — пересчитываем окно, чтобы оно
+            # не «убегало».
             self._window.update_idletasks()
             self._offset = (event.x_root - self._window.winfo_x(), event.y_root - self._window.winfo_y())
         except Exception:
             self._offset = None
+            return
+        try:
+            self._start_geometry = self._window.geometry() or ""
+        except Exception:
+            self._start_geometry = ""
+        self._last_applied = None
+        self._zone = None
+        self._zone_rect = None
+        # Границы виртуального экрана кэшируются на весь перенос:
+        # GetSystemMetrics не меняется посреди перетаскивания.
+        try:
+            self._bounds = virtual_screen_bounds()
+        except Exception:
+            self._bounds = None
+        self._poller.start()
 
     def _move(self, event) -> None:
+        # <B1-Motion>: мгновенный шаг; постоянный темп обеспечивает пулер.
         if self._offset is None:
             return
-        x = event.x_root - self._offset[0]
-        y = event.y_root - self._offset[1]
+        self._step(event.x_root, event.y_root)
+
+    def _on_poll(self, x: int, y: int) -> None:
+        if self._offset is None:
+            self._poller.stop()
+            return
+        self._step(x, y)
+
+    def _step(self, cursor_x: int, cursor_y: int) -> None:
+        if self._offset is None:
+            return
+        x = cursor_x - self._offset[0]
+        y = cursor_y - self._offset[1]
         # Зажим в виртуальный экран (объединение мониторов), 2.19.3:
         # окно уносится на ЛЮБОЙ монитор — левый и верхний тоже (в
         # 2.16.0 зажимы x ≥ −40, y ≥ 0 резали левые и верхние), но не
         # теряется за краями: остаётся полоса DRAG_EDGE_MARGIN, за
         # которую окно можно схватить, а шапка не прячется выше экранов.
-        try:
-            bounds_x, bounds_y, bounds_w, bounds_h = virtual_screen_bounds()
-            win_w = max(self._window.winfo_width(), 1)
+        if self._bounds is not None:
+            bounds_x, bounds_y, bounds_w, bounds_h = self._bounds
+            try:
+                win_w = max(self._window.winfo_width(), 1)
+            except Exception:
+                win_w = 1
             x = min(max(x, bounds_x - win_w + DRAG_EDGE_MARGIN),
                     bounds_x + bounds_w - DRAG_EDGE_MARGIN)
             y = min(max(y, bounds_y), bounds_y + bounds_h - DRAG_EDGE_MARGIN)
-        except Exception:
-            pass
+        # Один и тот же шаг от <B1-Motion> и от пулера: одинаковая позиция
+        # не требует ни geometry(), ни пересчёта зоны.
+        if self._last_applied == (x, y):
+            return
+        self._update_snap_zone(cursor_x, cursor_y, x, y)
         try:
             self._window.geometry(f"+{x}+{y}")
         except tk.TclError:
             # Окно уничтожено посреди перетаскивания — тихо завершаем путь.
-            self._offset = None
+            self._finish()
+            return
+        self._last_applied = (x, y)
+
+    def _update_snap_zone(self, cursor_x: int, cursor_y: int, win_x: int, win_y: int) -> None:
+        if self._snap_resolver is None:
+            return
+        try:
+            win_w = max(self._window.winfo_width(), 1)
+        except Exception:
+            return
+        try:
+            resolved = self._snap_resolver(cursor_x, cursor_y, win_x, win_y, win_w)
+        except Exception:
+            resolved = None
+        zone = rect = None
+        if resolved is not None:
+            zone, rect = resolved
+        if zone == self._zone and rect == self._zone_rect:
+            return
+        self._zone, self._zone_rect = zone, rect
+        if zone is None or rect is None:
+            if self._preview is not None:
+                self._preview.hide()
+            return
+        if self._preview is None:
+            self._preview = self._make_preview()
+        if self._preview is not None:
+            self._preview.show_rect(rect)
+
+    def _make_preview(self):
+        if self._preview_factory is not None:
+            try:
+                return self._preview_factory()
+            except Exception:
+                return None
+        try:
+            return SnapPreview(self._window)
+        except Exception:
+            return None
 
     def _release(self, _event) -> None:
+        zone, rect, start = self._zone, self._zone_rect, self._start_geometry
+        self._finish()
+        if zone is None or rect is None or self._snap_apply is None:
+            return
+        try:
+            self._snap_apply(zone, rect, start)
+        except Exception:
+            pass  # прилипание не критично: окно остаётся на месте
+
+    def _finish(self) -> None:
         self._offset = None
+        self._poller.stop()
+        self._zone = None
+        self._zone_rect = None
+        if self._preview is not None:
+            self._preview.hide()
 
 
 # --------------------------------------------------------------------------- #

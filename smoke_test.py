@@ -223,6 +223,24 @@ check(bool(win_shell.documents_known_folder()),
 win_shell.enable_dpi_awareness()
 check(True, "DPI: per-monitor awareness установлен без ошибок")
 
+# ---------- Прилипание окна к краям монитора (2.20.0) ----------
+_area = (0, 0, 1920, 1080)
+check(m.ui.snap_zone(510, 0, 900, _area, edge=16) == "max"
+      and m.ui.snap_zone(510, 300, 900, _area, edge=16) is None,
+      "snap: верхняя кромка окна у верха области — разворачивание, в центре — нет")
+check(m.ui.snap_zone(0, 300, 900, _area, edge=16) == "left"
+      and m.ui.snap_zone(1036, 300, 900, _area, edge=16) == "right",
+      "snap: левая/правая кромка — половина области")
+check(m.ui.snap_zone(0, 0, 900, _area, edge=16) == "left",
+      "snap: верхний угол — половина (Windows 10-стиль), не четверть")
+check(m.ui.snap_zone(-40, 300, 900, _area, edge=16) is None,
+      "snap: окно вдвинуто дальше полосы за край — зона снята (переезд на соседний монитор)")
+check(m.ui.snap_rect("left", _area) == (0, 0, 960, 1080)
+      and m.ui.snap_rect("right", _area) == (960, 0, 960, 1080),
+      "snap: прямоугольники половин делят рабочую область вплотную")
+check(win_shell.workarea_at(None, 100, 200) == win_shell.workarea(None),
+      "snap: рабочая область по точке (не-Windows) совпадает с экраном Tk")
+
 os.makedirs(storage.data_dir(), exist_ok=True)
 store = storage.DataStore()
 party_rec = store.add_counterparty("ooo", {
@@ -821,6 +839,42 @@ try:
           "панели предпросмотра: договор и доп. соглашение — есть (спецификация — есть)")
     check(hasattr(app, "status_label"), "строка статуса в футере")
     check(app.save_button.cget("text") == "Сохранить договор", "кнопка футера: договор")
+
+    # ---------- Прилипание окна (2.20.0): подключение и живой прогон ----------
+    check(app.drag._snap_resolver == app._snap_resolver
+          and app.drag._snap_apply == app._snap_apply,
+          "snap: перенос шапки подключён к зонам прилипания приложения")
+    check(app._snap_zone is None, "snap: состояние прилипания пустое при старте")
+    _snap_geo = app.root.geometry()
+    _snap_area = m.ui.workarea(app.root)
+    _snap_left = m.ui.snap_rect("left", _snap_area)
+    # Половина экрана может быть уже минимума окна: зажим в _min_width —
+    # часть контракта прилипания.
+    _snap_left_expect = (
+        f"{max(_snap_left[2], app._min_width)}x{max(_snap_left[3], app._min_height)}"
+        f"+{_snap_left[0]}+{_snap_left[1]}"
+    )
+    app._snap_apply("left", _snap_left, _snap_geo)
+    check(app._snap_zone == "left" and app._zoomed is False
+          and app.lights._zoomed is True,
+          "snap: левая половина применена, глиф кнопки — «восстановить»")
+    check(app.root.geometry() == _snap_left_expect,
+          "snap: окно встало в левую половину (не уже минимума окна)")
+    check(app._restore_geometry == _snap_geo,
+          "snap: прежняя геометрия запомнена для возврата")
+    app.toggle_zoom()  # возврат из прилипания — тот же путь, что из максимизации
+    check(app._snap_zone is None and app._zoomed is False
+          and app.lights._zoomed is False,
+          "snap: возврат из прилипания сбрасывает состояние")
+    check(app.root.geometry() == _snap_geo,
+          "snap: после возврата окно прежнего размера и позиции")
+    app._snap_apply("max", m.ui.snap_rect("max", _snap_area), _snap_geo)
+    check(app._zoomed is True and app._snap_zone is None,
+          "snap: зона «верх» разворачивает окно")
+    check(app.root.geometry() == f"{_snap_area[2]}x{_snap_area[3]}+{_snap_area[0]}+{_snap_area[1]}",
+          "snap: разворачивание — вся рабочая область монитора")
+    app.toggle_zoom()
+    check(app.root.geometry() == _snap_geo, "snap: возврат из разворачивания — прежняя геометрия")
 
     # Регрессия: переключатель «Юр. лицо / ИП» должен обновлять _cp_type_var.
     # Раньше переменная не была привязана к сегменту (variable=), тип оставался

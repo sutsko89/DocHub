@@ -124,6 +124,8 @@ class _MONITORINFO(ctypes.Structure):
         ("rcWork", _RECT),
         ("dwFlags", ctypes.c_ulong),
     ]
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 def workarea(window: tk.Misc | None = None) -> tuple[int, int, int, int]:
     """Рабочая область (без панели задач): x, y, ширина, высота.
 
@@ -158,6 +160,34 @@ def workarea(window: tk.Misc | None = None) -> tuple[int, int, int, int]:
         except Exception:
             pass
     return 0, 0, 1920, 1080
+def workarea_at(root: tk.Misc | None, x: int, y: int) -> tuple[int, int, int, int]:
+    """Рабочая область монитора, на котором лежит точка (x, y) (2.20.0).
+
+    Прилипание к краям (2.20.0) ориентируется на монитор ПОД КУРСОРом:
+    пользователь тянет окно к краю конкретного монитора (в том числе
+    второго), а не к краю того, где окно «в среднем». Сбой Win32 и
+    не-Windows — единая рабочая область из ``workarea(root)`` (экран Tk),
+    крайний fallback 1920×1080.
+    """
+    if sys.platform == "win32":
+        try:
+            user32 = ctypes.windll.user32
+            # MonitorFromPoint принимает POINT по значению — argtypes
+            # обязательны, restype — 64-битный хендл (как в _main_hwnd).
+            user32.MonitorFromPoint.argtypes = [_POINT, ctypes.c_ulong]
+            user32.MonitorFromPoint.restype = ctypes.c_void_p
+            hmon = user32.MonitorFromPoint(
+                _POINT(int(x), int(y)), 2  # MONITOR_DEFAULTTONEAREST
+            )
+            if hmon:
+                info = _MONITORINFO()
+                info.cbSize = ctypes.sizeof(info)
+                if user32.GetMonitorInfoW(ctypes.c_void_p(hmon), ctypes.byref(info)):
+                    rc = info.rcWork
+                    return rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top
+        except Exception:
+            pass
+    return workarea(root)
 def minimize_window(window: tk.Misc) -> None:
     if sys.platform == "win32":
         try:
@@ -173,27 +203,41 @@ def maximize_window(window: tk.Misc) -> None:
     """Разворачивает окно ровно на рабочую область: панель задач остаётся видимой.
 
     Для безрамочного окна (overrideredirect) системная максимизация
-    SW_MAXIMIZE накрывает панель задач, поэтому задаём геометрию сами.
+    SW_MAXIMIZE накрывает панель задач, поэтому задаём геометрию сами —
+    на ВСЕХ платформах (2.20.0): прежняя ветка state('zoomed') на
+    не-Windows бездействовала для overrideredirect-окна и не давала
+    тестам проверять разворачивание. Не удалось посчитать рабочую
+    область — системный аналог.
     """
-    if sys.platform == "win32":
-        try:
-            x, y, width, height = workarea(window)
+    try:
+        x, y, width, height = workarea(window)
+        if width > 0 and height > 0:
             window.geometry(f"{width}x{height}+{x}+{y}")
             return
-        except Exception:
-            pass
+    except Exception:
+        pass
     try:
         window.state("zoomed")
     except Exception:
         pass
 def restore_window(window: tk.Misc, geometry: str = "") -> None:
-    """Возврат из максимизации: применяет прежнюю геометрию, если она задана."""
+    """Возврат из максимизации: применяет прежнюю геометрию, если она задана.
+
+    Явная геометрия применяется на ВСЕХ платформах (2.20.0): раньше
+    не-Windows-ветка её игнорировала (только state('normal')) — возврат
+    из разворота/прилипания не возвращал размер окна, что вскрыли
+    smoke-проверки прилипания. Без геометрии — системный аналог
+    (SW_RESTORE на Windows, state('normal') на не-Windows).
+    """
+    if geometry:
+        try:
+            window.geometry(geometry)
+            return
+        except Exception:
+            pass
     if sys.platform == "win32":
         try:
-            if geometry:
-                window.geometry(geometry)
-            else:
-                ctypes.windll.user32.ShowWindow(_main_hwnd(window), 9)  # SW_RESTORE
+            ctypes.windll.user32.ShowWindow(_main_hwnd(window), 9)  # SW_RESTORE
             return
         except Exception:
             pass

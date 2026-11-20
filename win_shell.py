@@ -17,31 +17,15 @@ import tkinter as tk
 WM_DROPFILES = 0x0233
 WM_DPICHANGED = 0x02E0
 
-# Нативное перетаскивание/растягивание безрамочного окна (2.17.0):
-# Windows сама ведёт модальный цикл переноса после синтетического
-# WM_NCLBUTTONDOWN с HT-кодом «куда попали мышью». В этом цикле работают
-# перенос на второй монитор (со сменой DPI) и Aero Snap — то, что
-# недоступно ручному переносу через geometry().
-WM_NCLBUTTONDOWN = 0x00A1
-HTCAPTION = 0x2
-#: HT-коды кромок для нативного растягивания (WM_NCLBUTTONDOWN).
-HT_RESIZE_EDGES = {
-    "w": 10,   # HTLEFT
-    "e": 11,   # HTRIGHT
-    "n": 12,   # HTTOP
-    "nw": 13,  # HTTOPLEFT
-    "ne": 14,  # HTTOPRIGHT
-    "s": 15,   # HTBOTTOM
-    "sw": 16,  # HTBOTTOMLEFT
-    "se": 17,  # HTBOTTOMRIGHT
-}
-#: VK-код левой кнопки мыши (GetAsyncKeyState) — страж отложенного старта.
-VK_LBUTTON = 0x01
-#: Ручной глушитель нативного переноса/растягивания (2.19.1): при
-#: EWDOCHUB_NO_NATIVE_DRAG=1 окно перетаскивается и растягивается
-#: ручным Tk-путём (без Snap/второго монитора). Служит для диагностики
-#: проблем с оконным циклом на конкретных машинах.
-NO_NATIVE_DRAG_ENV = "EWDOCHUB_NO_NATIVE_DRAG"
+#: Поля отступа при зажиме позиции окна внутри виртуального экрана:
+#: у края экрана остаётся видимая полоса окна, за которую его можно схватить.
+DRAG_EDGE_MARGIN = 48
+#: Системные индексы GetSystemMetrics для виртуального экрана (объединение
+#: всех мониторов): x, y, ширина, высота.
+_SM_XVIRTUALSCREEN = 76
+_SM_YVIRTUALSCREEN = 77
+_SM_CXVIRTUALSCREEN = 78
+_SM_CYVIRTUALSCREEN = 79
 _SWP_FRAMECHANGED_FLAGS = 0x1 | 0x2 | 0x4 | 0x20  # NOMOVE|NOSIZE|NOZORDER|FRAMECHANGED
 
 
@@ -219,146 +203,40 @@ def restore_window(window: tk.Misc, geometry: str = "") -> None:
         pass
 
 
-def _native_drag_disabled() -> bool:
-    """Ручной глушитель нативного переноса (EWDOCHUB_NO_NATIVE_DRAG=1)."""
-    return os.environ.get(NO_NATIVE_DRAG_ENV) == "1"
+def _get_system_metrics(index: int) -> int:
+    """Точка подмены в тестах: sysmetrics без ctypes-магии в тесте."""
+    return int(ctypes.windll.user32.GetSystemMetrics(index))
 
 
-def left_button_pressed() -> bool:
-    """Левая кнопка мыши нажата прямо сейчас (Win32 GetAsyncKeyState).
+def virtual_screen_bounds() -> tuple[int, int, int, int]:
+    """Границы виртуального экрана (объединение всех мониторов): x, y, w, h.
 
-    Не-Windows и сбой запроса — True: вызывающий ведёт себя как прежде.
+    Ручной перенос (2.19.3 — единственный путь, нативный модальный цикл
+    убран как причина вылетов) зажимает позицию окна в эти границы:
+    окно можно унести на ЛЮБОЙ монитор — левый, правый, верхний, нижний
+    (см. 2.17.0: прежние зажимы x ≥ −40, y ≥ 0 резали левый/верхний),
+    но окно не теряется за пределами экранов — у края остаётся полоса
+    DRAG_EDGE_MARGIN, за которую окно можно схватить.
+
+    Не-Windows и сбой Win32: размеры экрана Tk, крайний fallback 1920×1080.
     """
-    if sys.platform != "win32":
-        return True
+    if sys.platform == "win32":
+        try:
+            x = _get_system_metrics(_SM_XVIRTUALSCREEN)
+            y = _get_system_metrics(_SM_YVIRTUALSCREEN)
+            width = _get_system_metrics(_SM_CXVIRTUALSCREEN)
+            height = _get_system_metrics(_SM_CYVIRTUALSCREEN)
+            if width > 0 and height > 0:
+                return x, y, width, height
+        except Exception:
+            pass
     try:
-        return bool(ctypes.windll.user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
-    except Exception:
-        return True
-
-
-def _begin_native_ht(window: tk.Misc, ht_code: int) -> bool:
-    """Запускает нативный модальный цикл Windows с HT-кодом точки.
-
-    ReleaseCapture сбрасывает захват мыши Tk, после чего синтетический
-    WM_NCLBUTTONDOWN передаёт Windows управление переносом/растягиванием:
-    окно можно унести на второй монитор (со сменой DPI) и прилипнуть
-    к краям (Aero Snap). Блокирует до отпускания кнопки мыши.
-    False — не-Windows, глушитель env или сбой (вызывающий использует
-    ручной fallback).
-
-    ВНИМАНИЕ (2.19.1): вызывать НЕ изнутри Tk-обработчика нажатия мыши.
-    Этот вызов блокирует до отпускания кнопки и внутри себя раскручивает
-    вложенный message loop — из обработчика ButtonPress запускать через
-    begin_native_*_deferred, из «пустого» стека.
-    """
-    if sys.platform != "win32" or _native_drag_disabled():
-        return False
-    try:
-        hwnd = _main_hwnd(window)
-        user32 = ctypes.windll.user32
-        user32.ReleaseCapture()
-        user32.SendMessageW.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_longlong,
-        ]
-        user32.SendMessageW.restype = ctypes.c_longlong
-        user32.SendMessageW(
-            ctypes.c_void_p(hwnd), WM_NCLBUTTONDOWN, ht_code, 0,
-        )
-        return True
-    except Exception:
-        return False
-
-
-def begin_native_move(window: tk.Misc) -> bool:
-    """Нативное перетаскивание окна за шапку (2.17.0).
-
-    Вызывать из обработчика нажатия мыши на шапке. True — Windows взяла
-    перенос на себя (второй монитор, Snap, смена DPI); False — не-Windows
-    или сбой, нужен ручной перенос через geometry().
-    """
-    return _begin_native_ht(window, HTCAPTION)
-
-
-def begin_native_resize(window: tk.Misc, edge: str) -> bool:
-    """Нативное растягивание за кромку ``edge`` (2.17.0).
-
-    ``edge`` — одна из 8 сторон: 'n', 's', 'w', 'e', 'nw', 'ne', 'sw',
-    'se'. True — Windows ведёт цикл растягивания сама (плавно, с учётом
-    монитора под курсором и minsize); False — ручной fallback.
-
-    Синхронный вариант: только из «пустого» стека Tk. Из обработчика
-    ButtonPress использовать begin_native_resize_deferred (2.19.1).
-    """
-    ht_code = HT_RESIZE_EDGES.get(str(edge).lower())
-    if not ht_code:
-        return False
-    return _begin_native_ht(window, ht_code)
-
-
-# ----------------------------------------------------------------------- #
-#  Отложенный нативный перенос/растягивание (2.19.1)
-# ----------------------------------------------------------------------- #
-def _schedule_native_ht(window: tk.Misc, ht_code: int) -> bool:
-    """Откладывает нативный модальный цикл до выхода из Tk-обработчика.
-
-    Фикс «программа вылетает при перетаскивании» (2.19.1).
-    SendMessageW(WM_NCLBUTTONDOWN) блокирует до отпускания кнопки мыши:
-    внутри него Windows раскручивает вложенный message loop и перекачивает
-    сообщения окна (WM_MOUSEMOVE, WM_PAINT, WM_DPICHANGED, ...) прямо
-    через Tk-обработчики поверх незавершённого колбэка ButtonPress.
-    Такая ре-entrant обработка событий Tcl из вложенного насоса
-    заканчивается падением процесса без traceback. after_idle откладывает
-    старт цикла: стек Tk полностью раскручивается, и модальный цикл
-    начинается при пустом стеке — как в окне с системной рамкой.
-
-    False — не-Windows, глушитель env или сбой планирования: вызывающий
-    использует ручной fallback.
-    """
-    if sys.platform != "win32" or _native_drag_disabled():
-        return False
-    try:
-        window.after_idle(lambda: _run_native_ht(window, ht_code))
-        return True
-    except Exception:
-        return False
-
-
-def _run_native_ht(window: tk.Misc, ht_code: int) -> None:
-    """Стартует отложенный модальный цикл (выполняется из after_idle)."""
-    try:
-        if not window.winfo_exists():
-            return
-        if not left_button_pressed():
-            # Кнопка уже отпущена — это был клик, а не перенос/растягивание.
-            return
-        _begin_native_ht(window, ht_code)
+        source = getattr(tk, "_default_root", None)
+        if source is not None:
+            return 0, 0, source.winfo_screenwidth(), source.winfo_screenheight()
     except Exception:
         pass
-
-
-def begin_native_move_deferred(window: tk.Misc) -> bool:
-    """Нативное перетаскивание за шапку, отложенное до выхода из колбэка.
-
-    Фикс вылета при перетаскивании (2.19.1). Вызывать из обработчика
-    ButtonPress шапки: True — перенос начнётся после after_idle, когда
-    стек Tk пуст (второй монитор, Snap, смена DPI остаются доступны);
-    False — не-Windows, EWDOCHUB_NO_NATIVE_DRAG=1 или сбой планирования,
-    вызывающий использует ручной перенос через geometry().
-    """
-    return _schedule_native_ht(window, HTCAPTION)
-
-
-def begin_native_resize_deferred(window: tk.Misc, edge: str) -> bool:
-    """Нативное растягивание за кромку, отложенное до выхода из колбэка.
-
-    Аналог begin_native_move_deferred для кромок: True — цикл
-    растягивания стартует из after_idle; False — ручной fallback.
-    """
-    ht_code = HT_RESIZE_EDGES.get(str(edge).lower())
-    if not ht_code:
-        return False
-    return _schedule_native_ht(window, ht_code)
+    return 0, 0, 1920, 1080
 
 
 # ----------------------------------------------------------------------- #

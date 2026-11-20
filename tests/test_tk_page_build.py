@@ -286,24 +286,14 @@ def test_store_uses_isolated_profile(app):
 
 
 # --------------------------------------------------------------------------- #
-#  Перетаскивание и растягивание окна (2.19.1): обработчики нажатия не
-#  выполняют блокирующей работы — модальный Win32-цикл уходит в after_idle.
+#  Перетаскивание и растягивание окна (2.19.3): только ручной путь —
+#  нативный модальный цикл удалён как причина вылетов без traceback.
 # --------------------------------------------------------------------------- #
-def test_titlebar_drag_moves_window_manually(app, monkeypatch):
-    """Ручной путь (fallback): нажатие + движение по шапке переносит окно.
-
-    Нативный вариант глушится явно: на Windows настоящий
-    begin_native_move_deferred планирует after_idle и ручной старт
-    не выполняется (это контракт test_resize_press_uses_deferred_*),
-    а здесь проверяется именно fallback-перенос.
-    """
+def test_titlebar_drag_moves_window_manually(app):
+    """Нажатие + движение по шапке переносит окно (ручной путь — единственный)."""
     from types import SimpleNamespace
 
-    monkeypatch.setattr(main.ui, "begin_native_move_deferred", lambda w: False)
     window = app.root
-    # Детерминированный старт в границах экрана: на CI-раннере окно может
-    # стоять у левого края (x0 = -128), а зажим в _move — max(x, -40) —
-    # тогда меняет арифметику переноса. Ожидание всё равно зажим-учётное.
     window.geometry("+120+80")
     window.update()
     x0, y0 = window.winfo_x(), window.winfo_y()
@@ -311,35 +301,19 @@ def test_titlebar_drag_moves_window_manually(app, monkeypatch):
         app.drag._press(SimpleNamespace(x_root=x0 + 10, y_root=y0 + 5))
         app.drag._move(SimpleNamespace(x_root=x0 + 60, y_root=y0 + 45))
         window.update()
-        expected = (max(x0 + 50, -40), max(y0 + 40, 0))
-        assert (window.winfo_x(), window.winfo_y()) == expected
+        assert (window.winfo_x(), window.winfo_y()) == (x0 + 50, y0 + 40)
     finally:
         app.drag._release(SimpleNamespace(x_root=0, y_root=0))
         window.geometry(f"+{x0}+{y0}")
         window.update()
 
 
-def test_resize_press_uses_deferred_native_path(app, monkeypatch):
-    """Windows: растягивание планируется в after_idle без ручного старта."""
+def test_resize_press_arms_manual_start(app):
+    """Нажатие кромки запоминает стартовую геометрию для ручного растягивания."""
     from types import SimpleNamespace
 
-    calls = []
-    monkeypatch.setattr(
-        main.ui, "begin_native_resize_deferred",
-        lambda w, edge: calls.append(edge) or True,
-    )
-    app._resize_press(SimpleNamespace(x_root=0, y_root=0), "se")
-    assert calls == ["se"]
-    assert app._resize_origin is None and app._resize_start is None, \
-        "нативный путь: ручной старт растягивания не выполняется"
-
-
-def test_resize_press_falls_back_manually_without_native(app, monkeypatch):
-    from types import SimpleNamespace
-
-    monkeypatch.setattr(main.ui, "begin_native_resize_deferred", lambda w, e: False)
     app._resize_press(SimpleNamespace(x_root=10, y_root=10), "se")
-    assert app._resize_origin is not None, "ручной путь запоминает стартовую геометрию"
+    assert app._resize_origin is not None, "стартовая геометрия запомнена"
     assert app._resize_start == (10, 10)
     app._resize_origin = None
     app._resize_start = None

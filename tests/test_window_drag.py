@@ -1,16 +1,18 @@
-"""WindowDrag — диспетчеризация перетаскивания окна (фикс вылета 2.19.1).
+"""WindowDrag — ручное перетаскивание окна за шапку (2.19.3).
 
-Причина падения процесса на Windows (релиз 2.19.0): обработчик нажатия
-шапки запускал SendMessageW(WM_NCLBUTTONDOWN, HTCAPTION) синхронно —
-вызов блокирует до отпускания кнопки и раскручивает вложенный message
-loop поверх незавершённого Tk-колбэка; события Tcl обрабатываются
-ре-entrantly и процесс умирает без traceback. Фикс: отложенный старт
-(begin_native_move_deferred → after_idle), ручной путь остаётся запасным.
+Нативный модальный цикл Windows (2.17.0 — синхронный SendMessageW из
+обработчика нажатия, 2.19.1 — отложенный via after_idle) ронял процесс
+на ряде машин с Windows 11 без traceback и с пустым crash.log: вложенный
+message loop перекачивает сообщения окна через Tk-обработчики, Tcl не
+рассчитан на такую ре-entrant обработку — повреждение памяти завершается
+fast-fail, который не ловит даже faulthandler. В 2.19.3 нативный путь
+удалён полностью: перенос — только через geometry() (работал без вылетов
+во всех версиях до 2.17.0), позиции зажимаются в виртуальный экран
+(объединение мониторов — перенос на второй монитор сохранён, Snap — нет).
 
 Тесты headless: duck-typed окно вместо Tk. Проверяются контракты
-WindowDrag: нажатие не выполняет блокирующей работы в колбэке, ручной
-fallback считает геометрию и зажимает позиции, привязки добавляются
-к существующим (add="+").
+WindowDrag: нажатие вооружает offset, движение двигает окно в границах
+виртуального экрана, привязки добавляются к существующим (add="+").
 """
 from __future__ import annotations
 
@@ -22,9 +24,10 @@ import ui_macos as ui
 class FakeDragWindow:
     """Duck-typed аналог Tk-окна: запоминает вызовы, двигает позицию."""
 
-    def __init__(self):
+    def __init__(self, width=900, height=600):
         self.calls: list[tuple] = []
         self._x, self._y = 100, 80
+        self._width, self._height = width, height
 
     def update_idletasks(self):
         self.calls.append(("update_idletasks",))
@@ -34,6 +37,9 @@ class FakeDragWindow:
 
     def winfo_y(self):
         return self._y
+
+    def winfo_width(self):
+        return self._width
 
     def winfo_exists(self):
         return True
@@ -69,50 +75,24 @@ def test_attach_binds_press_motion_release():
 
 
 # --------------------------------------------------------------------------- #
-#  Windows-путь: блокирующий вызов не живёт в колбэке нажатия
+#  Ручной перенос: нажатие → движение → отпускание
 # --------------------------------------------------------------------------- #
-def test_press_with_native_path_defers_and_returns_fast(monkeypatch):
+def test_press_arms_offset_without_blocking_calls():
+    """Нажатие считает offset и не делает ничего блокирующего."""
     window = FakeDragWindow()
     drag = ui.WindowDrag(window)
-    monkeypatch.setattr(ui, "begin_native_move_deferred", lambda w: True)
-    drag._press(event(150, 120))
-    # Нативный путь: offset сброшен, никакой ручной геометрии в колбэке.
-    assert drag._offset is None
-    assert not any(kind == "geometry" for kind, _ in window.calls)
-    assert not any(kind == "update_idletasks" for kind, _ in window.calls)
-
-
-def test_press_falls_back_manually_when_native_unavailable(monkeypatch):
-    window = FakeDragWindow()
-    drag = ui.WindowDrag(window)
-    monkeypatch.setattr(ui, "begin_native_move_deferred", lambda w: False)
     drag._press(event(150, 120))
     # offset = (x_root - winfo_x, y_root - winfo_y) = (50, 40)
     assert drag._offset == (50, 40)
+    assert any(call[0] == "update_idletasks" for call in window.calls), \
+        "геометрия пересчитывается на нажатии (on_start мог её сменить)"
+    assert not any(call[0] == "geometry" for call in window.calls), \
+        "в колбэке нажатия нет переноса окна"
 
 
-def test_press_survives_native_dispatch_failure(monkeypatch):
+def test_manual_drag_moves_window():
     window = FakeDragWindow()
     drag = ui.WindowDrag(window)
-
-    def boom(window_arg):
-        raise RuntimeError("сбой планирования")
-
-    monkeypatch.setattr(ui, "begin_native_move_deferred", boom)
-    drag._press(event(150, 120))
-    assert drag._offset == (50, 40), "сбой нативной диспетчеризации → ручной путь"
-
-
-# --------------------------------------------------------------------------- #
-#  Ручной fallback: перенос окна по событиям
-# --------------------------------------------------------------------------- #
-def test_manual_drag_moves_window(monkeypatch):
-    # Ручной путь закрепляем явно: на Windows настоящий
-    # begin_native_move_deferred уходит в after_idle (нативный цикл) —
-    # тест же проверяет именно fallback.
-    window = FakeDragWindow()
-    drag = ui.WindowDrag(window)
-    monkeypatch.setattr(ui, "begin_native_move_deferred", lambda w: False)
     drag._press(event(150, 120))
     drag._move(event(160, 140))
     assert ("geometry", "+110+100") in window.calls
@@ -132,18 +112,64 @@ def test_move_is_noop_before_press_and_after_release():
     ), "после отпускания кнопки окно не двигается"
 
 
-def test_manual_drag_clamps_positions(monkeypatch):
-    window = FakeDragWindow()
-    drag = ui.WindowDrag(window)
-    monkeypatch.setattr(ui, "begin_native_move_deferred", lambda w: False)
-    drag._press(event(150, 120))  # offset (50, 40)
-    drag._move(event(20, 5))      # x = -30, y = -35 → зажим (-30, 0)
-    assert ("geometry", "+-30+0") in window.calls
-
-
 def test_on_start_receives_press_event():
     window = FakeDragWindow()
     started = []
     drag = ui.WindowDrag(window, on_start=lambda ev: started.append(ev))
     drag._press(event(150, 120))
     assert len(started) == 1 and started[0].x_root == 150
+
+
+# --------------------------------------------------------------------------- #
+#  Зажим в виртуальный экран (2.19.3)
+# --------------------------------------------------------------------------- #
+def test_move_clamps_to_virtual_screen(monkeypatch):
+    """Окно не теряется за краями: остаётся полоса DRAG_EDGE_MARGIN."""
+    window = FakeDragWindow(width=900)
+    drag = ui.WindowDrag(window)
+    # Виртуальный экран: два монитора 1920×1080, второй слева.
+    monkeypatch.setattr(
+        ui, "virtual_screen_bounds", lambda: (-1920, 0, 3840, 1080))
+    drag._press(event(150, 120))  # offset (50, 40)
+    drag._move(event(0, 5))       # x = -50, y = -35
+    # x: зажим в [-1920 - 900 + 48, -1920 + 3840 - 48] → -50 внутри
+    # y: зажим в [0, 1080 - 48] → 0
+    assert ("geometry", "+-50+0") in window.calls
+
+
+def test_move_keeps_window_grabbable_at_left_edge(monkeypatch):
+    """Далеко за левым краем окно не улетает — margin остаётся видимым."""
+    window = FakeDragWindow(width=900)
+    drag = ui.WindowDrag(window)
+    monkeypatch.setattr(
+        ui, "virtual_screen_bounds", lambda: (-1920, 0, 3840, 1080))
+    drag._press(event(150, 120))          # offset (50, 40)
+    drag._move(event(-3300, 500))         # x = -3350, y = 460
+    # нижняя граница x: bounds_x - win_w + margin = -1920 - 900 + 48 = -2772
+    assert ("geometry", "+-2772+460") in window.calls
+
+
+def test_move_keeps_titlebar_below_top_of_virtual_screen(monkeypatch):
+    """Шапка не прячется выше верхнего монитора: y ≥ bounds_y."""
+    window = FakeDragWindow()
+    drag = ui.WindowDrag(window)
+    monkeypatch.setattr(
+        ui, "virtual_screen_bounds", lambda: (0, -200, 1920, 1280))
+    drag._press(event(150, 120))  # offset (50, 40)
+    drag._move(event(160, -500))  # y = -540
+    assert ("geometry", "+110+-200") in window.calls
+
+
+def test_move_survives_bounds_failure(monkeypatch):
+    """Сбой расчёта границ не прерывает перенос (позиция без зажима)."""
+    window = FakeDragWindow()
+    drag = ui.WindowDrag(window)
+
+    def boom():
+        raise OSError("win32 сбой")
+
+    monkeypatch.setattr(ui, "virtual_screen_bounds", boom)
+    drag._press(event(150, 120))
+    drag._move(event(160, 140))
+    assert ("geometry", "+110+100") in window.calls, \
+        "перенос работает и без зажима"

@@ -86,7 +86,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.19.2"
+APP_VERSION = "2.19.3"
 
 # Уведомление о сроках доп. соглашений (2.18.0): раз в сутки, ключ
 # settings.json — как у автопроверки обновлений (updater.SETTINGS_KEY_TS).
@@ -813,18 +813,9 @@ class ContractApp:
             self.lights.set_zoomed(False)
             ui.restore_window(self.root)
         self.root.update_idletasks()
-        # Нативное растягивание (2.17.0), фикс 2.19.1: цикл больше не
-        # стартует изнутри Tk-обработчика (см. WindowDrag._press) —
-        # begin_native_resize_deferred откладывает его до after_idle,
-        # когда стек Tk пуст. Ручной путь ниже остаётся для не-Windows
-        # и как страховка при сбое Win32-вызова.
-        try:
-            if ui.begin_native_resize_deferred(self.root, edge):
-                self._resize_origin = None
-                self._resize_start = None
-                return
-        except Exception:
-            pass
+        # 2.19.3: только ручное растягивание. Нативный модальный цикл
+        # (2.17.0/2.19.1) удалён как причина вылетов без traceback —
+        # см. WindowDrag._press. Ручной путь ниже — единственный.
         self._resize_origin = (
             self.root.winfo_x(), self.root.winfo_y(),
             self.root.winfo_width(), self.root.winfo_height(),

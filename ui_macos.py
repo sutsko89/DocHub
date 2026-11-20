@@ -24,11 +24,13 @@ FAMILY_DISPLAY = "Segoe UI"
 SCALE = 1.0
 # Win32-обвязка вынесена в win_shell.py (п. 9.3); имена реэкспортируются,
 # чтобы main.py и внутренние виджеты продолжали вызывать ui.make_borderless и т. п.
+# Нативный модальный цикл переноса/растягивания (2.17.0/2.19.1) удалён в
+# 2.19.3: на ряде машин он ронял процесс без traceback (пустой crash.log),
+# перетаскивание и растягивание снова только ручные, через geometry().
 from win_shell import (
-    _RECT, _MONITORINFO, _main_hwnd, begin_native_move,
-    begin_native_move_deferred, begin_native_resize, begin_native_resize_deferred,
-    enable_rounded_corners, focus_window, make_borderless, maximize_window,
-    minimize_window, refresh_taskbar, restore_window, workarea,
+    DRAG_EDGE_MARGIN, virtual_screen_bounds, enable_rounded_corners,
+    focus_window, make_borderless, maximize_window, minimize_window,
+    refresh_taskbar, restore_window, workarea,
 )
 
 
@@ -667,22 +669,16 @@ class WindowDrag:
     def _press(self, event) -> None:
         if self._on_start is not None:
             self._on_start(event)
-        # Нативное перетаскивание (2.17.0), фикc 2.19.1: цикл переноса
-        # больше НЕ стартует изнутри Tk-обработчика нажатия. SendMessageW
-        # блокирует до отпускания кнопки и раскручивает вложенный message
-        # loop поверх незавершённого колбэка ButtonPress — ре-entrant
-        # обработка событий Tcl из вложенного насоса роняла процесс без
-        # traceback. begin_native_move_deferred откладывает старт до
-        # after_idle: стек Tk раскручивается, и Windows ведёт перенос из
-        # пустого стека — окно уносится на второй монитор (со сменом DPI)
-        # и работает Aero Snap. Ручной путь ниже остаётся для не-Windows
-        # и как страховка при сбое Win32-вызова.
-        self._offset = None
-        try:
-            if begin_native_move_deferred(self._window):
-                return
-        except Exception:
-            pass
+        # 2.19.3: ТОЛЬКО ручной перенос. Нативный модальный цикл
+        # (2.17.0 — синхронный SendMessageW из обработчика, 2.19.1 —
+        # отложенный via after_idle) на ряде машин с Windows 11 ронял
+        # процесс без traceback и с пустым crash.log: внутри цикла
+        # Windows перекачивает сообщения окна через Tk-обработчики,
+        # Tcl не рассчитан на такую ре-entrant обработку — повреждение
+        # памяти завершается fast-fail, который не ловит даже
+        # faulthandler. Ручной перенос через geometry() работал во всех
+        # версиях до 2.17.0 без единого вылета (app.log: смерти только
+        # в эпоху нативного переноса).
         try:
             # Геометрия могла измениться в on_start (восстановление из
             # максимизации) — пересчитываем окно, чтобы оно не «убегало».
@@ -696,8 +692,21 @@ class WindowDrag:
             return
         x = event.x_root - self._offset[0]
         y = event.y_root - self._offset[1]
+        # Зажим в виртуальный экран (объединение мониторов), 2.19.3:
+        # окно уносится на ЛЮБОЙ монитор — левый и верхний тоже (в
+        # 2.16.0 зажимы x ≥ −40, y ≥ 0 резали левые и верхние), но не
+        # теряется за краями: остаётся полоса DRAG_EDGE_MARGIN, за
+        # которую окно можно схватить, а шапка не прячется выше экранов.
         try:
-            self._window.geometry(f"+{max(x, -40)}+{max(y, 0)}")
+            bounds_x, bounds_y, bounds_w, bounds_h = virtual_screen_bounds()
+            win_w = max(self._window.winfo_width(), 1)
+            x = min(max(x, bounds_x - win_w + DRAG_EDGE_MARGIN),
+                    bounds_x + bounds_w - DRAG_EDGE_MARGIN)
+            y = min(max(y, bounds_y), bounds_y + bounds_h - DRAG_EDGE_MARGIN)
+        except Exception:
+            pass
+        try:
+            self._window.geometry(f"+{x}+{y}")
         except tk.TclError:
             # Окно уничтожено посреди перетаскивания — тихо завершаем путь.
             self._offset = None

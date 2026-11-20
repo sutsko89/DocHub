@@ -23,10 +23,12 @@ from logging.handlers import RotatingFileHandler
 SETTINGS_DIR_NAME = "DogovorGenerator"
 LOGGER_NAME = "ewdochub"
 LOG_FILE_NAME = "app.log"
+CRASH_FILE_NAME = "crash.log"
 MAX_BYTES = 2 * 1024 * 1024   # 2 МБ на файл
 BACKUP_COUNT = 3              # app.log + 3 архивных копии
 
 _configured = False
+_crash_stream = None
 
 
 def log_dir() -> str:
@@ -37,6 +39,34 @@ def log_dir() -> str:
 
 def log_path() -> str:
     return os.path.join(log_dir(), LOG_FILE_NAME)
+
+
+def enable_crash_dump() -> str:
+    """Включает faulthandler в crash.log рядом с app.log (2.19.1).
+
+    Хард-падения (access violation в Tcl/Tk, например в оконном цикле
+    при перетаскивании) не доходят до Python-обработчиков: процесс
+    умирает без traceback и приложение просто «вылетает». faulthandler
+    при фатальном сигнале пишет C-стек и цепочку вызовов Python в файл —
+    по нему видна точка падения. Любой сбой включения не мешает работе.
+
+    Возвращает путь к файлу дампа или пустую строку, если включить не
+    удалось. Повторный вызов безопасен (без эффекта).
+    """
+    global _crash_stream
+    if _crash_stream is not None:
+        return _crash_stream.name
+    try:
+        import faulthandler
+
+        os.makedirs(log_dir(), exist_ok=True)
+        path = os.path.join(log_dir(), CRASH_FILE_NAME)
+        _crash_stream = open(path, "a", encoding="utf-8")  # noqa: SIM115 — держим открытым весь сеанс
+        faulthandler.enable(_crash_stream)
+        return path
+    except Exception:
+        _crash_stream = None
+        return ""
 
 
 def setup_logging(version: str = "", level: int = logging.INFO) -> logging.Logger:

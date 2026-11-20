@@ -275,3 +275,51 @@ def test_store_uses_isolated_profile(app):
     assert os.environ["APPDATA"] in st.db_path(), \
         "реестр живёт во временном профиле, а не в данных разработчика"
     assert app.store.active_documents() == [], "чистый реестр на старте"
+
+
+# --------------------------------------------------------------------------- #
+#  Перетаскивание и растягивание окна (2.19.1): обработчики нажатия не
+#  выполняют блокирующей работы — модальный Win32-цикл уходит в after_idle.
+# --------------------------------------------------------------------------- #
+def test_titlebar_drag_moves_window_manually(app):
+    """Ручной путь (не-Windows): нажатие + движение по шапке переносит окно."""
+    from types import SimpleNamespace
+
+    window = app.root
+    window.update_idletasks()
+    x0, y0 = window.winfo_x(), window.winfo_y()
+    try:
+        app.drag._press(SimpleNamespace(x_root=x0 + 10, y_root=y0 + 5))
+        app.drag._move(SimpleNamespace(x_root=x0 + 60, y_root=y0 + 45))
+        window.update()
+        assert (window.winfo_x(), window.winfo_y()) == (x0 + 50, y0 + 40)
+    finally:
+        app.drag._release(SimpleNamespace(x_root=0, y_root=0))
+        window.geometry(f"+{x0}+{y0}")
+        window.update()
+
+
+def test_resize_press_uses_deferred_native_path(app, monkeypatch):
+    """Windows: растягивание планируется в after_idle без ручного старта."""
+    from types import SimpleNamespace
+
+    calls = []
+    monkeypatch.setattr(
+        main.ui, "begin_native_resize_deferred",
+        lambda w, edge: calls.append(edge) or True,
+    )
+    app._resize_press(SimpleNamespace(x_root=0, y_root=0), "se")
+    assert calls == ["se"]
+    assert app._resize_origin is None and app._resize_start is None, \
+        "нативный путь: ручной старт растягивания не выполняется"
+
+
+def test_resize_press_falls_back_manually_without_native(app, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(main.ui, "begin_native_resize_deferred", lambda w, e: False)
+    app._resize_press(SimpleNamespace(x_root=10, y_root=10), "se")
+    assert app._resize_origin is not None, "ручной путь запоминает стартовую геометрию"
+    assert app._resize_start == (10, 10)
+    app._resize_origin = None
+    app._resize_start = None

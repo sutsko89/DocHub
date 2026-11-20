@@ -813,11 +813,13 @@ class ContractApp:
             self.lights.set_zoomed(False)
             ui.restore_window(self.root)
         self.root.update_idletasks()
-        # Нативное растягивание (2.17.0): Windows сама ведёт цикл — плавно,
-        # с учётом монитора под курсором (второй монитор) и minsize.
-        # Ручной путь ниже остаётся для не-Windows и как страховка при сбое.
+        # Нативное растягивание (2.17.0), фикс 2.19.1: цикл больше не
+        # стартует изнутри Tk-обработчика (см. WindowDrag._press) —
+        # begin_native_resize_deferred откладывает его до after_idle,
+        # когда стек Tk пуст. Ручной путь ниже остаётся для не-Windows
+        # и как страховка при сбое Win32-вызова.
         try:
-            if ui.begin_native_resize(self.root, edge):
+            if ui.begin_native_resize_deferred(self.root, edge):
                 self._resize_origin = None
                 self._resize_start = None
                 return
@@ -1576,7 +1578,13 @@ def main():
         return
 
     applog.setup_logging(APP_VERSION)
+    # Дамп критических сбоев (2.19.1): хард-падения Tcl/Tk (например,
+    # при перетаскивании окна) умирают без Python-traceback — faulthandler
+    # пишет C-стек в crash.log, по нему видна точка падения.
+    crash_log = applog.enable_crash_dump()
     log = applog.get_logger("main")
+    if crash_log:
+        log.info("Дамп критических сбоев включён: %s", crash_log)
     try:
         app = ContractApp()
         app.run()

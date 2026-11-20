@@ -35,6 +35,13 @@ HT_RESIZE_EDGES = {
     "sw": 16,  # HTBOTTOMLEFT
     "se": 17,  # HTBOTTOMRIGHT
 }
+#: VK-код левой кнопки мыши (GetAsyncKeyState) — страж отложенного старта.
+VK_LBUTTON = 0x01
+#: Ручной глушитель нативного переноса/растягивания (2.19.1): при
+#: EWDOCHUB_NO_NATIVE_DRAG=1 окно перетаскивается и растягивается
+#: ручным Tk-путём (без Snap/второго монитора). Служит для диагностики
+#: проблем с оконным циклом на конкретных машинах.
+NO_NATIVE_DRAG_ENV = "EWDOCHUB_NO_NATIVE_DRAG"
 _SWP_FRAMECHANGED_FLAGS = 0x1 | 0x2 | 0x4 | 0x20  # NOMOVE|NOSIZE|NOZORDER|FRAMECHANGED
 
 
@@ -47,8 +54,15 @@ class _RECT(ctypes.Structure):
     ]
 def _main_hwnd(window: tk.Misc) -> int:
     window.update_idletasks()
-    hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
-    return hwnd or window.winfo_id()
+    if sys.platform != "win32":
+        return window.winfo_id()
+    user32 = ctypes.windll.user32
+    # restype — 64-битный HWND: без него ctypes вернёт усечённый c_int
+    # (user-хендлы Windows пока укладываются в 32 бита, но полагаться
+    # на это не стоит).
+    user32.GetParent.restype = ctypes.c_void_p
+    hwnd = user32.GetParent(window.winfo_id())
+    return int(hwnd) if hwnd else window.winfo_id()
 def enable_rounded_corners(window: tk.Misc) -> None:
     """Скругление углов силами DWM (Windows 11)."""
     if sys.platform != "win32":
@@ -205,6 +219,24 @@ def restore_window(window: tk.Misc, geometry: str = "") -> None:
         pass
 
 
+def _native_drag_disabled() -> bool:
+    """Ручной глушитель нативного переноса (EWDOCHUB_NO_NATIVE_DRAG=1)."""
+    return os.environ.get(NO_NATIVE_DRAG_ENV) == "1"
+
+
+def left_button_pressed() -> bool:
+    """Левая кнопка мыши нажата прямо сейчас (Win32 GetAsyncKeyState).
+
+    Не-Windows и сбой запроса — True: вызывающий ведёт себя как прежде.
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+    except Exception:
+        return True
+
+
 def _begin_native_ht(window: tk.Misc, ht_code: int) -> bool:
     """Запускает нативный модальный цикл Windows с HT-кодом точки.
 
@@ -212,9 +244,15 @@ def _begin_native_ht(window: tk.Misc, ht_code: int) -> bool:
     WM_NCLBUTTONDOWN передаёт Windows управление переносом/растягиванием:
     окно можно унести на второй монитор (со сменой DPI) и прилипнуть
     к краям (Aero Snap). Блокирует до отпускания кнопки мыши.
-    False — не-Windows или сбой (вызывающий использует ручной fallback).
+    False — не-Windows, глушитель env или сбой (вызывающий использует
+    ручной fallback).
+
+    ВНИМАНИЕ (2.19.1): вызывать НЕ изнутри Tk-обработчика нажатия мыши.
+    Этот вызов блокирует до отпускания кнопки и внутри себя раскручивает
+    вложенный message loop — из обработчика ButtonPress запускать через
+    begin_native_*_deferred, из «пустого» стека.
     """
-    if sys.platform != "win32":
+    if sys.platform != "win32" or _native_drag_disabled():
         return False
     try:
         hwnd = _main_hwnd(window)
@@ -248,11 +286,79 @@ def begin_native_resize(window: tk.Misc, edge: str) -> bool:
     ``edge`` — одна из 8 сторон: 'n', 's', 'w', 'e', 'nw', 'ne', 'sw',
     'se'. True — Windows ведёт цикл растягивания сама (плавно, с учётом
     монитора под курсором и minsize); False — ручной fallback.
+
+    Синхронный вариант: только из «пустого» стека Tk. Из обработчика
+    ButtonPress использовать begin_native_resize_deferred (2.19.1).
     """
     ht_code = HT_RESIZE_EDGES.get(str(edge).lower())
     if not ht_code:
         return False
     return _begin_native_ht(window, ht_code)
+
+
+# ----------------------------------------------------------------------- #
+#  Отложенный нативный перенос/растягивание (2.19.1)
+# ----------------------------------------------------------------------- #
+def _schedule_native_ht(window: tk.Misc, ht_code: int) -> bool:
+    """Откладывает нативный модальный цикл до выхода из Tk-обработчика.
+
+    Фикс «программа вылетает при перетаскивании» (2.19.1).
+    SendMessageW(WM_NCLBUTTONDOWN) блокирует до отпускания кнопки мыши:
+    внутри него Windows раскручивает вложенный message loop и перекачивает
+    сообщения окна (WM_MOUSEMOVE, WM_PAINT, WM_DPICHANGED, ...) прямо
+    через Tk-обработчики поверх незавершённого колбэка ButtonPress.
+    Такая ре-entrant обработка событий Tcl из вложенного насоса
+    заканчивается падением процесса без traceback. after_idle откладывает
+    старт цикла: стек Tk полностью раскручивается, и модальный цикл
+    начинается при пустом стеке — как в окне с системной рамкой.
+
+    False — не-Windows, глушитель env или сбой планирования: вызывающий
+    использует ручной fallback.
+    """
+    if sys.platform != "win32" or _native_drag_disabled():
+        return False
+    try:
+        window.after_idle(lambda: _run_native_ht(window, ht_code))
+        return True
+    except Exception:
+        return False
+
+
+def _run_native_ht(window: tk.Misc, ht_code: int) -> None:
+    """Стартует отложенный модальный цикл (выполняется из after_idle)."""
+    try:
+        if not window.winfo_exists():
+            return
+        if not left_button_pressed():
+            # Кнопка уже отпущена — это был клик, а не перенос/растягивание.
+            return
+        _begin_native_ht(window, ht_code)
+    except Exception:
+        pass
+
+
+def begin_native_move_deferred(window: tk.Misc) -> bool:
+    """Нативное перетаскивание за шапку, отложенное до выхода из колбэка.
+
+    Фикс вылета при перетаскивании (2.19.1). Вызывать из обработчика
+    ButtonPress шапки: True — перенос начнётся после after_idle, когда
+    стек Tk пуст (второй монитор, Snap, смена DPI остаются доступны);
+    False — не-Windows, EWDOCHUB_NO_NATIVE_DRAG=1 или сбой планирования,
+    вызывающий использует ручной перенос через geometry().
+    """
+    return _schedule_native_ht(window, HTCAPTION)
+
+
+def begin_native_resize_deferred(window: tk.Misc, edge: str) -> bool:
+    """Нативное растягивание за кромку, отложенное до выхода из колбэка.
+
+    Аналог begin_native_move_deferred для кромок: True — цикл
+    растягивания стартует из after_idle; False — ручной fallback.
+    """
+    ht_code = HT_RESIZE_EDGES.get(str(edge).lower())
+    if not ht_code:
+        return False
+    return _schedule_native_ht(window, ht_code)
 
 
 # ----------------------------------------------------------------------- #

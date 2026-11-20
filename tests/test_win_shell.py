@@ -66,6 +66,12 @@ class FakeWindow:
     def after(self, _ms, fn):
         self.calls.append(("after", fn))
 
+    def after_idle(self, fn):
+        self.calls.append(("after_idle", fn))
+
+    def winfo_exists(self):
+        return True
+
 
 # --------------------------------------------------------------------------- #
 #  DPI (п. 6.3)
@@ -128,6 +134,106 @@ def test_begin_native_resize_unknown_edge_returns_false_anywhere():
     fake = FakeWindow()
     assert win_shell.begin_native_resize(fake, "diagonal-fake") is False
     assert win_shell.begin_native_resize(fake, "") is False
+
+
+# --------------------------------------------------------------------------- #
+#  Отложенный нативный перенос/растягивание (2.19.1 — фикс вылета
+#  при перетаскивании): модальный цикл стартует из after_idle, а не
+#  изнутри Tk-обработчика нажатия.
+# --------------------------------------------------------------------------- #
+@not_win32
+def test_deferred_native_move_returns_false_without_windows():
+    """Не-Windows: отложенного переноса нет — вызывающий идёт ручным путём."""
+    fake = FakeWindow()
+    assert win_shell.begin_native_move_deferred(fake) is False
+    assert not any(call[0] == "after_idle" for call in fake.calls)
+
+
+def test_deferred_native_move_schedules_after_idle(monkeypatch):
+    """Windows: цикл переносится в after_idle — стек Tk успевает раскрутиться."""
+    monkeypatch.setattr(win_shell.sys, "platform", "win32")
+    recorded = []
+    monkeypatch.setattr(
+        win_shell, "_run_native_ht", lambda w, ht: recorded.append((w, ht)),
+    )
+    fake = FakeWindow()
+    assert win_shell.begin_native_move_deferred(fake) is True
+    scheduled = [fn for kind, fn in fake.calls if kind == "after_idle"]
+    assert len(scheduled) == 1, "ровно один отложенный старт переноса"
+    scheduled[0]()  # after_idle срабатывает: кнопка «нажата» (фейк → True)
+    assert recorded == [(fake, win_shell.HTCAPTION)]
+
+
+def test_deferred_native_resize_schedules_after_idle(monkeypatch):
+    monkeypatch.setattr(win_shell.sys, "platform", "win32")
+    recorded = []
+    monkeypatch.setattr(
+        win_shell, "_run_native_ht", lambda w, ht: recorded.append((w, ht)),
+    )
+    fake = FakeWindow()
+    assert win_shell.begin_native_resize_deferred(fake, "ne") is True
+    scheduled = [fn for kind, fn in fake.calls if kind == "after_idle"]
+    scheduled[0]()
+    assert recorded == [(fake, win_shell.HT_RESIZE_EDGES["ne"])]
+
+
+def test_deferred_native_resize_unknown_edge_rejected(monkeypatch):
+    monkeypatch.setattr(win_shell.sys, "platform", "win32")
+    fake = FakeWindow()
+    assert win_shell.begin_native_resize_deferred(fake, "diagonal-fake") is False
+    assert win_shell.begin_native_resize_deferred(fake, "") is False
+    assert not any(call[0] == "after_idle" for call in fake.calls)
+
+
+def test_native_drag_env_switch_disables_all_native_paths(monkeypatch):
+    """EWDOCHUB_NO_NATIVE_DRAG=1 глушит и отложенные, и синхронные вызовы."""
+    monkeypatch.setenv(win_shell.NO_NATIVE_DRAG_ENV, "1")
+    monkeypatch.setattr(win_shell.sys, "platform", "win32")
+    fake = FakeWindow()
+    assert win_shell.begin_native_move_deferred(fake) is False
+    assert win_shell.begin_native_resize_deferred(fake, "se") is False
+    assert win_shell.begin_native_move(fake) is False
+    assert win_shell.begin_native_resize(fake, "w") is False
+    assert not any(call[0] == "after_idle" for call in fake.calls)
+
+
+def test_run_native_ht_skips_when_button_already_released(monkeypatch):
+    """Клик без движения не входит в модальный цикл переноса."""
+    monkeypatch.setattr(win_shell.sys, "platform", "win32")
+    monkeypatch.setattr(win_shell, "left_button_pressed", lambda: False)
+    called = []
+    monkeypatch.setattr(win_shell, "_begin_native_ht", lambda w, ht: called.append(ht))
+    win_shell._run_native_ht(FakeWindow(), win_shell.HTCAPTION)
+    assert called == []
+
+
+def test_run_native_ht_starts_loop_when_button_held(monkeypatch):
+    monkeypatch.setattr(win_shell.sys, "platform", "win32")
+    monkeypatch.setattr(win_shell, "left_button_pressed", lambda: True)
+    called = []
+    monkeypatch.setattr(
+        win_shell, "_begin_native_ht", lambda w, ht: called.append((w, ht)),
+    )
+    fake = FakeWindow()
+    win_shell._run_native_ht(fake, win_shell.HTCAPTION)
+    assert called == [(fake, win_shell.HTCAPTION)]
+
+
+def test_run_native_ht_ignores_dead_window_and_failures(monkeypatch):
+    """Уничтоженное окно и любые сбои внутри отложенного старта — тихо."""
+    monkeypatch.setattr(win_shell.sys, "platform", "win32")
+    called = []
+    monkeypatch.setattr(win_shell, "_begin_native_ht", lambda w, ht: called.append(ht))
+    fake = FakeWindow()
+    fake.winfo_exists = lambda: False
+    win_shell._run_native_ht(fake, win_shell.HTCAPTION)
+    assert called == []
+
+    def boom(window, ht_code):
+        raise RuntimeError("win32 сбой")
+
+    monkeypatch.setattr(win_shell, "_begin_native_ht", boom)
+    win_shell._run_native_ht(FakeWindow(), win_shell.HTCAPTION)  # не бросает
 
 
 # --------------------------------------------------------------------------- #

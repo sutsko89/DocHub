@@ -25,7 +25,8 @@ SCALE = 1.0
 # Win32-обвязка вынесена в win_shell.py (п. 9.3); имена реэкспортируются,
 # чтобы main.py и внутренние виджеты продолжали вызывать ui.make_borderless и т. п.
 from win_shell import (
-    _RECT, _MONITORINFO, _main_hwnd, begin_native_move, begin_native_resize,
+    _RECT, _MONITORINFO, _main_hwnd, begin_native_move,
+    begin_native_move_deferred, begin_native_resize, begin_native_resize_deferred,
     enable_rounded_corners, focus_window, make_borderless, maximize_window,
     minimize_window, refresh_taskbar, restore_window, workarea,
 )
@@ -666,13 +667,19 @@ class WindowDrag:
     def _press(self, event) -> None:
         if self._on_start is not None:
             self._on_start(event)
-        # Нативное перетаскивание (2.17.0): Windows сама ведёт цикл переноса
-        # — окно уносится на второй монитор (со сменой DPI) и работает
-        # Aero Snap. Вызов блокирует до отпускания кнопки; ручной путь ниже
-        # остаётся для не-Windows и как страховка при сбое Win32-вызова.
+        # Нативное перетаскивание (2.17.0), фикc 2.19.1: цикл переноса
+        # больше НЕ стартует изнутри Tk-обработчика нажатия. SendMessageW
+        # блокирует до отпускания кнопки и раскручивает вложенный message
+        # loop поверх незавершённого колбэка ButtonPress — ре-entrant
+        # обработка событий Tcl из вложенного насоса роняла процесс без
+        # traceback. begin_native_move_deferred откладывает старт до
+        # after_idle: стек Tk раскручивается, и Windows ведёт перенос из
+        # пустого стека — окно уносится на второй монитор (со сменом DPI)
+        # и работает Aero Snap. Ручной путь ниже остаётся для не-Windows
+        # и как страховка при сбое Win32-вызова.
+        self._offset = None
         try:
-            if begin_native_move(self._window):
-                self._offset = None
+            if begin_native_move_deferred(self._window):
                 return
         except Exception:
             pass
@@ -689,7 +696,11 @@ class WindowDrag:
             return
         x = event.x_root - self._offset[0]
         y = event.y_root - self._offset[1]
-        self._window.geometry(f"+{max(x, -40)}+{max(y, 0)}")
+        try:
+            self._window.geometry(f"+{max(x, -40)}+{max(y, 0)}")
+        except tk.TclError:
+            # Окно уничтожено посреди перетаскивания — тихо завершаем путь.
+            self._offset = None
 
     def _release(self, _event) -> None:
         self._offset = None

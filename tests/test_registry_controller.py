@@ -19,6 +19,7 @@ smoke-тестом под Xvfb; здесь проверяется логика �
 from __future__ import annotations
 
 import logging
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -72,6 +73,14 @@ class FakeApp:
         self._registry_rows: dict = {}
         self._registry_docs_row = 1
         self._registry_docs_frame = None
+        # 2.18.0: раскрытый контрагент, выделенный документ, времена кликов.
+        self._registry_expanded_id = None
+        self._docs_selected_id = None
+        self._docs_rows: dict = {}
+        self._registry_last_click_id = None
+        self._registry_last_click_ts = 0.0
+        self._docs_last_click_id = None
+        self._docs_last_click_ts = 0.0
         self._registry_rendered = False
         self._registry_search_after = None
         self._orphans: list = []
@@ -88,6 +97,12 @@ class FakeApp:
         )
         self._settings_flow = SimpleNamespace(
             documents_dir=lambda interactive=True: self.docs_dir)
+        self._lifecycle_flow = SimpleNamespace(
+            delete_document=lambda rec: self.calls.append(
+                ("delete_doc", rec.get("id"))),
+            delete_counterparty=lambda rec: self.calls.append(
+                ("delete_party", rec.get("id"))),
+        )
 
     def _update_status(self):
         self.calls.append("status")
@@ -382,3 +397,122 @@ def test_reconcile_dialog_skip_choice_does_nothing(app, flow, monkeypatch):
 
     assert app.choice_calls, "диалог открывается"
     assert app.calls == [], "без выбора пользователя ничего не происходит"
+
+
+# --------------------------------------------------------------------------- #
+#  Взаимодействие 2.18.0: выделение, двойной клик, Delete, сроки
+# --------------------------------------------------------------------------- #
+def test_on_party_click_selects_then_double_click_opens(app, flow):
+    rec = make_party()
+
+    flow.on_party_click(rec)
+    assert app._registry_selected_id == rec["id"], "первый клик — выделение"
+    assert app._registry_expanded_id is None, "документы ещё не раскрыты"
+
+    # Второй клик в пределах окна двойного клика — раскрытие документов.
+    flow.on_party_click(rec)
+    assert app._registry_selected_id == rec["id"]
+    assert app._registry_expanded_id == rec["id"], "двойной клик раскрывает документы"
+
+
+def test_on_party_click_second_click_on_other_party(app, flow):
+    rec_a = make_party(short="ООО А")
+    rec_b = make_party(short="ООО Б")
+    app._registry_last_click_id = rec_a["id"]
+    app._registry_last_click_ts = time.monotonic()
+
+    flow.on_party_click(rec_b)
+
+    assert app._registry_selected_id == rec_b["id"]
+    assert app._registry_expanded_id is None, "двойной клик по разным строкам не сработал"
+
+
+def test_on_party_click_after_timeout_is_single_click(app, flow):
+    rec = make_party()
+    flow.on_party_click(rec)
+    # Имитируем медленный клик: время предыдущего клика — давно.
+    app._registry_last_click_ts = time.monotonic() - 10
+
+    flow.on_party_click(rec)
+
+    assert app._registry_selected_id is None, "это снятие выделения, не двойной клик"
+
+
+def test_open_party_documents_toggles_expansion(app, flow):
+    rec = make_party()
+
+    flow.open_party_documents(rec)
+    assert app._registry_expanded_id == rec["id"]
+    assert app._registry_selected_id == rec["id"], "раскрытие также выделяет строку"
+
+    flow.open_party_documents(rec)
+    assert app._registry_expanded_id is None, "повторный двойной клик сворачивает"
+
+
+def test_select_other_party_collapses_expanded(app, flow):
+    rec_a = make_party(short="ООО А")
+    rec_b = make_party(short="ООО Б")
+    app._registry_expanded_id = rec_a["id"]
+
+    flow.select_party(rec_b)
+
+    assert app._registry_expanded_id is None, "раскрыта секция только одного контрагента"
+
+
+def test_select_document_toggles(app, flow):
+    doc = {"id": 42, "kind": storage.KIND_CONTRACT, "number": "5",
+           "date": "01.10.2026", "extra": {}}
+
+    flow.select_document(doc)
+    assert app._docs_selected_id == 42
+
+    flow.select_document(doc)
+    assert app._docs_selected_id is None, "повторный клик снимает выделение"
+
+
+def test_delete_selected_prefers_document(store, app, flow):
+    doc = store.add_document(storage.KIND_CONTRACT, None, "5", "01.10.2026", {})
+    app._docs_selected_id = doc["id"]
+    app._registry_selected_id = "p-1"
+
+    flow.delete_selected()
+
+    assert ("delete_doc", doc["id"]) in app.calls
+    assert not any(call[0] == "delete_party" for call in app.calls), \
+        "документ приоритетнее контрагента"
+
+
+def test_delete_selected_party_when_no_document(store, app, flow):
+    party = store.add_counterparty("ooo", {"Сокращенное название компании": "ООО А"})
+    app._docs_selected_id = None
+    app._registry_selected_id = party["id"]
+
+    flow.delete_selected()
+
+    assert ("delete_party", party["id"]) in app.calls
+
+
+def test_delete_selected_without_selection_is_noop(app, flow):
+    assert flow.delete_selected() is False
+    assert app.calls == []
+
+
+def test_doc_row_text_includes_expiry_suffix(store, app, flow):
+    rec = {"id": 1, "kind": storage.KIND_ADDITIONAL, "number": "3",
+           "date": "01.10.2026",
+           "extra": {"valid_until_iso": "2026-01-01"}}
+    text = flow.doc_row_text(rec)
+    assert "Доп. соглашение № 3" in text
+    assert "истекло 01.01.2026" in text, "просрочка видна в строке реестра"
+
+
+def test_doc_row_color_marks_expired_and_soon(app, flow):
+    expired = {"id": 1, "kind": storage.KIND_ADDITIONAL, "number": "1",
+               "extra": {"valid_until_iso": "2026-01-01"}}
+    soon = {"id": 2, "kind": storage.KIND_ADDITIONAL, "number": "2",
+            "extra": {"valid_until_iso": "2026-12-15"}}
+    contract = {"id": 3, "kind": storage.KIND_CONTRACT, "number": "5", "extra": {}}
+
+    assert flow.doc_row_color(expired) == rc.ui.COLORS["error_text"]
+    assert flow.doc_row_color(soon) == rc.ui.COLORS["warning_text"]
+    assert flow.doc_row_color(contract) == rc.ui.COLORS["text"]

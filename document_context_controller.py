@@ -272,6 +272,7 @@ class DocumentContextController:
                     app.addl_number_var.get(),
                     app._limit_var.get(),
                     app.term_var.get(),
+                    app.addl_valid_var.get(),
                 )
             if key == "spec":
                 items = tuple(

@@ -1,8 +1,8 @@
 """Проверка обновлений EW.DocHub через GitHub Releases API.
 
 Первый публичный релиз (2.15.0): приложение само проверяет наличие новых
-версий и предлагает пользователю открыть страницу релиза. Модуль
-намеренно без Tk — только версии, HTTP и разбор ответа GitHub:
+версий и предлагает пользователю обновиться. Модуль намеренно без Tk —
+только версии, HTTP и разбор ответа GitHub:
 
 * ``parse_version`` / ``is_newer`` — сравнение версий «v2.15.0» ↔ «2.15.0»;
 * ``fetch_latest_release`` — GET последнего релиза GitHub (stdlib urllib,
@@ -10,7 +10,11 @@
 * ``check_for_update`` — единая точка проверки с понятным пользователю
   результатом («доступна новая», «версия последняя», «ошибка сети»);
 * ``auto_check_due`` / ``mark_checked`` — суточный троттлинг
-  автопроверки через settings.json (ключ ``last_update_check``).
+  автопроверки через settings.json (ключ ``last_update_check``);
+* 2.18.0 — автообновление: ``download_file`` (потоковое скачивание
+  установщика с прогрессом и отменой), ``fetch_text``/``match_sums_line``
+  (SHA256SUMS.txt) и ``verify_sha256`` (контроль целостности перед
+  запуском установщика).
 
 Оркестрация с очередью и опросом из главного потока Tk — в
 updater_controller.py (паттерн dadata_controller: рабочий поток не трогает
@@ -26,6 +30,7 @@ Tk). Модуль не импортирует main — APP_VERSION переда�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -49,7 +54,15 @@ DISABLE_ENV = "EWDOCHUB_NO_UPDATE_CHECK"
 SETTINGS_KEY_TS = "last_update_check"
 SETTINGS_KEY_AUTO = "auto_update_check"
 
+# Скачивание установщика (2.18.0): размер порции и имя ассета-сумм.
+CHUNK_SIZE = 256 * 1024
+SUMS_ASSET_NAME = "sha256sums.txt"
+
 _USER_AGENT = "EW.DocHub-Updater"
+
+
+class DownloadCancelled(Exception):
+    """Пользователь отменил скачивание обновления (кнопка «Отмена»)."""
 
 
 # --------------------------------------------------------------------------- #
@@ -137,11 +150,14 @@ def parse_release_payload(payload: object) -> dict | None:
         if isinstance(asset, dict)
     ]
     installer_url = ""
+    sums_url = ""
     for asset in assets:
-        name = str(asset.get("name") or "").strip().lower()
-        if name.endswith("-setup.exe"):
+        name = str(asset.get("name") or "").strip()
+        lowered = name.lower()
+        if lowered.endswith("-setup.exe"):
             installer_url = str(asset.get("browser_download_url") or "")
-            break
+        elif lowered == SUMS_ASSET_NAME:
+            sums_url = str(asset.get("browser_download_url") or "")
     return {
         "tag": tag,
         "version": version,
@@ -150,6 +166,9 @@ def parse_release_payload(payload: object) -> dict | None:
         "url": str(payload.get("html_url") or "").strip() or PAGE_URL,
         "notes": str(payload.get("body") or ""),
         "installer_url": installer_url,
+        "sums_url": sums_url,
+        "installer_name": os.path.basename(installer_url.split("?")[0])
+        if installer_url else "",
     }
 
 
@@ -226,3 +245,92 @@ def check_for_update(current: str, timeout: float = TIMEOUT) -> dict:
         "message": f"Вы используете последнюю версию ({current}).",
         "release": release,
     }
+
+
+# --------------------------------------------------------------------------- #
+#  Скачивание установщика и контроль целостности (2.18.0)
+# --------------------------------------------------------------------------- #
+def download_file(url: str, dest_path: str, progress_cb=None,
+                  cancel_event=None, timeout: float = 30.0) -> str:
+    """Скачивает файл потоком в ``dest_path`` и возвращает путь.
+
+    * ``progress_cb(done, total)`` вызывается на каждой порции (total может
+      быть 0, если сервер не отдал Content-Length);
+    * ``cancel_event`` — threading.Event: установка события прерывает
+      скачивание исключением DownloadCancelled;
+    * чистый stdlib urllib — работает и в сборке PyInstaller, никаких
+      новых зависимостей.
+
+    Файл пишется во временный ``.part`` и переименовывается по успехе,
+    поэтому после отмены/ошибки не остаётся «полуфабриката» с целевым
+    именем.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    part_path = dest_path + ".part"
+    os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+    done = 0
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+            if callable(progress_cb):
+                progress_cb(0, total)
+            with open(part_path, "wb") as out:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise DownloadCancelled()
+                    chunk = response.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if callable(progress_cb):
+                        progress_cb(done, total)
+        os.replace(part_path, dest_path)
+        return dest_path
+    finally:
+        try:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+        except OSError:
+            pass  # Windows может держать файл открытым до завершения потока
+
+
+def fetch_text(url: str, timeout: float = TIMEOUT) -> str:
+    """Скачивает небольшой текстовый файл целиком (SHA256SUMS.txt)."""
+    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def match_sums_line(sums_text: str, filename: str) -> str:
+    """Из содержимого SHA256SUMS.txt берёт хеш для ``filename``.
+
+    Формат GitHub-релиза — ``<hex64>  <имя>`` (два пробела; допустим
+    бинарный маркер ``*``). Возвращает hex-строку в нижнем регистре или
+    пустую строку, если файла в списке нет.
+    """
+    target = str(filename or "").strip().lower()
+    if not target:
+        return ""
+    for line in str(sums_text or "").splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        digest, name = parts[0].strip().lower(), parts[1].strip()
+        if name.startswith("*"):
+            name = name[1:]
+        if name.strip().lower() == target:
+            return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else ""
+    return ""
+
+
+def verify_sha256(path: str, expected_hex: str) -> bool:
+    """Считает SHA-256 файла потоком и сравнивает с ожидаемым значением."""
+    expected = str(expected_hex or "").strip().lower()
+    if not expected:
+        return False
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest() == expected

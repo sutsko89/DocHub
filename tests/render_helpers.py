@@ -148,10 +148,12 @@ def render_six_forms() -> dict:
         services.render_contract(contract_data_ooo, is_ip=False))
     out["contract_ip"] = document_signature(
         services.render_contract(contract_data_ip, is_ip=True))
+    # Срок действия (2.18.0) входит в печатную форму п. 5, поэтому
+    # эталон собирается с фиксированной датой.
     out["additional_ooo"] = document_signature(services.render_additional(
-        contract_data_ooo, False, "2", limit_display, term))
+        contract_data_ooo, False, "2", limit_display, term, "31.12.2026"))
     out["additional_ip"] = document_signature(services.render_additional(
-        contract_data_ip, True, "3", limit_display, term))
+        contract_data_ip, True, "3", limit_display, term, "31.12.2026"))
     out["spec_ooo"] = document_signature(
         services.render_spec(spec_rec(party_ooo, contract_ooo), store))
     out["spec_ip"] = document_signature(

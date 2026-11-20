@@ -54,7 +54,8 @@ import tkinter as tk
 import ui_macos as ui
 from document_builder import (
     F, MONTHS_GENITIVE, digits_only, docx_to_text, format_number_grouped,
-    number_to_words_ru, amount_to_words_ru,
+    number_to_words_ru, amount_to_words_ru, parse_valid_until,
+    valid_until_default,
 )
 
 
@@ -334,6 +335,19 @@ class DocumentPageController:
             error_var=app._error_var_for("additional", F.TERM),
         )
 
+        # -- Срок действия (2.18.0) --------------------------------------- #
+        app.addl_valid_var = tk.StringVar(value=valid_until_default())
+        valid_entry = ui.entry(
+            card.body, width=int(120 * app.scale), textvariable=app.addl_valid_var,
+        )
+        app._page_widgets[("additional", F.VALID_UNTIL)] = valid_entry
+        card.row(
+            F.VALID_UNTIL, valid_entry, required=True,
+            hint="Срок действия по п. 5 (формат ДД.ММ.ГГГГ). По умолчанию — "
+                 "31 декабря текущего года.",
+            error_var=app._error_var_for("additional", F.VALID_UNTIL),
+        )
+
         app.words_label = ctk.CTkLabel(
             card.body, text="Срок прописью: —", font=ui.font(12),
             text_color=ui.COLORS["text_secondary"], anchor="w", justify="left", height=18,
@@ -352,6 +366,7 @@ class DocumentPageController:
         app.addl_number_var.trace_add("write", self.preview_additional)
         app._limit_var.trace_add("write", self.preview_additional)
         app.term_var.trace_add("write", self.preview_additional)
+        app.addl_valid_var.trace_add("write", self.preview_additional)
         self.preview_additional()
 
     def preview_additional(self, *_args):
@@ -391,6 +406,7 @@ class DocumentPageController:
                 app.addl_number_var.get().strip(),
                 app._limit_var.get().strip(),
                 app.term_var.get().strip(),
+                app.addl_valid_var.get().strip(),
             )
             app._set_text(app.addl_preview, docx_to_text(doc))
         except Exception as exc:

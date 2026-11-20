@@ -115,6 +115,8 @@ COLORS: dict[str, tuple[str, str]] = {
     "caption_pressed": ("#D9D9D9", "#3F3F41"),
     "error_border": ("#E03131", "#FF5C5C"),
     "error_text": ("#C92A2A", "#FF8787"),
+    # 2.18.0: амберный для «истекает в течение месяца» (сроки допсоглашений).
+    "warning_text": ("#B45309", "#FFB454"),
 }
 
 LIGHT_RED = "#FF5F57"

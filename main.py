@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 
 from decimal import Decimal, ROUND_HALF_UP
@@ -46,6 +47,7 @@ import registry_controller
 import settings_controller
 import single_instance
 import storage
+import updater
 import updater_controller
 import ui_macos as ui
 import win_shell
@@ -84,7 +86,12 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.17.0"
+APP_VERSION = "2.18.0"
+
+# Уведомление о сроках доп. соглашений (2.18.0): раз в сутки, ключ
+# settings.json — как у автопроверки обновлений (updater.SETTINGS_KEY_TS).
+EXPIRY_NOTICE_SETTINGS_KEY = "last_expiry_notice"
+EXPIRY_NOTICE_INTERVAL = 24 * 60 * 60
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -560,10 +567,16 @@ class ContractApp:
         # не чаще раза в сутки, выключается пользователем и env-глушкой
         # EWDOCHUB_NO_UPDATE_CHECK (тесты/smoke не ходят в сеть).
         self.root.after(2200, self._update_flow.maybe_auto_check)
+        # Уведомление о сроках доп. соглашений (2.18.0): просроченные и
+        # истекающие в течение месяца; раз в сутки, без сети.
+        self.root.after(1900, self.check_agreement_expiry_notice)
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Escape>", self._on_escape)
         self.root.bind("<F11>", lambda _event: self.toggle_fullscreen())
+        # Delete в реестре удаляет выделенную запись (2.18.0); в полях
+        # ввода клавиша работает штатно (проверка фокуса — в обработчике).
+        self.root.bind("<Delete>", self._on_delete_key)
         # Ctrl+S и Enter в формах сохраняют текущий документ (п. 4.5).
         self.root.bind("<Control-s>", self._on_save_shortcut)
         self.root.bind("<Control-S>", self._on_save_shortcut)
@@ -1446,6 +1459,65 @@ class ContractApp:
         if key == "registry":
             self._registry_flow.refresh()
         self.root.after(60, self._refresh_scrollbars)
+
+    # ------------------------------------------------------------------ #
+    #  Реестр: Delete и сроки доп. соглашений (2.18.0)
+    # ------------------------------------------------------------------ #
+    def _on_delete_key(self, _event=None):
+        """Клавиша Delete на странице «Реестр» — удалить выделенную запись.
+
+        Если фокус в поле ввода (Entry/Text/Combobox), клавиша работает
+        штатно (удаляет символ) и ничего не удаляет из реестра. На других
+        страницах выделения нет — обработчик молчит.
+        """
+        if self.current_page != "registry":
+            return
+        focus = None
+        try:
+            focus = self.root.focus_get()
+        except Exception:
+            pass
+        if focus is not None:
+            try:
+                if str(focus.winfo_class()) in ("Entry", "Text", "Spinbox", "Combobox", "TCombobox"):
+                    return
+            except Exception:
+                pass
+        self._registry_flow.delete_selected()
+
+    def check_agreement_expiry_notice(self) -> None:
+        """Стартовое уведомление о сроках доп. соглашений (2.18.0).
+
+        Просроченные и истекающие в течение месяца соглашения показываются
+        одним диалогом с переходом в реестр; не чаще раза в сутки (ключ
+        ``last_expiry_notice`` в settings.json), без сети — работает и
+        офлайн. Тишина, когда тревожить не о чем.
+        """
+        import agreements  # поздний импорт: модуль без Tk
+
+        now = time.time()
+        last = self._settings.get(EXPIRY_NOTICE_SETTINGS_KEY)
+        if isinstance(last, (int, float)) and (now - float(last)) < EXPIRY_NOTICE_INTERVAL:
+            return
+        try:
+            text = agreements.notice_text(self.store)
+        except Exception:
+            self._log.exception("Сбор сроков доп. соглашений не удался")
+            return
+        if not text:
+            return
+        self._settings[EXPIRY_NOTICE_SETTINGS_KEY] = now
+        self._persist_settings()
+        choice = self._choice_dialog(
+            "Сроки действия доп. соглашений",
+            text,
+            [
+                ("later", "Позже", False),
+                ("registry", "Открыть реестр", True),
+            ],
+        )
+        if choice == "registry":
+            self._select_page("registry")
 
     def _refresh_scrollbars(self):
         """Прячет полосу прокрутки, если содержимое помещается целиком (как в macOS)."""

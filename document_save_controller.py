@@ -49,8 +49,8 @@ import storage
 import ui_macos as ui
 from document_builder import (
     F, MONTHS_GENITIVE, digits_only, format_quantity, format_amount,
-    amount_in_words_ru, prices_valid_until_default, spec_vat_amount_from_items,
-    spec_line_total, spec_total,
+    amount_in_words_ru, parse_valid_until, prices_valid_until_default,
+    spec_vat_amount_from_items, spec_line_total, spec_total, valid_until_iso,
 )
 from services import safe_filename, validate_contract_fields
 from widgets import SpecTable
@@ -324,9 +324,10 @@ class DocumentSaveController:
         return services.render_contract(data, is_ip)
 
     def render_additional_docx(self, data: dict, is_ip: bool, number: str,
-                               limit_display: str, term: str) -> "Document":
+                               limit_display: str, term: str,
+                               valid_until: str = "") -> "Document":
         """Доп. соглашение из шаблона с подстановкой лимита и отсрочки."""
-        return services.render_additional(data, is_ip, number, limit_display, term)
+        return services.render_additional(data, is_ip, number, limit_display, term, valid_until)
 
     def render_spec_docx(self, rec: dict) -> "Document":
         """Спецификация из шаблона (ООО/ИП) — сборка в сервисном слое (п. 9.2)."""
@@ -587,6 +588,8 @@ class DocumentSaveController:
             limit = digits_only(limit_display)
             term = app.term_var.get().strip()
             number = app.addl_number_var.get().strip() or "б/н"
+            valid_text = app.addl_valid_var.get().strip()
+            valid_date = parse_valid_until(valid_text)
 
             errors = {}
             if not limit:
@@ -595,6 +598,10 @@ class DocumentSaveController:
                 errors[F.TERM] = "Заполните поле"
             elif not term.isdigit():
                 errors[F.TERM] = "Должно быть целое число дней"
+            if not valid_text:
+                errors[F.VALID_UNTIL] = "Заполните поле"
+            elif valid_date is None:
+                errors[F.VALID_UNTIL] = "Введите дату в формате ДД.ММ.ГГГГ"
             if errors:
                 app._clear_page_errors("additional")
                 for key, message in errors.items():
@@ -620,6 +627,10 @@ class DocumentSaveController:
                 "limit_digits": limit,
                 "term": term,
                 "is_ip": party.get("type") == "ip",
+                # Срок действия (2.18.0): вид «31.12.2026» для реестра и
+                # ISO «2026-12-31» для расчёта «истекло/истекает».
+                "valid_until": valid_date.strftime("%d.%m.%Y"),
+                "valid_until_iso": valid_until_iso(valid_date),
             }
             draft = {
                 "kind": storage.KIND_ADDITIONAL,

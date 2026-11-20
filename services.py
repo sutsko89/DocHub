@@ -24,7 +24,7 @@ from document_builder import (
     docx_from_text, fill_spec_items, format_amount, format_date,
     format_name_ip2, mark_spec_final_page, number_to_words_ru, parse_decimal,
     prices_valid_until_default, replace_in_doc, spec_total,
-    spec_vat_amount, spec_vat_amount_from_items,
+    spec_vat_amount, spec_vat_amount_from_items, valid_until_parts,
 )
 
 MAX_PATH_LENGTH = 240
@@ -303,8 +303,15 @@ def render_contract(data: dict, is_ip: bool) -> "Document":
 
 
 def render_additional(data: dict, is_ip: bool, number: str,
-                      limit_display: str, term: str) -> "Document":
-    """Доп. соглашение из шаблона с подстановкой лимита и отсрочки."""
+                      limit_display: str, term: str,
+                      valid_until: str = "") -> "Document":
+    """Доп. соглашение из шаблона с подстановкой лимита и отсрочки.
+
+    ``valid_until`` — срок действия (п. 5): строка «31.12.2026» или ISO
+    «2026-12-31» (как в extra записи реестра). Пусто/нечитаемо —
+    плейсхолдеры пункта 5 заменяются пустотой, недостающая дата видна
+    в печатной форме и в реестре.
+    """
     template_path = resource_path("additional_agreement_ip.docx" if is_ip else "additional_agreement.docx")
     doc = load_template_cached(template_path)
     replacements = build_replacements(data, is_ip)
@@ -315,6 +322,12 @@ def render_additional(data: dict, is_ip: bool, number: str,
         PH.LIMIT_WORDS: amount_to_words_ru(int(limit)) if limit else "",
         PH.TERM: term,
         PH.TERM_WORDS: number_to_words_ru(int(term)) if term.isdigit() else "",
+    })
+    day, month, year = valid_until_parts(valid_until)
+    replacements.update({
+        PH.VALID_DAY: day,
+        PH.VALID_MONTH: month,
+        PH.VALID_YEAR: year,
     })
     replace_in_doc(doc, replacements)
     return doc
@@ -422,9 +435,11 @@ def build_record_docx(rec: dict, store) -> "Document":
     if kind == storage.KIND_CONTRACT:
         return render_contract(rec.get("data") or {}, rec_is_ip(rec, store))
     if kind == storage.KIND_ADDITIONAL:
+        extra = rec.get("extra") or {}
         return render_additional(
             rec.get("data") or {}, rec_is_ip(rec, store),
             rec.get("number") or "", extra.get("limit", ""), extra.get("term", ""),
+            extra.get("valid_until_iso") or extra.get("valid_until", ""),
         )
     if kind == storage.KIND_SPEC:
         return render_spec(rec, store)

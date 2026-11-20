@@ -160,6 +160,7 @@ class FakeApp:
         self.addl_party_var = FakeVar("")
         self.addl_contract_var = FakeVar("")
         self.addl_number_var = FakeVar("")
+        self.addl_valid_var = FakeVar("31.12.2026")
         self._limit_var = FakeVar("")
         self.term_var = FakeVar("")
 
@@ -682,6 +683,9 @@ def test_save_additional_success(store, ooo_fields, app, flow, ui_stub, monkeypa
     assert draft["extra"]["contract_id"] == contract["id"]
     assert draft["extra"]["limit_digits"] == "1500000", "лимит без разделителей"
     assert draft["extra"]["term"] == "45"
+    assert draft["extra"]["valid_until"] == "31.12.2026", (
+        "2.18.0: срок действия сохраняется в записи реестра")
+    assert draft["extra"]["valid_until_iso"] == "2026-12-31"
     assert ("baseline", "additional") in app.calls
     assert "сохранено" in app.calls[-1][1]
 
@@ -827,7 +831,8 @@ def test_render_docx_helpers_route_to_services(app, flow, monkeypatch):
                         lambda data, is_ip: ("contract", data, is_ip))
     monkeypatch.setattr(
         services, "render_additional",
-        lambda data, is_ip, number, limit, term: ("additional", data, number),
+        lambda data, is_ip, number, limit, term, valid_until="":
+        ("additional", data, number),
     )
     monkeypatch.setattr(services, "render_spec",
                         lambda rec, store_, settings: ("spec", rec))
@@ -839,6 +844,8 @@ def test_render_docx_helpers_route_to_services(app, flow, monkeypatch):
     assert flow.render_contract_docx({"x": 1}, True) == ("contract", {"x": 1}, True)
     assert flow.render_additional_docx({}, False, "1", "1 000", "30") == \
         ("additional", {}, "1")
+    assert flow.render_additional_docx({}, False, "1", "1 000", "30", "31.12.2026") == \
+        ("additional", {}, "1"), "2.18.0: срок действия проходит в печатную форму"
     assert flow.render_spec_docx({"y": 2}) == ("spec", {"y": 2})
     assert flow.rec_is_ip({"z": 3}) is True
     assert flow.build_record_docx({"w": 4}) == ("record", {"w": 4})

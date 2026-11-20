@@ -1009,11 +1009,17 @@ try:
     app.addl_party_var.set(storage.display_with_inn(party_rec))
     app.root.update()
     check("№ 5" in app.addl_contract_var.get(), f"список договоров: {app.addl_contract_var.get()!r}")
+    _dec31 = "31.12." + str(datetime.now().year)
+    check(app.addl_valid_var.get() == _dec31,
+          f"2.18.0: «Действует до» по умолчанию — 31 декабря текущего года ({app.addl_valid_var.get()!r})")
     doc2 = app._doc_save_flow.render_additional_docx(data, is_ip=False, number="1",
-                                       limit_display="1 500 000", term="45")
+                                       limit_display="1 500 000", term="45",
+                                       valid_until="15.03.2027")
     additional_text = "\n".join(p.text for p in doc2.paragraphs)
     check("Ромашка" in additional_text and "№ 1" in additional_text,
           "печатная форма доп. соглашения сформирована")
+    check("«15» марта 2027" in additional_text,
+          "2.18.0: срок действия подставляется в пункт 5 печатной формы")
     check(len(doc2.tables) == 1, "печатная форма доп. соглашения: таблица подписей на месте")
 
     app._limit_var.set("1500000")
@@ -1024,9 +1030,14 @@ try:
     app._doc_page_flow.render_additional_preview()
     check("Ромашка" in app.addl_preview.get("1.0", "end"),
           "предпросмотр доп. соглашения: данные контрагента видны")
+    app.addl_valid_var.set("01.04.2027")  # пользователь изменил дату вручную
     app._doc_save_flow.save_additional()
     check(sum(1 for d in app.store.documents if d["kind"] == storage.KIND_ADDITIONAL) == 1,
           "доп. соглашение сохранено в реестре")
+    _saved_addl = next(d for d in app.store.documents if d["kind"] == storage.KIND_ADDITIONAL)
+    check(_saved_addl["extra"].get("valid_until") == "01.04.2027"
+          and _saved_addl["extra"].get("valid_until_iso") == "2027-04-01",
+          "2.18.0: срок действия сохранён в записи реестра")
 
     # Страница «Спецификация».
     app._select_page("spec")
@@ -1638,6 +1649,53 @@ try:
     check(updater.check_enabled() is False,
           "2.15: check_enabled() видит env-глушку smoke-прогона")
 
+    # 2.18.0: автообновление — скачивание (стаб), контроль SHA-256,
+    # подтверждение и запуск установщика; приложение закрывается штатно.
+    import updater_controller as _ucc
+    import threading as _threading
+    import hashlib as _hashlib
+    import queue as _queue
+    _inst_path = os.path.join(os.environ.get("TEMP", "/tmp"),
+                              "EW.DocHub-2.18.0-smoke-setup.exe")
+    with open(_inst_path, "wb") as _f:
+        _f.write(b"setup-payload")
+    _smoke_launch: list = []
+    _orig_run = _ucc.run_installer_command
+    _ucc.run_installer_command = lambda path: _smoke_launch.append(path)
+    _smoke_closed: list = []
+    _orig_after = app.root.after
+    app.root.after = lambda ms, fn: _smoke_closed.append((ms, fn.__name__))
+    _upd_flow = app._update_flow
+    _upd_flow.run_installer(_inst_path)
+    _ucc.run_installer_command = _orig_run
+    app.root.after = _orig_after
+    check(_smoke_launch == [_inst_path],
+          "2.18.0: установщик запускается после подтверждения")
+    check(bool(_smoke_closed) and _smoke_closed[0][1] == "close",
+          "2.18.0: приложение закрывается после запуска установки")
+
+    # 2.18.0: рабочий поток скачивания отдаёт done при корректной сумме.
+    import shutil as _shutil
+    _rel = {"installer_name": "EW.DocHub-2.18.0-smoke-setup.exe",
+            "sums_url": "https://github.com/x/SHA256SUMS.txt"}
+    _digest = _hashlib.sha256(b"setup-payload").hexdigest()
+    _q = _queue.Queue()
+    _orig_dl = updater.download_file
+    _orig_ft = updater.fetch_text
+    updater.download_file = lambda url, dest, **kw: _shutil.copy(_inst_path, dest)
+    updater.fetch_text = lambda url: f"{_digest}  {_rel['installer_name']}"
+    _upd_flow._download_worker(
+        _rel, "https://x/setup.exe", _threading.Event(), _q)
+    updater.download_file = _orig_dl
+    updater.fetch_text = _orig_ft
+    _kinds = []
+    while not _q.empty():
+        _kinds.append(_q.get_nowait())
+    check(any(item[0] == "done" for item in _kinds),
+          "2.18.0: скачивание и проверка SHA-256 завершаются успехом")
+    check(any(item[0] == "phase" for item in _kinds),
+          "2.18.0: после скачивания идёт фаза проверки целостности")
+
     # Реестр.
     app._select_page("registry")
     app.root.update()
@@ -1661,14 +1719,32 @@ try:
     registry_text = "\n".join(texts)
     check("ООО Ромашка" in registry_text, "реестр: контрагент виден")
 
-    # Документы в реестре появляются после выбора контрагента.
+    # 2.18.0: один клик — выделение, документы раскрываются двойным кликом.
     app._registry_flow.select_party(party_rec)
+    app.root.update()
+    check(app._registry_selected_id == party_rec["id"],
+          "2.18.0: клик по контрагенту выделяет строку")
+    texts = []
+    collect(app.registry_list)
+    registry_text = "\n".join(texts)
+    check("Договор поставки № 5" not in registry_text,
+          "2.18.0: документы не раскрываются одинарным кликом")
+    app._registry_flow.open_party_documents(party_rec)
     app.root.update()
     texts = []
     collect(app.registry_list)
     registry_text = "\n".join(texts)
     check("Договор поставки № 5" in registry_text, "реестр: договор виден")
     check("Доп. соглашение" in registry_text, "реестр: доп. соглашение видно")
+    check("действует до" in registry_text or "истекает" in registry_text or "истекло" in registry_text,
+          "2.18.0: в строке доп. соглашения виден срок действия")
+    _addl_rec = next(d for d in app.store.documents if d["kind"] == storage.KIND_ADDITIONAL)
+    app._registry_flow.select_document(_addl_rec)
+    app.root.update()
+    check(app._docs_selected_id == _addl_rec["id"],
+          "2.18.0: клик по документу выделяет его")
+    app._registry_flow.select_document(_addl_rec)
+    check(app._docs_selected_id is None, "2.18.0: повторный клик снимает выделение документа")
 
     # Поиск по ИНН в реестре.
     app._registry_flow.select_party(party_rec)  # снять выбор
@@ -1695,6 +1771,8 @@ try:
               for pid in _frames_before if pid in app._registry_rows),
           "5.1: выбор контрагента не пересоздаёт строки реестра")
     check(app._registry_selected_id == party_rec["id"], "5.1: выбор контрагента запомнен")
+    app._registry_flow.open_party_documents(party_rec)
+    app.root.update()
     _docs_texts = []
     for _child in app._registry_docs_frame.winfo_children():
         try:
@@ -1705,6 +1783,11 @@ try:
           "5.1: секция документов выбранного видна после частичного обновления")
     app._registry_flow.select_party(party_rec)  # снять выбор
     check(app._registry_selected_id is None, "5.1: повторный клик снимает выбор")
+    # 2.18.0: двойной клик распознаётся по времени между command-вызовами.
+    app._registry_flow.on_party_click(party_rec)
+    app._registry_flow.on_party_click(party_rec)
+    check(app._registry_expanded_id == party_rec["id"],
+          "2.18.0: два быстрых клика по строке раскрывают документы")
     app.store.counterparties.remove(_party_2)
     app._registry_flow.refresh()
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from docx import Document
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-from datetime import datetime
+from datetime import date, datetime
 import calendar
 import copy
 
@@ -44,6 +44,7 @@ class F:
     BIK = "БИК"
     LIMIT = "Лимит"
     TERM = "Отсрочка платежа"
+    VALID_UNTIL = "Действует до"
     DELIVERY_TERM = "Срок поставки"
     PAYMENT_TERMS = "Условия оплаты"
     DELIVERY_BASIS = "Базис поставки"
@@ -80,6 +81,9 @@ class PH:
     TERM = "{{term}}"
     TERM_WORDS = "{{term_in_words}}"
     AGREEMENT_NUMBER = "{{agreement_number}}"
+    VALID_DAY = "{{valid_day}}"
+    VALID_MONTH = "{{valid_month}}"
+    VALID_YEAR = "{{valid_year}}"
 
     # --- Спецификация (spec_template.docx) -------------------------------- #
     APPENDIX_NUMBER = "{{appendix_number}}"
@@ -507,6 +511,94 @@ def prices_valid_until_default() -> str:
     today = datetime.now()
     last_day = calendar.monthrange(today.year, today.month)[1]
     return f"{last_day:02d}.{today.month:02d}.{today.year} г."
+
+
+# --------------------------------------------------------------------------- #
+#  Срок действия доп. соглашения (2.18.0)
+# --------------------------------------------------------------------------- #
+VALID_UNTIL_FORMATS = (
+    "%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d-%m-%Y",
+    "%Y-%m-%d",  # ISO — так срок хранится в extra записи реестра
+)
+
+SOON_DAYS = 30  # предупреждение «истекает» за месяц до окончания срока
+
+
+def valid_until_default() -> str:
+    """«Действует до» по умолчанию — 31 декабря текущего года (п. 5 шаблона)."""
+    return f"31.12.{datetime.now().year}"
+
+
+def parse_valid_until(text: str) -> "date | None":
+    """Разбирает дату «действует до» в формате ДД.ММ.ГГГГ (и соседние).
+
+    Допустимы «31.12.2026», «31/12/2026», «31-12-2026», «31.12.26» и
+    пробелы вокруг. None — пустая/некорректная дата (например 32.13.2026).
+    """
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return None
+    for fmt in VALID_UNTIL_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def valid_until_iso(value) -> str:
+    """Дата (date или строка «31.12.2026»/«2026-12-31») → ISO «2026-12-31»."""
+    if isinstance(value, date):
+        return value.isoformat()
+    parsed = parse_valid_until(str(value or ""))
+    if parsed is None:
+        return ""
+    return parsed.isoformat()
+
+
+def valid_until_display(value) -> str:
+    """Дата (date/ISO) → пользовательский вид «31.12.2026»."""
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    parsed = parse_valid_until(str(value or ""))
+    if parsed is None:
+        return ""
+    return parsed.strftime("%d.%m.%Y")
+
+
+def valid_until_parts(value) -> tuple[str, str, str]:
+    """Дата (date/ISO/ДД.ММ.ГГГГ) → («31», «декабря», «2026») для п. 5 шаблона.
+
+    Неразобираемое значение даёт пустые строки — плейсхолдеры заменятся
+    на пропуск, а пользователь увидит недостающее поле в печатной форме.
+    """
+    parsed = value if isinstance(value, date) else parse_valid_until(str(value or ""))
+    if parsed is None:
+        return ("", "", "")
+    return (
+        f"«{parsed.day:02d}»",
+        MONTHS_GENITIVE[parsed.month - 1],
+        str(parsed.year),
+    )
+
+
+def agreement_expiry_state(value, today: "date | None" = None) -> "str | None":
+    """Состояние срока доп. соглашения: «expired» / «soon» / None.
+
+    ``soon`` — до окончания осталось меньше SOON_DAYS дней (месяц);
+    ``expired`` — срок уже прошёл; None — срок не указан или далеко.
+    Записи без даты (созданные до 2.18.0) не тревожат пользователя.
+    """
+    parsed = value if isinstance(value, date) else parse_valid_until(str(value or ""))
+    if parsed is None:
+        return None
+    current = date.today() if today is None else today
+    days_left = (parsed - current).days
+    if days_left < 0:
+        return "expired"
+    if days_left <= SOON_DAYS:
+        return "soon"
+    return None
 
 
 def mark_spec_final_page(doc):

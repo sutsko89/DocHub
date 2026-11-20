@@ -1,16 +1,18 @@
-"""Проверка обновлений — восьмой контроллер ContractApp (2.15.0).
+"""Проверка обновлений и автообновление — восьмой контроллер ContractApp.
 
-Владеет всей оркестрацией проверки обновлений:
+Владеет всей оркестрацией обновления приложения:
 
 * тихая автопроверка при старте (раз в сутки, если включена пользователем
   и не заглушена средой) — ``maybe_auto_check``, вызывается стартовым
   таймером ``after(2200, …)`` ContractApp;
 * ручная проверка кнопкой «Проверить обновления» на странице «Настройки»
   — ``check_now`` с guard повторных кликов и блокировкой кнопки;
-* диалог результата: «Доступна новая версия — открыть страницу релиза?»,
-  открытие страницы в браузере, честное «версия последняя» / ошибка сети
-  при ручной проверке; автопроверка молчит, если обновления нет или сеть
-  недоступна (пользователя не нужно тревожить неудавшейся фоновой задачей).
+* диалог результата (2.18.0): «Обновить сейчас» / «Открыть страницу» /
+  «Позже»; при выборе «Обновить сейчас» — окно скачивания с прогрессом
+  и отменой, контроль SHA-256 по SHA256SUMS.txt релиза, запуск
+  установщика Inno Setup в тихом режиме и закрытие приложения;
+* честное «версия последняя» / ошибка сети при ручной проверке;
+  автопроверка молчит, если обновления нет или сеть недоступна.
 
 Паттерн потоков — тот же, что у dadata_controller (аудит 2.0.1): HTTP в
 рабочем потоке, результат через ``queue.Queue``, опрос из главного потока
@@ -20,10 +22,12 @@ Tk; рабочий поток не трогает Tk и не вызывает ``
 
 Подменяемые маршруты (для smoke-теста и юнит-тестов):
 
-* ``updater.check_for_update`` — сетевая функция подменяется целиком;
+* ``updater.check_for_update`` / ``updater.download_file`` /
+  ``updater.fetch_text`` — сетевые функции подменяются целиком;
 * ``threading.Thread`` — общий модуль, синхронная подмена из smoke-теста
   действует и на этот контроллер;
 * ``webbrowser.open`` — открытие страницы релиза подменяется в тестах;
+* ``run_installer_command`` — модульная функция запуска setup.exe;
 * ``ui.alert`` / ``ui.confirm`` — атрибуты общего модуля ui_macos.
 
 Зависимость от main (APP_VERSION, подмена main.threading в smoke) берётся
@@ -32,23 +36,35 @@ Tk; рабочий поток не трогает Tk и не вызывает ``
 
 from __future__ import annotations
 
+import os
 import queue
+import subprocess
+import sys
 import threading
 import webbrowser
 from typing import Any
+
+import tkinter as tk
 
 import ui_macos as ui
 import updater
 
 
 class UpdateController:
-    """Жизненный цикл проверки обновлений: guard → HTTP → диалог."""
+    """Жизненный цикл обновления: guard → проверка → диалог → скачивание → установка."""
 
     def __init__(self, app: Any) -> None:
         self.app = app
         self.busy = False              # guard повторных проверок
         self.result_queue: "queue.Queue | None" = None
         self.result_after = None       # id таймера опроса для after_cancel
+        # Скачивание (2.18.0): своя очередь, окно прогресса и флаг отмены.
+        self.download_queue: "queue.Queue | None" = None
+        self.download_after = None
+        self.cancel_event: "threading.Event | None" = None
+        self.download_window = None
+        self._download_progress = None
+        self._download_status_var: "tk.StringVar | None" = None
 
     # ------------------------------------------------------------------ #
     #  Запуск проверки
@@ -180,20 +196,45 @@ class UpdateController:
             pass
 
     # ------------------------------------------------------------------ #
-    #  Диалог обновления и открытие страницы релиза
+    #  Диалог обновления: «Обновить сейчас» / страница / позже
     # ------------------------------------------------------------------ #
     def _show_update_dialog(self, release: dict) -> None:
         import main  # поздний импорт: APP_VERSION (см. докстринг класса)
 
         newest = str(release.get("version_str") or release.get("tag") or "")
-        open_now = ui.confirm(
-            self.app.root, "Доступна новая версия EW.DocHub",
-            f"Установлена версия: {main.APP_VERSION}\n"
-            f"Новая версия: {newest}\n\n"
-            "Открыть страницу релиза, чтобы скачать новый установщик?",
-            ok_text="Открыть страницу",
+        has_installer = bool(release.get("installer_url"))
+        if has_installer:
+            message = (
+                f"Установлена версия: {main.APP_VERSION}\n"
+                f"Новая версия: {newest}\n\n"
+                "«Обновить сейчас» скачает установщик, проверит его целостность "
+                "и запустит обновление — приложение закроется и запустится "
+                "уже новой версией. Реестр и настройки сохранятся."
+            )
+            options = [
+                ("later", "Позже", False),
+                ("page", "Открыть страницу", False),
+                ("install", "Обновить сейчас", True),
+            ]
+        else:
+            # Установщика в релизе нет — обновиться программой нельзя,
+            # остаётся страница релиза (CI мог ещё не выложить ассет).
+            message = (
+                f"Установлена версия: {main.APP_VERSION}\n"
+                f"Новая версия: {newest}\n\n"
+                "Установщик ещё не выложен в релиз — открыть страницу релиза, "
+                "чтобы скачать его вручную?"
+            )
+            options = [
+                ("later", "Позже", False),
+                ("page", "Открыть страницу", True),
+            ]
+        choice = self.app._choice_dialog(
+            "Доступна новая версия EW.DocHub", message, options,
         )
-        if open_now:
+        if choice == "install":
+            self.start_download(release)
+        elif choice == "page":
             self.open_release_page(release)
 
     def open_release_page(self, release: dict | None = None) -> None:
@@ -208,6 +249,235 @@ class UpdateController:
             )
 
     # ------------------------------------------------------------------ #
+    #  Скачивание и запуск установки (2.18.0)
+    # ------------------------------------------------------------------ #
+    def start_download(self, release: dict) -> None:
+        """Открывает окно прогресса и запускает рабочий поток скачивания.
+
+        Скачивается setup.exe релиза, затем SHA256SUMS.txt и сверяется
+        SHA-256; всё это в одном рабочем потоке, результат — через
+        очередь ``download_queue`` и опрос ``download_tick`` из Tk.
+        """
+        if self.download_queue is not None:
+            return  # скачивание уже идёт
+        url = str(release.get("installer_url") or "")
+        if not url:
+            self.open_release_page(release)
+            return
+        self.cancel_event = threading.Event()
+        self.download_queue = queue.Queue()
+        self._build_progress_window(release)
+        threading.Thread(
+            target=self._download_worker,
+            args=(release, url, self.cancel_event, self.download_queue),
+            daemon=True,
+        ).start()
+        self.download_after = self.app.root.after(80, self.download_tick)
+
+    def _build_progress_window(self, release: dict) -> None:
+        """Модальное окно скачивания: заголовок, прогресс, отмена."""
+        import customtkinter as ctk
+
+        app = self.app
+        newest = str(release.get("version_str") or release.get("tag") or "")
+        win = ctk.CTkToplevel(app.root)
+        win.title("Обновление EW.DocHub")
+        win.configure(fg_color=ui.COLORS["window"])
+        win.transient(app.root)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self.cancel_download)
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(fill="both", expand=True,
+                  padx=int(24 * app.scale), pady=int(20 * app.scale))
+        ctk.CTkLabel(
+            body, text=f"Скачивание обновления {newest}",
+            font=ui.font(15, "bold", display=True),
+            text_color=ui.COLORS["text"], anchor="w",
+        ).pack(anchor="w")
+        self._download_status_var = tk.StringVar(
+            value="Подключение к github.com…")
+        ctk.CTkLabel(
+            body, textvariable=self._download_status_var,
+            font=ui.font(12), text_color=ui.COLORS["text_secondary"],
+            anchor="w", justify="left", wraplength=int(380 * app.scale),
+        ).pack(anchor="w", pady=(int(8 * app.scale), int(12 * app.scale)))
+        self._download_progress = ctk.CTkProgressBar(
+            body, width=int(380 * app.scale),
+            progress_color=ui.COLORS["accent"],
+        )
+        self._download_progress.pack(fill="x")
+        self._download_progress.set(0.0)
+        ctk.CTkButton(
+            body, text="Отмена", command=self.cancel_download,
+            width=int(120 * app.scale), height=int(30 * app.scale),
+            fg_color=ui.COLORS["card"], hover_color=ui.COLORS["button_secondary_hover"],
+            border_width=1, border_color=ui.COLORS["card_border"],
+            text_color=ui.COLORS["text"],
+        ).pack(anchor="e", pady=(int(14 * app.scale), 0))
+        self.download_window = win
+
+    def _download_worker(self, release: dict, url: str,
+                         cancel_event: "threading.Event",
+                         result_queue: "queue.Queue") -> None:
+        """Рабочий поток: скачивание установщика + проверка SHA-256.
+
+        Никаких вызовов Tk; ошибки сети/проверки складываются в очередь
+        как ("error", …), успех — как ("done", путь). Отмена —
+        ("cancelled", …).
+        """
+        import tempfile
+
+        filename = str(release.get("installer_name") or "EW.DocHub-setup.exe")
+        dest_dir = os.path.join(tempfile.gettempdir(), "EW.DocHub-update")
+        dest_path = os.path.join(dest_dir, filename)
+        try:
+            def progress(done: int, total: int) -> None:
+                result_queue.put(("progress", done, total))
+
+            updater.download_file(
+                url, dest_path, progress_cb=progress, cancel_event=cancel_event,
+            )
+            result_queue.put(("phase", "Проверка целостности файла…"))
+            sums_url = str(release.get("sums_url") or "")
+            expected = ""
+            if sums_url:
+                expected = updater.match_sums_line(
+                    updater.fetch_text(sums_url), filename)
+            if not expected:
+                result_queue.put(("error",
+                    "Не удалось получить контрольную сумму релиза "
+                    "(SHA256SUMS.txt) — проверка целостности невозможна."))
+                return
+            if not updater.verify_sha256(dest_path, expected):
+                try:
+                    os.remove(dest_path)
+                except OSError:
+                    pass
+                result_queue.put(("error",
+                    "Скачанный файл не прошёл проверку целостности "
+                    "(SHA-256 не совпал). Файл удалён — повторите обновление "
+                    "позже или скачайте установщик со страницы релиза."))
+                return
+            result_queue.put(("done", dest_path))
+        except updater.DownloadCancelled:
+            result_queue.put(("cancelled", None))
+        except Exception as exc:  # сеть/диск: пользовательская ошибка
+            result_queue.put(("error", updater.human_error(exc)))
+
+    def download_tick(self) -> None:
+        """Опрашивает очередь скачивания из главного потока Tk."""
+        result_queue = self.download_queue
+        if result_queue is None:
+            return
+        try:
+            item = result_queue.get_nowait()
+        except queue.Empty:
+            try:
+                self.download_after = self.app.root.after(80, self.download_tick)
+            except Exception:
+                pass  # окно закрывается — цикл прервётся вместе с ним
+            return
+        except (RuntimeError, AttributeError):
+            return
+        kind = item[0]
+        if kind == "progress":
+            self._show_progress(item[1], item[2])
+            return  # очередь продолжает опрашиваться
+        self.download_queue = None
+        self._close_progress_window()
+        if kind == "done":
+            self._confirm_install(item[1])
+        elif kind == "cancelled":
+            pass  # окно закрыто — ничего не делаем
+        elif kind == "phase":
+            # Промежуточная фаза (проверка суммы) — окно нужно вернуть.
+            self.download_queue = result_queue
+            if self.download_window is not None and self.download_window.winfo_exists():
+                self._download_status_var.set(item[1])
+            self.download_after = self.app.root.after(80, self.download_tick)
+        else:
+            ui.alert(
+                self.app.root, "Обновление не удалось",
+                str(item[1] or "Неизвестная ошибка скачивания.")
+                + "\n\nСтраницу релизов можно открыть вручную:\n"
+                + updater.PAGE_URL,
+                "error",
+            )
+
+    def _show_progress(self, done: int, total: int) -> None:
+        """Обновляет полосу и статус скачивания."""
+        if self._download_progress is None:
+            return
+        try:
+            if total > 0:
+                self._download_progress.set(min(1.0, done / total))
+                mb_done = done / (1024 * 1024)
+                mb_total = total / (1024 * 1024)
+                if mb_total >= 1:
+                    text = (f"{mb_done:.1f} МБ из {mb_total:.1f} МБ")
+                else:
+                    text = f"{done / 1024:.0f} КБ из {total / 1024:.0f} КБ"
+            else:
+                self._download_progress.set(0.0)
+                text = f"Скачано: {done / (1024 * 1024):.1f} МБ"
+            self._download_status_var.set(text)
+        except Exception:
+            pass  # окно уже закрыто
+
+    def _close_progress_window(self) -> None:
+        """Закрывает окно прогресса (если оно живо)."""
+        window = self.download_window
+        self.download_window = None
+        if window is None:
+            return
+        try:
+            if window.winfo_exists():
+                window.destroy()
+        except Exception:
+            pass
+
+    def cancel_download(self) -> None:
+        """Кнопка «Отмена»: останавливает рабочий поток и закрывает окно."""
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+        self.download_queue = None
+        self._close_progress_window()
+
+    def _confirm_install(self, path: str) -> None:
+        """Финальное подтверждение: закрыть программу и запустить установщик."""
+        proceed = ui.confirm(
+            self.app.root, "Обновление скачано",
+            "Установщик проверен и готов к запуску.\n\n"
+            "EW.DocHub закроется, установится новая версия и запустится "
+            "автоматически. Реестр, настройки и ключ DaData сохранятся.\n\n"
+            "Запустить установку сейчас?",
+            ok_text="Обновить",
+        )
+        if proceed:
+            self.run_installer(path)
+
+    def run_installer(self, path: str) -> None:
+        """Запускает setup.exe в тихом режиме и закрывает приложение.
+
+        Inno Setup с /VERYSILENT ставит обновление в ту же папку без
+        вопросов (профиль в %APPDATA% не трогается), /NORESTART отменяет
+        перезагрузку. Программа закрывается сразу после запуска — так
+        установщик не встречает занятые файлы.
+        """
+        try:
+            run_installer_command(path)
+        except Exception as exc:
+            ui.alert(
+                self.app.root, "Не удалось запустить установщик",
+                f"{exc}\n\nУстановщик сохранён здесь:\n{path}",
+                "error",
+            )
+            return
+        # Небольшая задержка: установщик стартует, затем приложение
+        # закрывается штатно (очистки, сохранение настроек).
+        self.app.root.after(500, self.app.close)
+
+    # ------------------------------------------------------------------ #
     #  Текст статуса для страницы «Настройки»
     # ------------------------------------------------------------------ #
     def status_text(self) -> str:
@@ -215,3 +485,29 @@ class UpdateController:
         import main
 
         return f"Установлена версия {main.APP_VERSION}"
+
+
+def run_installer_command(path: str) -> None:
+    """Стартует установщик Inno Setup в тихом режиме (модульная для тестов).
+
+    /VERYSILENT — без вопросов (обновление в ту же папку, профиль в
+    %APPDATA% не трогается); /NORESTART — без перезагрузки;
+    /SUPPRESSMSGBOXES и /FORCECLOSEAPPLICATIONS — тихо закрывают
+    запущенную программу, если она не успела выйти (все данные
+    сохраняются сразу при изменениях, риск минимальный); после установки
+    приложение перезапускается само ([Run] skipifnotsilent). На других ОС
+    функция не запускается (обновление — Windows-сценарий).
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Установщик не найден: {path}")
+    if not sys.platform.startswith("win"):
+        raise OSError("Автообновление доступно только в Windows.")
+    # creationflags: DETACHED_PROCESS — установщик живёт после закрытия
+    # приложения; без консольного окна.
+    detached = getattr(subprocess, "DETACHED_PROCESS", 0)
+    subprocess.Popen(
+        [path, "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES",
+         "/FORCECLOSEAPPLICATIONS"],
+        close_fds=True,
+        creationflags=detached,
+    )

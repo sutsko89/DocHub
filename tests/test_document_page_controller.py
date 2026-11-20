@@ -161,6 +161,7 @@ class FakeApp:
         self.term_var = FakeVar("")
         self.term_entry = FakeEntry()
         self.words_label = FakeLabel()
+        self.addl_valid_var = FakeVar("31.12.2026")
         self._preview_additional_after = None
 
         # Что вернут разборчики комбобоксов (настраивается тестом).
@@ -194,9 +195,11 @@ class FakeApp:
         doc.add_paragraph(f"Договор для {data.get(F.SHORT_NAME, '?')}, № {data.get(F.NUMBER, '')}")
         return doc
 
-    def _render_additional_docx(self, data, is_ip, number, limit_display, term):
+    def _render_additional_docx(self, data, is_ip, number, limit_display, term,
+                                valid_until=""):
         self.calls.append(
-            ("render_additional_docx", dict(data), is_ip, number, limit_display, term))
+            ("render_additional_docx", dict(data), is_ip, number, limit_display,
+             term, valid_until))
         doc = Document()
         doc.add_paragraph(f"Доп. соглашение № {number}, лимит {limit_display}, срок {term}")
         return doc
@@ -353,11 +356,14 @@ def test_render_additional_preview_uses_contract_data(app, flow, store, ooo_fiel
     app.addl_number_var.set("1")
     app._limit_var.set("1 500 000")
     app.term_var.set("45")
+    app.addl_valid_var.set("31.12.2026")
     flow.render_additional_preview()
 
     render_calls = [c for c in app.calls if c[0] == "render_additional_docx"]
     assert len(render_calls) == 1
-    _name, data, is_ip, number, limit_display, term = render_calls[0]
+    _name, data, is_ip, number, limit_display, term, valid_until = render_calls[0]
+    assert valid_until == "31.12.2026", (
+        "2.18.0: срок действия передаётся в печатную форму")
     # Данные берутся из сохранённого договора (копия на момент создания).
     assert data[F.SHORT_NAME] == ooo_fields[F.SHORT_NAME]
     assert is_ip is False
@@ -372,7 +378,7 @@ def test_render_additional_preview_error_is_honest(app, flow, store, ooo_fields)
     app.party_for_var = rec
     app.contract_for_var = seed_contract(store, rec["id"], ooo_fields)
 
-    def broken(data, is_ip, number, limit_display, term):
+    def broken(data, is_ip, number, limit_display, term, valid_until=""):
         raise RuntimeError("шаблон недоступен")
 
     app._doc_save_flow.render_additional_docx = broken

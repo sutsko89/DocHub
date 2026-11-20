@@ -84,6 +84,7 @@ class FakeApp:
         self.addl_number_var = FakeVar("")
         self._limit_var = FakeVar("")
         self.term_var = FakeVar("")
+        self.addl_valid_var = FakeVar("31.12.2026")
         self.addl_contract_var = FakeVar("")
         self.addl_contract_info_var = FakeVar("")
         self.spec_contract_var = FakeVar("")
@@ -365,7 +366,9 @@ def test_form_signature_additional(app, flow):
     app.addl_number_var.set("1")
     app._limit_var.set("1 500 000")
     app.term_var.set("45")
-    assert flow.form_signature("additional") == ("1", "1 500 000", "45")
+    assert flow.form_signature("additional") == (
+        "1", "1 500 000", "45", "31.12.2026"), (
+        "2.18.0: в подпись формы входит срок действия доп. соглашения")
 
 
 def test_form_signature_spec_includes_items(app, flow):

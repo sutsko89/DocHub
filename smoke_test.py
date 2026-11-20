@@ -1725,7 +1725,7 @@ try:
     registry_text = "\n".join(texts)
     check("ООО Ромашка" in registry_text, "реестр: контрагент виден")
 
-    # 2.18.0: один клик — выделение, документы раскрываются двойным кликом.
+    # 2.19.0: один клик — выделение, двойной клик проваливается в документы.
     app._registry_flow.select_party(party_rec)
     app.root.update()
     check(app._registry_selected_id == party_rec["id"],
@@ -1737,6 +1737,8 @@ try:
           "2.18.0: документы не раскрываются одинарным кликом")
     app._registry_flow.open_party_documents(party_rec)
     app.root.update()
+    check(app._registry_drill_party_id == party_rec["id"],
+          "2.19.0: двойной клик проваливается в документы контрагента")
     texts = []
     collect(app.registry_list)
     registry_text = "\n".join(texts)
@@ -1744,6 +1746,9 @@ try:
     check("Доп. соглашение" in registry_text, "реестр: доп. соглашение видно")
     check("действует до" in registry_text or "истекает" in registry_text or "истекло" in registry_text,
           "2.18.0: в строке доп. соглашения виден срок действия")
+    check("ООО Ромашка   ·" in registry_text or "ООО Ромашка ·" in registry_text
+          or "ИП" in registry_text or "Юр. лицо" in registry_text,
+          "2.19.0: в виде документов видна подстрока контрагента")
     _addl_rec = next(d for d in app.store.documents if d["kind"] == storage.KIND_ADDITIONAL)
     app._registry_flow.select_document(_addl_rec)
     app.root.update()
@@ -1751,6 +1756,17 @@ try:
           "2.18.0: клик по документу выделяет его")
     app._registry_flow.select_document(_addl_rec)
     check(app._docs_selected_id is None, "2.18.0: повторный клик снимает выделение документа")
+
+    # 2.19.0: кнопка «← Назад» возвращает к списку контрагентов.
+    app._registry_flow.back_to_parties()
+    app.root.update()
+    check(app._registry_drill_party_id is None,
+          "2.19.0: «Назад» возвращает к списку контрагентов")
+    texts = []
+    collect(app.registry_list)
+    registry_text = "\n".join(texts)
+    check("ООО Ромашка" in registry_text and "Договор поставки № 5" not in registry_text,
+          "2.19.0: после возврата видны контрагенты, а не документы")
 
     # Поиск по ИНН в реестре.
     app._registry_flow.select_party(party_rec)  # снять выбор
@@ -1779,21 +1795,20 @@ try:
     check(app._registry_selected_id == party_rec["id"], "5.1: выбор контрагента запомнен")
     app._registry_flow.open_party_documents(party_rec)
     app.root.update()
-    _docs_texts = []
-    for _child in app._registry_docs_frame.winfo_children():
-        try:
-            _docs_texts.append(_child.cget("text"))
-        except Exception:
-            pass
-    check(any("Документы" in str(_t) for _t in _docs_texts),
-          "5.1: секция документов выбранного видна после частичного обновления")
+    texts = []
+    collect(app.registry_list)
+    check(any("Документы" in str(_t) for _t in texts),
+          "2.19.0: вид документов открыт после частичного обновления списка")
+    app._registry_flow.back_to_parties()
+    app.root.update()
     app._registry_flow.select_party(party_rec)  # снять выбор
     check(app._registry_selected_id is None, "5.1: повторный клик снимает выбор")
-    # 2.18.0: двойной клик распознаётся по времени между command-вызовами.
+    # 2.19.0: двойной клик распознаётся по времени между command-вызовами.
     app._registry_flow.on_party_click(party_rec)
     app._registry_flow.on_party_click(party_rec)
-    check(app._registry_expanded_id == party_rec["id"],
-          "2.18.0: два быстрых клика по строке раскрывают документы")
+    check(app._registry_drill_party_id == party_rec["id"],
+          "2.19.0: два быстрых клика по строке проваливаются в документы")
+    app._registry_flow.back_to_parties()
     app.store.counterparties.remove(_party_2)
     app._registry_flow.refresh()
 

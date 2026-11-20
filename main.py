@@ -86,7 +86,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.18.0"
+APP_VERSION = "2.19.0"
 
 # Уведомление о сроках доп. соглашений (2.18.0): раз в сутки, ключ
 # settings.json — как у автопроверки обновлений (updater.SETTINGS_KEY_TS).
@@ -736,6 +736,12 @@ class ContractApp:
             self.root.update_idletasks()
 
     def _on_escape(self, _event=None):
+        # 2.19.0: Escape в проваливании реестра возвращает к контрагентам —
+        # как кнопка «← Назад» в шапке страницы.
+        if (self.current_page == "registry"
+                and getattr(self, "_registry_drill_party_id", None) is not None):
+            self._registry_flow.back_to_parties()
+            return None
         if self._fullscreen:
             self.toggle_fullscreen()
         return None
@@ -1457,7 +1463,7 @@ class ContractApp:
         for nav_key, item in self.nav_items.items():
             item.set_selected(nav_key == key)
         if key == "registry":
-            self._registry_flow.refresh()
+            self._registry_flow.on_page_open()
         self.root.after(60, self._refresh_scrollbars)
 
     # ------------------------------------------------------------------ #

@@ -71,10 +71,8 @@ class FakeApp:
         self.pages: dict = {}
         self._registry_selected_id = None
         self._registry_rows: dict = {}
-        self._registry_docs_row = 1
-        self._registry_docs_frame = None
-        # 2.18.0: раскрытый контрагент, выделенный документ, времена кликов.
-        self._registry_expanded_id = None
+        # 2.19.0: проваливание в контрагента, выделенный документ, времена кликов.
+        self._registry_drill_party_id = None
         self._docs_selected_id = None
         self._docs_rows: dict = {}
         self._registry_last_click_id = None
@@ -102,6 +100,8 @@ class FakeApp:
                 ("delete_doc", rec.get("id"))),
             delete_counterparty=lambda rec: self.calls.append(
                 ("delete_party", rec.get("id"))),
+            export_document=lambda rec: self.calls.append(
+                ("open_word", rec.get("id"))),
         )
 
     def _update_status(self):
@@ -400,19 +400,19 @@ def test_reconcile_dialog_skip_choice_does_nothing(app, flow, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-#  Взаимодействие 2.18.0: выделение, двойной клик, Delete, сроки
+#  Взаимодействие 2.19.0: выделение, двойной клик, проваливание, Delete, сроки
 # --------------------------------------------------------------------------- #
-def test_on_party_click_selects_then_double_click_opens(app, flow):
+def test_on_party_click_selects_then_double_click_drills(app, flow):
     rec = make_party()
 
     flow.on_party_click(rec)
     assert app._registry_selected_id == rec["id"], "первый клик — выделение"
-    assert app._registry_expanded_id is None, "документы ещё не раскрыты"
+    assert app._registry_drill_party_id is None, "ещё не провалились"
 
-    # Второй клик в пределах окна двойного клика — раскрытие документов.
+    # Второй клик в пределах окна двойного клика — проваливание в документы.
     flow.on_party_click(rec)
     assert app._registry_selected_id == rec["id"]
-    assert app._registry_expanded_id == rec["id"], "двойной клик раскрывает документы"
+    assert app._registry_drill_party_id == rec["id"], "двойной клик открывает документы"
 
 
 def test_on_party_click_second_click_on_other_party(app, flow):
@@ -424,7 +424,7 @@ def test_on_party_click_second_click_on_other_party(app, flow):
     flow.on_party_click(rec_b)
 
     assert app._registry_selected_id == rec_b["id"]
-    assert app._registry_expanded_id is None, "двойной клик по разным строкам не сработал"
+    assert app._registry_drill_party_id is None, "двойной клик по разным строкам не сработал"
 
 
 def test_on_party_click_after_timeout_is_single_click(app, flow):
@@ -438,25 +438,60 @@ def test_on_party_click_after_timeout_is_single_click(app, flow):
     assert app._registry_selected_id is None, "это снятие выделения, не двойной клик"
 
 
-def test_open_party_documents_toggles_expansion(app, flow):
+def test_open_party_documents_drills_down_and_back(app, flow):
     rec = make_party()
 
     flow.open_party_documents(rec)
-    assert app._registry_expanded_id == rec["id"]
-    assert app._registry_selected_id == rec["id"], "раскрытие также выделяет строку"
+    assert app._registry_drill_party_id == rec["id"], "проваливание в документы"
+    assert app._registry_selected_id == rec["id"], "проваливание выделяет строку"
 
-    flow.open_party_documents(rec)
-    assert app._registry_expanded_id is None, "повторный двойной клик сворачивает"
+    flow.back_to_parties()
+    assert app._registry_drill_party_id is None, "«Назад» возвращает к контрагентам"
+    assert app._docs_selected_id is None, "выделенный документ сброшен"
 
 
-def test_select_other_party_collapses_expanded(app, flow):
+def test_select_other_party_does_not_break_drill(app, flow):
     rec_a = make_party(short="ООО А")
     rec_b = make_party(short="ООО Б")
-    app._registry_expanded_id = rec_a["id"]
+    app._registry_drill_party_id = rec_a["id"]
 
     flow.select_party(rec_b)
 
-    assert app._registry_expanded_id is None, "раскрыта секция только одного контрагента"
+    assert app._registry_drill_party_id == rec_a["id"], \
+        "выделение другого контрагента не меняет текущий вид"
+
+
+def test_on_doc_click_double_click_opens_word(app, flow):
+    doc = {"id": 42, "kind": storage.KIND_CONTRACT, "number": "5",
+           "date": "01.10.2026", "extra": {}}
+
+    flow.on_doc_click(doc)
+    assert app._docs_selected_id == 42, "первый клик — выделение"
+    assert ("open_word", 42) not in app.calls
+
+    flow.on_doc_click(doc)
+    assert ("open_word", 42) in app.calls, "двойной клик открывает документ в Word"
+
+
+def test_on_page_open_resets_drill(app, flow):
+    rec = make_party()
+    flow.open_party_documents(rec)
+    assert app._registry_drill_party_id == rec["id"]
+
+    flow.on_page_open()
+
+    assert app._registry_drill_party_id is None, \
+        "возврат на страницу реестра показывает список контрагентов"
+
+
+def test_delete_selected_in_drill_mode_ignores_party(store, app, flow):
+    party = store.add_counterparty("ooo", {"Сокращенное название компании": "ООО А"})
+    flow.open_party_documents({"id": party["id"]})
+    app._docs_selected_id = None
+
+    assert flow.delete_selected() is False, \
+        "внутри документов Delete не удаляет контрагента"
+    assert not any(call[0] == "delete_party" for call in app.calls)
 
 
 def test_select_document_toggles(app, flow):
@@ -480,6 +515,15 @@ def test_delete_selected_prefers_document(store, app, flow):
     assert ("delete_doc", doc["id"]) in app.calls
     assert not any(call[0] == "delete_party" for call in app.calls), \
         "документ приоритетнее контрагента"
+
+
+def test_delete_selected_document_also_in_drill_mode(store, app, flow):
+    doc = store.add_document(storage.KIND_CONTRACT, None, "7", "02.10.2026", {})
+    flow.open_party_documents({"id": "p-1"})
+    app._docs_selected_id = doc["id"]
+
+    assert flow.delete_selected() is True, "в проваливании Delete удаляет выделенный документ"
+    assert ("delete_doc", doc["id"]) in app.calls
 
 
 def test_delete_selected_party_when_no_document(store, app, flow):

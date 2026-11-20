@@ -6,26 +6,32 @@
 «документы контрагента», «неопознанные» и «корзина», сверка реестра с папкой
 документов и диалог разбора файлов вне реестра (п. 2.4).
 
-Модель взаимодействия (2.18.0, отзыв пользователя):
+Модель взаимодействия (2.19.0, отзыв пользователя — «проваливание»):
 
 * один клик по контрагенту/документу только выделяет строку — у
   выделенной строки появляются кнопки действий («Редактировать»,
   «Удалить» / «Открыть Word», «Удалить»), повторный клик снимает
   выделение; клавиша Delete удаляет выделенную запись (delete_selected);
-* двойной клик по контрагенту раскрывает/сворачивает список его
-  документов, двойной клик по документу открывает его в Word.
-  CTk-кнопка не отдаёт <Double-Button-1> (текст рисуется на внутреннем
-  виджете поверх канвы), поэтому двойной клик распознаётся по времени
-  между двумя command-вызовами (DOUBLE_CLICK_MS).
+* двойной клик по контрагенту проваливается в его документы: страница
+  переключается на отдельный вид — заголовок «Документы — <имя>»,
+  список его документов и кнопка «← Назад» в шапке (и клавиша Escape)
+  возвращают к списку контрагентов. CTk-кнопка не отдаёт
+  <Double-Button-1> (текст рисуется на внутреннем виджете поверх канвы),
+  поэтому двойной клик распознаётся по времени между двумя command-вызовами
+  (DOUBLE_CLICK_MS);
+* двойной клик по документу открывает его в Word; Delete внутри вида
+  документов удаляет только выделенный документ — контрагент удаляется
+  только из списка контрагентов.
 
 Состояние страницы остаётся на приложении с прежними именами
 (``registry_search_var``, ``registry_list``, ``_registry_selected_id``,
-``_registry_rows``, ``_registry_docs_frame``, ``_registry_rendered``,
-``_orphans`` …): его читают и меняют другие страницы, сценарии сохранения
-и smoke-тест — контроллер владеет кодом, а не данными страницы. Новые
-поля 2.18.0: ``_registry_expanded_id`` (раскрытые документы),
-``_docs_selected_id`` (выделенный документ), ``_registry_rows[id]`` теперь
-хранит и кнопки действий строки.
+``_registry_rows``, ``_registry_rendered``, ``_orphans`` …): его читают и
+меняют другие страницы, сценарии сохранения и smoke-тест — контроллер
+владеет кодом, а не данными страницы. Поля 2.19.0:
+``_registry_drill_party_id`` (контрагент, в документы которого провалились),
+``_registry_title_label`` / ``_registry_hint_label`` / ``_registry_back_btn``
+(шапка вида), ``_docs_selected_id`` (выделенный документ),
+``_registry_rows[id]`` хранит и кнопки действий строки.
 
 Вызовы, которые подменяет smoke-тест, всегда идут через ``self.app.*``:
 ``_choice_dialog`` подменяется как instance-атрибут, кнопки действий
@@ -69,6 +75,11 @@ class RegistryController:
     def __init__(self, app: Any) -> None:
         self.app = app
 
+    @property
+    def is_drill_mode(self) -> bool:
+        """True, пока открыт вид «Документы контрагента» (проваливание)."""
+        return getattr(self.app, "_registry_drill_party_id", None) is not None
+
     # ------------------------------------------------------------------ #
     #  Построение страницы
     # ------------------------------------------------------------------ #
@@ -80,12 +91,22 @@ class RegistryController:
 
         header = ctk.CTkFrame(page, fg_color="transparent")
         header.pack(fill="x", padx=int(24 * app.scale), pady=(int(18 * app.scale), int(6 * app.scale)))
+        app._registry_header = header
         title_row = ctk.CTkFrame(header, fg_color="transparent")
         title_row.pack(fill="x")
-        ctk.CTkLabel(
+        app._registry_title_label = ctk.CTkLabel(
             title_row, text="Реестр", font=ui.font(20, "bold", display=True),
             text_color=ui.COLORS["text"], anchor="w", height=26,
-        ).pack(side="left")
+        )
+        app._registry_title_label.pack(side="left")
+        # 2.19.0: выход из вида документов контрагента; показывается только
+        # в режиме проваливания (_update_header_mode).
+        app._registry_back_btn = ui.ghost_button(
+            title_row, "← Назад", app._registry_flow.back_to_parties,
+            width=int(110 * app.scale), height=int(28 * app.scale),
+        )
+        app._registry_back_btn.pack(side="left", padx=(int(14 * app.scale), 0))
+        app._registry_back_btn.pack_forget()
         ui.ghost_button(
             title_row, "Обновить", app._registry_flow.refresh,
             width=int(110 * app.scale), height=int(28 * app.scale),
@@ -94,14 +115,16 @@ class RegistryController:
             title_row, "Добавить документы…", app._import_documents_dialog,
             width=int(180 * app.scale), height=int(28 * app.scale),
         ).pack(side="right", padx=(0, int(8 * app.scale)))
-        ctk.CTkLabel(
+        app._registry_hint_label = ctk.CTkLabel(
             header,
             text="Клик — выделить контрагента (Редактировать/Удалить, клавиша Delete). "
-                 "Двойной клик — раскрыть его документы.",
+                 "Двойной клик — открыть его документы.",
             font=ui.font(12), text_color=ui.COLORS["text_secondary"], anchor="w", height=16,
-        ).pack(anchor="w", pady=(int(2 * app.scale), 0))
+        )
+        app._registry_hint_label.pack(anchor="w", pady=(int(2 * app.scale), 0))
 
         search_bar = ctk.CTkFrame(page, fg_color="transparent")
+        app._registry_search_bar = search_bar
         search_bar.pack(fill="x", padx=int(24 * app.scale), pady=(0, int(8 * app.scale)))
         app.registry_search_var = tk.StringVar()
         # Поиск идёт и по названию, и по ИНН, с фильтрацией по мере ввода (п. 4.5).
@@ -131,10 +154,9 @@ class RegistryController:
 
         app._registry_selected_id = None
         app._registry_rows = {}
-        app._registry_docs_row = 1
-        app._registry_docs_frame = None
-        # 2.18.0: раскрытый контрагент (двойной клик) и выделенный документ.
-        app._registry_expanded_id = None
+        # 2.19.0: проваливание в контрагента (двойной клик) и выделенный
+        # документ внутри вида «Документы контрагента».
+        app._registry_drill_party_id = None
         app._docs_selected_id = None
         app._docs_rows = {}
         # Времена последних кликов для распознавания двойного клика.
@@ -147,7 +169,7 @@ class RegistryController:
         app._registry_rendered = False
 
     # ------------------------------------------------------------------ #
-    #  Реестр: список контрагентов и документы раскрытого --------------- #
+    #  Список контрагентов, проваливание, секции реестра ----------------- #
     # ------------------------------------------------------------------ #
     def parties(self) -> list[dict]:
         """Активные контрагенты с учётом поиска по названию и ИНН (подстрока)."""
@@ -172,6 +194,17 @@ class RegistryController:
             return bool(query) and query in haystack
 
         return [rec for rec in parties if matches(rec)]
+
+    def on_page_open(self):
+        """Открытие страницы «Реестр» из меню: список контрагентов с начала.
+
+        Проваливание — режим просмотра, он не переживает уход со страницы:
+        вернулись в реестр — снова виден список контрагентов (2.19.0).
+        """
+        if self.is_drill_mode:
+            self.back_to_parties()
+            return
+        self.refresh()
 
     def on_search_changed(self, *_args):
         """Фильтрует реестр по мере ввода с небольшой задержкой."""
@@ -233,8 +266,8 @@ class RegistryController:
         """Клик по контрагенту: выделить строку (повторный клик снимает).
 
         Частичное обновление (п. 5.1): строки контрагентов не пересоздаются,
-        у выделенной появляются кнопки действий, секция документов
-        перерисовывается только если её нужно свернуть (раскрывали другого).
+        у выделенной появляются кнопки действий. Проваливание остаётся
+        прежним: выделение не влияет на текущий вид (2.19.0).
         """
         app = self.app
         if app._registry_selected_id == rec.get("id"):
@@ -243,11 +276,6 @@ class RegistryController:
             app._registry_selected_id = rec.get("id")
             # Выбор из реестра переносится на страницы документов (п. 4.2).
             app._doc_context_flow.set_current_party(rec)
-        # Документы раскрыты у другого — сворачиваем: раскрытая секция
-        # показывает документы только «активного» контрагента.
-        if (app._registry_expanded_id is not None
-                and app._registry_expanded_id != app._registry_selected_id):
-            app._registry_expanded_id = None
         app._docs_selected_id = None
         if not app._registry_rows:
             # Страница ещё не отрисована (ленивый рендер) — рисуем целиком.
@@ -256,18 +284,24 @@ class RegistryController:
         self.refresh_selection()
 
     def open_party_documents(self, rec: dict):
-        """Двойной клик по контрагенту: раскрыть/свернуть его документы."""
+        """Двойной клик по контрагенту: провалиться в его документы (2.19.0).
+
+        Страница переключается на вид «Документы — <имя>»: список документов
+        контрагента, кнопка «← Назад» в шапке возвращает к контрагентам.
+        """
         app = self.app
         app._registry_selected_id = rec.get("id")
         app._doc_context_flow.set_current_party(rec)
         app._docs_selected_id = None
-        app._registry_expanded_id = (
-            None if app._registry_expanded_id == rec.get("id") else rec.get("id")
-        )
-        if not app._registry_rows:
-            self.refresh()
-            return
-        self.refresh_selection()
+        app._registry_drill_party_id = rec.get("id")
+        self.refresh()
+
+    def back_to_parties(self):
+        """Кнопка «← Назад» (или Escape): вернуться к списку контрагентов."""
+        app = self.app
+        app._registry_drill_party_id = None
+        app._docs_selected_id = None
+        self.refresh()
 
     def select_document(self, rec: dict):
         """Клик по документу: выделить строку (повторный клик снимает)."""
@@ -276,7 +310,8 @@ class RegistryController:
             app._docs_selected_id = None
         else:
             app._docs_selected_id = rec.get("id")
-        if not app._registry_rows:
+        if not app._docs_rows:
+            # Вид документов ещё не отрисован — рисуем целиком.
             self.refresh()
             return
         self.refresh_selection()
@@ -288,6 +323,10 @@ class RegistryController:
         и контрагент, удаляется документ. Возвращает True, если удаление
         инициировано (диалог подтверждения — в контроллере жизненного
         цикла).
+
+        Внутри вида «Документы контрагента» (проваливание, 2.19.0) Delete
+        удаляет только выделенный документ — контрагент нельзя удалить
+        случайно из его списка документов.
         """
         app = self.app
         doc_id = getattr(app, "_docs_selected_id", None)
@@ -296,6 +335,8 @@ class RegistryController:
             if rec is not None:
                 app._lifecycle_flow.delete_document(rec)
                 return True
+        if self.is_drill_mode:
+            return False
         party_id = getattr(app, "_registry_selected_id", None)
         if party_id is not None:
             rec = app.store.get_counterparty(party_id)
@@ -344,36 +385,52 @@ class RegistryController:
                 return ui.COLORS["warning_text"]
         return ui.COLORS["text"]
 
-    def refresh_selection(self):
-        """Частичное обновление реестра при смене выбора (п. 5.1).
+    @staticmethod
+    def party_subtitle(rec: dict) -> str:
+        """Подстрока контрагента в виде документов: тип, ИНН, ID (2.19.0)."""
+        kind = "ИП" if rec.get("type") == "ip" else "Юр. лицо"
+        inn = str(rec.get("fields", {}).get(F.INN, "")).strip() or "—"
+        return f"{kind}   ·   ИНН {inn}   ·   ID {rec.get('id')}"
 
-        Строки контрагентов остаются теми же виджетами (меняется только
-        подсветка и видимость кнопок действий), секция документов
-        раскрытого контрагента пересобирается на своём месте. Полная
-        перерисовка нужна только при изменении состава списка (поиск,
-        добавление, удаление).
+    def refresh_selection(self):
+        """Частичное обновление при смене выбора (п. 5.1).
+
+        Строки остаются теми же виджетами — меняется только подсветка и
+        видимость кнопок действий: в списке контрагентов обновляются
+        строки контрагентов, в виде документов — строки документов.
+        Полная перерисовка нужна только при изменении состава списка
+        (поиск, добавление, удаление) и при проваливании/возврате.
         """
         app = self.app
-        for party_id, entry in app._registry_rows.items():
-            selected = app._registry_selected_id == party_id
-            btn = entry["btn"]
-            try:
-                btn.configure(
-                    text=self.party_row_text(entry["rec"], selected),
-                    font=ui.font(12, "bold" if selected else "normal"),
-                    text_color=(ui.COLORS["text"] if selected
-                                else ui.COLORS["text_secondary"]),
-                )
-            except Exception:
-                pass
-            self._toggle_row_actions(entry, selected)
-        if app._registry_docs_frame is not None:
-            try:
-                app._registry_docs_frame.destroy()
-            except Exception:
-                pass
-            app._registry_docs_frame = None
-        self.render_documents(app._registry_docs_row)
+        if self.is_drill_mode:
+            selected_id = getattr(app, "_docs_selected_id", None)
+            for row_id, entry in app._docs_rows.items():
+                selected = selected_id == row_id
+                btn = entry["btn"]
+                try:
+                    btn.configure(
+                        text=self.doc_row_text(entry["rec"]),
+                        font=ui.font(12, "bold" if selected else "normal"),
+                        text_color=(ui.COLORS["text"] if selected
+                                    else self.doc_row_color(entry["rec"])),
+                    )
+                except Exception:
+                    pass
+                self._toggle_row_actions(entry, selected)
+        else:
+            for party_id, entry in app._registry_rows.items():
+                selected = app._registry_selected_id == party_id
+                btn = entry["btn"]
+                try:
+                    btn.configure(
+                        text=self.party_row_text(entry["rec"], selected),
+                        font=ui.font(12, "bold" if selected else "normal"),
+                        text_color=(ui.COLORS["text"] if selected
+                                    else ui.COLORS["text_secondary"]),
+                    )
+                except Exception:
+                    pass
+                self._toggle_row_actions(entry, selected)
         app.root.after(60, app._refresh_scrollbars)
 
     @staticmethod
@@ -392,11 +449,11 @@ class RegistryController:
                 pass  # виджет уже разрушен
 
     def refresh(self):
-        """Перерисовывает реестр целиком (поиск, изменения состава).
+        """Перерисовывает реестр целиком (поиск, изменения состава, проваливание).
 
         Длительные перерисовки (более 500 мс на больших объёмах) попадают
-        в журнал (п. 10 этапа 5); клик по контрагенту перерисовывает только
-        подсветку и секцию документов (refresh_selection, п. 5.1).
+        в журнал (п. 10 этапа 5); клик по контрагенту/документу обновляет
+        только подсветку строк (refresh_selection, п. 5.1).
         """
         with applog.timed("Перерисовка реестра", 500, "ui"):
             self.refresh_full()
@@ -409,7 +466,22 @@ class RegistryController:
                 child.destroy()
             except Exception:
                 pass
-        app._registry_docs_frame = None
+        app._registry_rows = {}
+        app._docs_rows = {}
+        self._update_header_mode()
+
+        # 2.19.0: проваливание — вид «Документы контрагента». Если контрагент
+        # к этому моменту удалён (мягкое удаление), молча возвращаемся к списку.
+        drill_id = getattr(app, "_registry_drill_party_id", None)
+        if drill_id is not None:
+            party = app.store.get_counterparty(drill_id)
+            if party is None or storage.is_deleted(party):
+                app._registry_drill_party_id = None
+                app._docs_selected_id = None
+            else:
+                self.render_documents_view(party)
+                app.root.after(60, app._refresh_scrollbars)
+                return
 
         parties = self.parties()
         query = app.registry_search_var.get().strip()
@@ -424,7 +496,6 @@ class RegistryController:
 
         row_index = 1
         row_index = self.render_expiry_banner(row_index)
-        app._registry_rows = {}
         if app._orphans:
             banner = ctk.CTkFrame(
                 app.registry_list, fg_color=ui.COLORS["sidebar_hover"], corner_radius=8,
@@ -495,11 +566,51 @@ class RegistryController:
             self._toggle_row_actions(entry, selected)
             row_index += 1
 
-        app._registry_docs_row = row_index
-        row_index = self.render_documents(row_index)
         row_index = self.render_unknown(row_index)
         self.render_trash(row_index)
         app.root.after(60, app._refresh_scrollbars)
+
+    def _update_header_mode(self):
+        """Шапка страницы по режиму: «Реестр» или «Документы — <имя>» (2.19.0)."""
+        app = self.app
+        title = getattr(app, "_registry_title_label", None)
+        if title is None:
+            return  # страница ещё не построена (юнит-тесты без Tk)
+        back_btn = getattr(app, "_registry_back_btn", None)
+        hint = getattr(app, "_registry_hint_label", None)
+        search_bar = getattr(app, "_registry_search_bar", None)
+        drill_id = getattr(app, "_registry_drill_party_id", None)
+        if drill_id is not None:
+            party = app.store.get_counterparty(drill_id)
+            name = storage.display_name(party) if party is not None else ""
+            title.configure(text=f"Документы — {name}" if name else "Документы")
+            if hint is not None:
+                hint.configure(
+                    text="Клик — выделить документ («Открыть Word»/«Удалить», клавиша "
+                         "Delete). Двойной клик — открыть документ в Word.",
+                )
+            if back_btn is not None:
+                back_btn.pack(side="left", padx=(int(14 * app.scale), 0))
+            if search_bar is not None:
+                search_bar.pack_forget()  # поиск фильтрует контрагентов, не документы
+        else:
+            title.configure(text="Реестр")
+            if hint is not None:
+                hint.configure(
+                    text="Клик — выделить контрагента (Редактировать/Удалить, клавиша "
+                         "Delete). Двойной клик — открыть его документы.",
+                )
+            if back_btn is not None:
+                back_btn.pack_forget()
+            if search_bar is not None:
+                # after=header: после pack_forget/pack строка поиска должна
+                # вернуться на своё место между шапкой и списком, а не в
+                # конец упаковки (registry_list — canvas window, ссылка
+                # before/after по нему невозможна) (2.19.0).
+                search_bar.pack(
+                    fill="x", padx=int(24 * app.scale), pady=(0, int(8 * app.scale)),
+                    after=getattr(app, "_registry_header", None),
+                )
 
     # ------------------------------------------------------------------ #
     #  Секции реестра
@@ -538,49 +649,44 @@ class RegistryController:
         ).grid(row=0, column=0, sticky="ew", padx=int(10 * app.scale), pady=int(8 * app.scale))
         return row_index + 1
 
-    def render_documents(self, row_index: int) -> int:
-        """Документы раскрытого контрагента под списком. Возвращает следующий row.
+    def render_documents_view(self, party: dict) -> None:
+        """Вид «Документы — <имя>»: список документов контрагента (2.19.0).
 
-        Секция показывает документы только контрагента, раскрытого двойным
-        кликом (``app._registry_expanded_id``); иначе — подсказка. Строки
+        Проваливание: двойной клик по контрагенту переключает страницу на
+        этот вид — список его документов вместо списка контрагентов.
+        Возврат — кнопка «← Назад» в шапке или клавиша Escape. Строки
         документов кликом выделяются (кнопки «Открыть Word»/«Удалить» у
         выделенной), двойным кликом открываются в Word.
         """
         app = self.app
-        holder = ctk.CTkFrame(app.registry_list, fg_color="transparent")
-        holder.grid(row=row_index, column=0, sticky="ew", pady=(int(10 * app.scale), 0))
-        holder.grid_columnconfigure(0, weight=1)
-        app._registry_docs_frame = holder
-        app._docs_rows = {}
-
-        party = app.store.get_counterparty(app._registry_expanded_id) \
-            if getattr(app, "_registry_expanded_id", None) is not None else None
-        if party is None:
-            ctk.CTkLabel(
-                holder,
-                text="Дважды кликните по контрагенту — здесь появится список его документов.",
-                font=ui.font(12), text_color=ui.COLORS["text_tertiary"], justify="left",
-            ).grid(row=0, column=0, sticky="ew")
-            return row_index + 1
-
+        header = ctk.CTkFrame(app.registry_list, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, int(6 * app.scale)))
+        header.grid_columnconfigure(0, weight=1)
         docs = app.store.documents_for(party["id"])
         ctk.CTkLabel(
-            holder, text=f"Документы — {storage.display_name(party)} ({len(docs)})",
+            header, text=f"Документы — {storage.display_name(party)} ({len(docs)})",
             font=ui.font(14, "bold"), text_color=ui.COLORS["text"], anchor="w",
-        ).grid(row=0, column=0, sticky="ew", pady=(0, int(6 * app.scale)))
+        ).grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(
+            header, text=self.party_subtitle(party),
+            font=ui.font(11), text_color=ui.COLORS["text_tertiary"], anchor="w",
+        ).grid(row=1, column=0, sticky="ew", pady=(int(2 * app.scale), 0))
 
         if not docs:
             ctk.CTkLabel(
-                holder, text="У контрагента пока нет документов.",
+                app.registry_list,
+                text="У контрагента пока нет документов.\n"
+                     "Создайте их на странице «Документ» или добавьте файлы "
+                     "кнопкой «Добавить документы…».",
                 font=ui.font(12), text_color=ui.COLORS["text_tertiary"], justify="left",
-            ).grid(row=1, column=0, sticky="ew")
-            return row_index + 1
+            ).grid(row=1, column=0, sticky="ew", pady=(int(12 * app.scale), 0))
+            return
 
         for offset, rec in enumerate(docs, start=1):
             selected = getattr(app, "_docs_selected_id", None) == rec.get("id")
             text = self.doc_row_text(rec)
             color = self.doc_row_color(rec) if not selected else ui.COLORS["text"]
-            row = ctk.CTkFrame(holder, fg_color="transparent")
+            row = ctk.CTkFrame(app.registry_list, fg_color="transparent")
             row.grid(row=offset, column=0, sticky="ew", pady=2)
             row.grid_columnconfigure(0, weight=1)
             btn = ctk.CTkButton(
@@ -608,7 +714,6 @@ class RegistryController:
                      "open_btn": open_btn, "del_btn": del_btn}
             app._docs_rows[rec.get("id")] = entry
             self._toggle_row_actions(entry, selected)
-        return row_index + 1
 
     def render_unknown(self, row_index: int) -> int:
         """Неопознанные документы (папка «unknown») в конце реестра."""

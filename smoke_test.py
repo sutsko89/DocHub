@@ -1682,7 +1682,13 @@ try:
     _q = _queue.Queue()
     _orig_dl = updater.download_file
     _orig_ft = updater.fetch_text
-    updater.download_file = lambda url, dest, **kw: _shutil.copy(_inst_path, dest)
+
+    def _fake_download(url, dest, **kwargs):
+        # Стаб без сети: настоящий download_file создаёт каталог назначения.
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        return _shutil.copy(_inst_path, dest)
+
+    updater.download_file = _fake_download
     updater.fetch_text = lambda url: f"{_digest}  {_rel['installer_name']}"
     _upd_flow._download_worker(
         _rel, "https://x/setup.exe", _threading.Event(), _q)

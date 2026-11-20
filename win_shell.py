@@ -17,6 +17,26 @@ import tkinter as tk
 WM_DROPFILES = 0x0233
 WM_DPICHANGED = 0x02E0
 
+# Нативное перетаскивание/растягивание безрамочного окна (2.17.0):
+# Windows сама ведёт модальный цикл переноса после синтетического
+# WM_NCLBUTTONDOWN с HT-кодом «куда попали мышью». В этом цикле работают
+# перенос на второй монитор (со сменой DPI) и Aero Snap — то, что
+# недоступно ручному переносу через geometry().
+WM_NCLBUTTONDOWN = 0x00A1
+HTCAPTION = 0x2
+#: HT-коды кромок для нативного растягивания (WM_NCLBUTTONDOWN).
+HT_RESIZE_EDGES = {
+    "w": 10,   # HTLEFT
+    "e": 11,   # HTRIGHT
+    "n": 12,   # HTTOP
+    "nw": 13,  # HTTOPLEFT
+    "ne": 14,  # HTTOPRIGHT
+    "s": 15,   # HTBOTTOM
+    "sw": 16,  # HTBOTTOMLEFT
+    "se": 17,  # HTBOTTOMRIGHT
+}
+_SWP_FRAMECHANGED_FLAGS = 0x1 | 0x2 | 0x4 | 0x20  # NOMOVE|NOSIZE|NOZORDER|FRAMECHANGED
+
 
 class _RECT(ctypes.Structure):
     _fields_ = [
@@ -42,7 +62,13 @@ def enable_rounded_corners(window: tk.Misc) -> None:
     except Exception:
         pass
 def make_borderless(window: tk.Misc, taskbar_button: bool = True) -> None:
-    """Убирает системную рамку, оставляя окно в панели задач и Alt+Tab."""
+    """Убирает системную рамку, оставляя окно в панели задач и Alt+Tab.
+
+    Стилевые биты WS_MAXIMIZEBOX/WS_MINIMIZEBOX/WS_SYSMENU (2.17.0) не
+    рисуют ничего (рамки WS_CAPTION/WS_THICKFRAME не добавляются), но
+    сообщают Windows, что окно можно разворачивать: без них Aero Snap
+    считает окно неразворачиваемым и не прилипает к краям.
+    """
     window.overrideredirect(True)
     if sys.platform != "win32":
         return
@@ -56,6 +82,20 @@ def make_borderless(window: tk.Misc, taskbar_button: bool = True) -> None:
         if taskbar_button:
             style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        # Разворачиваемость для Aero Snap: биты без визуального следа.
+        GWL_STYLE = -16
+        WS_MAXIMIZEBOX = 0x00010000
+        WS_MINIMIZEBOX = 0x00020000
+        WS_SYSMENU = 0x00080000
+        base_style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+        user32.SetWindowLongW(
+            hwnd, GWL_STYLE,
+            base_style | WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_SYSMENU,
+        )
+        user32.SetWindowPos(
+            ctypes.c_void_p(hwnd), None, 0, 0, 0, 0,
+            _SWP_FRAMECHANGED_FLAGS,
+        )
         enable_rounded_corners(window)
     except Exception:
         pass
@@ -163,6 +203,56 @@ def restore_window(window: tk.Misc, geometry: str = "") -> None:
         window.state("normal")
     except Exception:
         pass
+
+
+def _begin_native_ht(window: tk.Misc, ht_code: int) -> bool:
+    """Запускает нативный модальный цикл Windows с HT-кодом точки.
+
+    ReleaseCapture сбрасывает захват мыши Tk, после чего синтетический
+    WM_NCLBUTTONDOWN передаёт Windows управление переносом/растягиванием:
+    окно можно унести на второй монитор (со сменой DPI) и прилипнуть
+    к краям (Aero Snap). Блокирует до отпускания кнопки мыши.
+    False — не-Windows или сбой (вызывающий использует ручной fallback).
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        hwnd = _main_hwnd(window)
+        user32 = ctypes.windll.user32
+        user32.ReleaseCapture()
+        user32.SendMessageW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_longlong,
+        ]
+        user32.SendMessageW.restype = ctypes.c_longlong
+        user32.SendMessageW(
+            ctypes.c_void_p(hwnd), WM_NCLBUTTONDOWN, ht_code, 0,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def begin_native_move(window: tk.Misc) -> bool:
+    """Нативное перетаскивание окна за шапку (2.17.0).
+
+    Вызывать из обработчика нажатия мыши на шапке. True — Windows взяла
+    перенос на себя (второй монитор, Snap, смена DPI); False — не-Windows
+    или сбой, нужен ручной перенос через geometry().
+    """
+    return _begin_native_ht(window, HTCAPTION)
+
+
+def begin_native_resize(window: tk.Misc, edge: str) -> bool:
+    """Нативное растягивание за кромку ``edge`` (2.17.0).
+
+    ``edge`` — одна из 8 сторон: 'n', 's', 'w', 'e', 'nw', 'ne', 'sw',
+    'se'. True — Windows ведёт цикл растягивания сама (плавно, с учётом
+    монитора под курсором и minsize); False — ручной fallback.
+    """
+    ht_code = HT_RESIZE_EDGES.get(str(edge).lower())
+    if not ht_code:
+        return False
+    return _begin_native_ht(window, ht_code)
 
 
 # ----------------------------------------------------------------------- #

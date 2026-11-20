@@ -84,7 +84,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.16.0"
+APP_VERSION = "2.17.0"
 # Оставляем запас под полный путь Windows: лимит 260 символов, минус имя файла
 # и расширение, минус служебные суффиксы « (2).docx».
 
@@ -794,6 +794,16 @@ class ContractApp:
             self.lights.set_zoomed(False)
             ui.restore_window(self.root)
         self.root.update_idletasks()
+        # Нативное растягивание (2.17.0): Windows сама ведёт цикл — плавно,
+        # с учётом монитора под курсором (второй монитор) и minsize.
+        # Ручной путь ниже остаётся для не-Windows и как страховка при сбое.
+        try:
+            if ui.begin_native_resize(self.root, edge):
+                self._resize_origin = None
+                self._resize_start = None
+                return
+        except Exception:
+            pass
         self._resize_origin = (
             self.root.winfo_x(), self.root.winfo_y(),
             self.root.winfo_width(), self.root.winfo_height(),
@@ -806,7 +816,10 @@ class ContractApp:
         dx = event.x_root - self._resize_start[0]
         dy = event.y_root - self._resize_start[1]
         x, y, width, height = self._resize_origin
-        _area_x, _area_y, area_w, area_h = ui.workarea()
+        # Рабочая область ТОГО монитора, где окно сейчас (п. 6.3): иначе
+        # при частичном переносе на второй монитор растягивание зажималось
+        # размерами основного.
+        _area_x, _area_y, area_w, area_h = ui.workarea(self.root)
         max_w = max(area_w, self._min_width)
         max_h = max(area_h, self._min_height)
 

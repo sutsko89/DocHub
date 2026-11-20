@@ -94,6 +94,40 @@ def test_suggested_rect_from_lparam():
 def test_message_constants():
     assert win_shell.WM_DROPFILES == 0x0233
     assert win_shell.WM_DPICHANGED == 0x02E0
+    assert win_shell.WM_NCLBUTTONDOWN == 0x00A1
+    assert win_shell.HTCAPTION == 0x2
+
+
+# --------------------------------------------------------------------------- #
+#  Нативное перетаскивание/растягивание (2.17.0)
+# --------------------------------------------------------------------------- #
+def test_ht_resize_edges_cover_all_eight_sides():
+    """Все 8 кромок имеют HT-коды, значения — системные константы Win32."""
+    assert set(win_shell.HT_RESIZE_EDGES) == {"n", "s", "w", "e", "nw", "ne", "sw", "se"}
+    assert [win_shell.HT_RESIZE_EDGES[e] for e in ("w", "e", "n", "nw", "ne", "s", "sw", "se")] == [
+        10, 11, 12, 13, 14, 15, 16, 17,
+    ]
+
+
+@not_win32
+def test_begin_native_move_returns_false_without_windows():
+    """Не-Windows: нативный перенос недоступен — вызывающий использует ручной путь."""
+    fake = FakeWindow()
+    assert win_shell.begin_native_move(fake) is False
+
+
+@not_win32
+def test_begin_native_resize_returns_false_without_windows():
+    fake = FakeWindow()
+    for edge in ("n", "s", "w", "e", "nw", "ne", "sw", "se"):
+        assert win_shell.begin_native_resize(fake, edge) is False
+
+
+def test_begin_native_resize_unknown_edge_returns_false_anywhere():
+    """Неизвестная кромка отклоняется мапой HT-кодов до любых Win32-вызовов."""
+    fake = FakeWindow()
+    assert win_shell.begin_native_resize(fake, "diagonal-fake") is False
+    assert win_shell.begin_native_resize(fake, "") is False
 
 
 # --------------------------------------------------------------------------- #

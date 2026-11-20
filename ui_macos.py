@@ -25,9 +25,9 @@ SCALE = 1.0
 # Win32-обвязка вынесена в win_shell.py (п. 9.3); имена реэкспортируются,
 # чтобы main.py и внутренние виджеты продолжали вызывать ui.make_borderless и т. п.
 from win_shell import (
-    _RECT, _MONITORINFO, _main_hwnd, enable_rounded_corners, focus_window,
-    make_borderless, maximize_window, minimize_window, refresh_taskbar,
-    restore_window, workarea,
+    _RECT, _MONITORINFO, _main_hwnd, begin_native_move, begin_native_resize,
+    enable_rounded_corners, focus_window, make_borderless, maximize_window,
+    minimize_window, refresh_taskbar, restore_window, workarea,
 )
 
 
@@ -664,6 +664,16 @@ class WindowDrag:
     def _press(self, event) -> None:
         if self._on_start is not None:
             self._on_start(event)
+        # Нативное перетаскивание (2.17.0): Windows сама ведёт цикл переноса
+        # — окно уносится на второй монитор (со сменой DPI) и работает
+        # Aero Snap. Вызов блокирует до отпускания кнопки; ручной путь ниже
+        # остаётся для не-Windows и как страховка при сбое Win32-вызова.
+        try:
+            if begin_native_move(self._window):
+                self._offset = None
+                return
+        except Exception:
+            pass
         try:
             # Геометрия могла измениться в on_start (восстановление из
             # максимизации) — пересчитываем окно, чтобы оно не «убегало».

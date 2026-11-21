@@ -479,6 +479,7 @@ class UpdateController:
             "автоматически. Реестр, настройки и ключ DaData сохранятся.\n\n"
             "Запустить установку сейчас?",
             ok_text="Обновить",
+            destructive=True,  # U7: программа закроется — случайный Enter недопустим
         )
         if proceed:
             self.run_installer(path)

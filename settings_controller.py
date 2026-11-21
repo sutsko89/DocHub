@@ -62,6 +62,16 @@ import win_shell
 
 import applog  # WINLOG-1: кнопка «Открыть папку журналов»
 
+# U14 (UX-A): карточка «Горячие клавиши» на странице настроек — единое
+# место со списком сочетаний. Кнопка футера показывает суффикс «(Ctrl+S)»
+# (main._update_footer), остальные сочетания — только здесь.
+HOTKEY_HINTS: tuple[tuple[str, str], ...] = (
+    ("Ctrl+S · Ctrl+Enter", "— сохранить форму текущей страницы"),
+    ("Ctrl+N", "— новая карточка контрагента"),
+    ("Delete", "— удалить выбранную запись реестра (страница «Реестр»)"),
+    ("Esc", "— отменить: закрыть диалог или окно без действия"),
+)
+
 
 class SettingsController:
     """Страница «Настройки», ключ DaData и папка документов.
@@ -299,6 +309,25 @@ class SettingsController:
             width=int(190 * app.scale), height=int(30 * app.scale),
         ).pack(side="left")
 
+        # -- Горячие клавиши (U14, UX-A) --------------------------------- #
+        # Карточка в настройках — единое место, где виден весь список
+        # сочетаний: суффикс «(Ctrl+S)» на кнопке футера сам по себе
+        # не показывает остальные клавиши.
+        card = ui.Card(left, labels_above=True)
+        card.grid(row=6, column=0, sticky="new", padx=int(4 * app.scale), pady=(0, int(12 * app.scale)))
+        card.section("Горячие клавиши")
+        for keys, description in HOTKEY_HINTS:
+            line = ctk.CTkFrame(card.body, fg_color="transparent")
+            ctk.CTkLabel(
+                line, text=keys, font=ui.font(12, "bold"),
+                text_color=ui.COLORS["text_secondary"], anchor="w",
+            ).pack(side="left")
+            ctk.CTkLabel(
+                line, text=description, font=ui.font(12),
+                text_color=ui.COLORS["text"], anchor="w", justify="left",
+            ).pack(side="left", padx=(int(10 * app.scale), 0))
+            card.wide(line, pady=(int(2 * app.scale), int(2 * app.scale)))
+
     # ------------------------------------------------------------------ #
     #  Копии реестра (BKUP-1)
     # ------------------------------------------------------------------ #
@@ -374,6 +403,7 @@ class SettingsController:
             app.root, "Удалить ключ DaData",
             "Удалить сохранённый ключ? Автозаполнение по ИНН перестанет работать.",
             ok_text="Удалить",
+            destructive=True,  # U7: потеря ключа — не нейтральное действие
         ):
             return
         dadata.clear_api_key()

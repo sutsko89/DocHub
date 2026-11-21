@@ -838,7 +838,8 @@ try:
           and hasattr(app, "spec_text"),
           "панели предпросмотра: договор и доп. соглашение — есть (спецификация — есть)")
     check(hasattr(app, "status_label"), "строка статуса в футере")
-    check(app.save_button.cget("text") == "Сохранить договор", "кнопка футера: договор")
+    check(app.save_button.cget("text") == "Сохранить договор (Ctrl+S)",
+          "кнопка футера: договор, с суффиксом Ctrl+S (U14)")
 
     # ---------- Прилипание окна (2.20.0): подключение и живой прогон ----------
     check(app.drag._snap_resolver == app._snap_resolver
@@ -1058,7 +1059,7 @@ try:
     # Страница «Доп. соглашение»: договор-основание подтягивается из реестра.
     app._select_page("additional")
     app.root.update()
-    check(app.save_button.cget("text") == "Сохранить доп. соглашение",
+    check(app.save_button.cget("text") == "Сохранить доп. соглашение (Ctrl+S)",
           "кнопка футера: доп. соглашение")
     app.addl_party_var.set(storage.display_with_inn(party_rec))
     app.root.update()
@@ -1096,7 +1097,7 @@ try:
     # Страница «Спецификация».
     app._select_page("spec")
     app.root.update()
-    check(app.save_button.cget("text") == "Сохранить спецификацию",
+    check(app.save_button.cget("text") == "Сохранить спецификацию (Ctrl+S)",
           "кнопка футера: спецификация")
     app.spec_party_var.set(storage.display_with_inn(party_rec))
     app.root.update()

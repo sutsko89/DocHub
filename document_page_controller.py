@@ -102,30 +102,8 @@ class DocumentPageController:
         )
         card.wide(app.contract_party_combo, pady=(int(2 * app.scale), int(10 * app.scale)))
 
-        search_holder = ctk.CTkFrame(card.body, fg_color="transparent")
-        app.contract_search_var = tk.StringVar()
-        search_entry = ui.entry(
-            search_holder, width=int(180 * app.scale),
-            textvariable=app.contract_search_var,
-            validatecommand=app._digits_vcmd_for(12),
-        )
-        ui.enable_sanitized_paste(search_entry.entry, digits_only, max_len=12)
-        search_entry.pack(side="left")
-        try:  # Enter в поиске ищет, а не сохраняет договор
-            search_entry.bind_entry(
-                "<Return>", lambda _e: (self.find_party_by_inn(), "break")[1])
-            search_entry.bind_entry(
-                "<KP_Enter>", lambda _e: (self.find_party_by_inn(), "break")[1])
-        except Exception:
-            pass
-        ui.ghost_button(
-            search_holder, "Найти", self.find_party_by_inn,
-            width=int(92 * app.scale), height=int(28 * app.scale),
-        ).pack(side="left", padx=(int(10 * app.scale), 0))
-        card.row(
-            "Поиск по ИНН", search_holder, stretch=True,
-            hint="Найдёт контрагента в реестре программы.",
-        )
+        # U3 (UX-A): общий блок поиска — теперь на всех страницах документов.
+        self.build_party_search_row(card, "contract_search_var")
 
         # -- Договор ----------------------------------------------------- #
         card = ui.Card(left, labels_above=True)
@@ -200,10 +178,54 @@ class DocumentPageController:
         except Exception as exc:
             app._set_text(app.contract_preview, f"Не удалось собрать предпросмотр: {exc}")
 
-    def find_party_by_inn(self):
-        """Ищет контрагента по ИНН в реестре и подставляет в выпадающий список."""
+    # ------------------------------------------------------------------ #
+    #  Поиск контрагента по ИНН — общий блок страниц документов (U3)
+    # ------------------------------------------------------------------ #
+    def build_party_search_row(self, card, attr: str) -> None:
+        """Строка «Поиск по ИНН» в карточке «Контрагент» (U3, UX-A).
+
+        Переиспользует готовый блок страницы «Договор» на страницах
+        «Доп. соглашение» и «Спецификация»: найденный контрагент
+        подставляется сразу во все страницы (set_current_party), поэтому
+        больше не нужно листать комбобокс, когда контрагентов много.
+
+        ``attr`` — имя атрибута приложения для StringVar поиска;
+        на «Договоре» сохраняется прежнее имя ``contract_search_var``
+        (его читают тесты и smoke-сценарий).
+        """
         app = self.app
-        inn = digits_only(app.contract_search_var.get())
+        var = tk.StringVar()
+        setattr(app, attr, var)
+        holder = ctk.CTkFrame(card.body, fg_color="transparent")
+        search_entry = ui.entry(
+            holder, width=int(180 * app.scale), textvariable=var,
+            validatecommand=app._digits_vcmd_for(12),
+        )
+        ui.enable_sanitized_paste(search_entry.entry, digits_only, max_len=12)
+        search_entry.pack(side="left")
+        try:  # Enter в поиске ищет, а не сохраняет документ
+            search_entry.bind_entry(
+                "<Return>", lambda _e, v=var: (self.find_party_by_inn(v), "break")[1])
+            search_entry.bind_entry(
+                "<KP_Enter>", lambda _e, v=var: (self.find_party_by_inn(v), "break")[1])
+        except Exception:
+            pass
+        ui.ghost_button(
+            holder, "Найти", lambda v=var: self.find_party_by_inn(v),
+            width=int(92 * app.scale), height=int(28 * app.scale),
+        ).pack(side="left", padx=(int(10 * app.scale), 0))
+        card.row(
+            "Поиск по ИНН", holder, stretch=True,
+            hint="Найдёт контрагента в реестре и подставит его во все страницы.",
+        )
+
+    def find_party_by_inn(self, source_var=None):
+        """Ищет контрагента по ИНН в реестре и подставляет во все страницы (U3)."""
+        app = self.app
+        var = source_var if source_var is not None else getattr(app, "contract_search_var", None)
+        if var is None:
+            return
+        inn = digits_only(var.get())
         rec = app.store.find_by_inn(inn)
         if rec is None:
             ui.alert(
@@ -214,7 +236,7 @@ class DocumentPageController:
             )
             return
         app._doc_context_flow.set_current_party(rec)
-        app.contract_search_var.set("")
+        var.set("")
 
     # ------------------------------------------------------------------ #
     #  Страница «Доп. соглашение»
@@ -243,6 +265,8 @@ class DocumentPageController:
             width=int(main.ENTRY_WIDTH * app.scale), variable=app.addl_party_var,
         )
         card.wide(app.addl_party_combo, pady=(int(2 * app.scale), int(10 * app.scale)))
+        # U3 (UX-A): поиск по ИНН как на «Договоре» — не листать комбобокс.
+        self.build_party_search_row(card, "addl_search_var")
         app.addl_party_var.trace_add("write", self.on_addl_party_changed)
         app.addl_party_var.trace_add(
             "write", lambda *_: app._doc_context_flow.on_party_selected("additional"))

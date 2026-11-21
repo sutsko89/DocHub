@@ -59,6 +59,20 @@ from services import validate_party_fields
 # поэтому «поле сломалось» никогда не выглядит как «пользователь стёр значение».
 READ_ERROR_MARKER = "\x00поле-недоступно\x00"
 
+# U4 (UX-A): подсказки формата в полях с жёстким форматом. Показываются
+# подложкой в пустом поле (ui.TextField.set_placeholder) — не в значении:
+# get() пустого поля всегда даёт пустую строку, подсказка не попадает
+# в карточку и не «путается» с введёнными данными.
+FORMAT_HINTS: dict[str, str] = {
+    F.INN: "10 или 12 цифр",
+    F.KPP: "9 цифр",
+    F.OGRN: "13 цифр",
+    F.OGRNIP: "15 цифр",
+    F.ACCOUNT: "20 цифр",
+    F.CORR_ACCOUNT: "20 цифр",
+    F.BIK: "9 цифр",
+}
+
 
 def read_entry_values(entries, log=None) -> tuple[dict, list[str]]:
     """Читает значения полей; сбой чтения не превращается в пустую строку (D4).
@@ -236,6 +250,7 @@ class CounterpartyController:
         inn = ui.entry(
             inn_holder, width=int(180 * app.scale),
             validatecommand=app._digits_vcmd_for(12),
+            placeholder=FORMAT_HINTS[F.INN],
         )
         ui.enable_sanitized_paste(inn.entry, digits_only, max_len=12)
         inn.pack(side="left")
@@ -252,12 +267,15 @@ class CounterpartyController:
 
         if mode == "ooo":
             self.add_field(card, mode, F.KPP, F.KPP, kind="digits", max_len=9,
-                           width=int(140 * app.scale), required=True, stretch=False)
+                           width=int(140 * app.scale), required=True, stretch=False,
+                           placeholder=FORMAT_HINTS[F.KPP])
             self.add_field(card, mode, F.OGRN, F.OGRN, kind="digits", max_len=13,
-                           width=int(180 * app.scale), required=True, stretch=False)
+                           width=int(180 * app.scale), required=True, stretch=False,
+                           placeholder=FORMAT_HINTS[F.OGRN])
         else:
             self.add_field(card, mode, F.OGRNIP, F.OGRNIP, kind="digits", max_len=15,
-                           width=int(180 * app.scale), required=True, stretch=False)
+                           width=int(180 * app.scale), required=True, stretch=False,
+                           placeholder=FORMAT_HINTS[F.OGRNIP])
 
         # -- Организация ------------------------------------------------- #
         card.section("Организация" if mode == "ooo" else "Предприниматель")
@@ -302,16 +320,19 @@ class CounterpartyController:
         # -- Банк -------------------------------------------------------- #
         card.section("Банковские реквизиты")
         self.add_field(card, mode, F.ACCOUNT, F.ACCOUNT, kind="digits", max_len=20,
-                       width=int(260 * app.scale), required=True)
+                       width=int(260 * app.scale), required=True,
+                       placeholder=FORMAT_HINTS[F.ACCOUNT])
         self.add_field(card, mode, F.CORR_ACCOUNT, F.CORR_ACCOUNT, kind="digits", max_len=20,
-                       width=int(260 * app.scale), required=True)
+                       width=int(260 * app.scale), required=True,
+                       placeholder=FORMAT_HINTS[F.CORR_ACCOUNT])
         self.add_field(card, mode, F.BANK, F.BANK, required=True)
         self.add_field(card, mode, F.BIK, F.BIK, kind="digits", max_len=9,
-                       width=int(140 * app.scale), required=True, stretch=False)
+                       width=int(140 * app.scale), required=True, stretch=False,
+                       placeholder=FORMAT_HINTS[F.BIK])
 
     def add_field(self, card, mode: str, key: str, label: str, kind="text",
                   width=None, required=False, stretch=True, max_len=None,
-                  hint: str | None = None):
+                  hint: str | None = None, placeholder: str | None = None):
         import main  # поздний импорт: ширина поля и формат телефона из main.py
 
         app = self.app
@@ -322,7 +343,8 @@ class CounterpartyController:
         elif kind == "phone":
             validate = (app._phone_vcmd, "%P")
 
-        widget = ui.entry(card.body, width=width, validatecommand=validate)
+        widget = ui.entry(card.body, width=width, validatecommand=validate,
+                          placeholder=placeholder)
         if kind == "digits":
             # Валидатор отбрасывает вставку целиком, если в буфере есть
             # недопустимые символы («р/с 40702810…»). Вставляем только цифры.
@@ -340,6 +362,36 @@ class CounterpartyController:
         card.row(label, widget, stretch=stretch, required=required,
                  error_var=self.error_var_for(mode)(key), hint=hint)
         return widget
+
+    def _highlight_page_errors(self, mode: str, errors: dict[str, str]) -> None:
+        """Подсвечивает ошибочные поля страницы карточки (путь добавления).
+
+        После фокуса прокручивает страницу к первому ошибочному полю (U5):
+        оно может быть за нижней границей окна, и алерт сам по себе
+        не показывает, какое поле подсвечено.
+        """
+        app = self.app
+        for var in app._cp_error_vars[mode].values():
+            var.set("")
+        for widget in app._cp_entries[mode].values():
+            if hasattr(widget, "set_error"):
+                widget.set_error(False)
+        for key, message in errors.items():
+            self.error_var_for(mode)(key).set(message)
+            widget = app._cp_entries[mode].get(key)
+            if widget is not None and hasattr(widget, "set_error"):
+                widget.set_error(True)
+        first = app._cp_entries[mode].get(next(iter(errors)))
+        if first is not None:
+            try:
+                first.focus_set()
+            except Exception:
+                pass
+            # U5: прокрутка к ошибочному полю внутри страницы карточки.
+            try:
+                ui.scroll_to_widget(ui.containing_scroller(first), first)
+            except Exception:
+                pass
 
     def error_var_for(self, mode: str):
         def get(key: str) -> tk.StringVar:
@@ -397,22 +449,7 @@ class CounterpartyController:
         for key, message in services.checksum_errors(data, is_ip, previous=None).items():
             errors.setdefault(key, message)
         if errors:
-            for var in app._cp_error_vars[mode].values():
-                var.set("")
-            for widget in app._cp_entries[mode].values():
-                if hasattr(widget, "set_error"):
-                    widget.set_error(False)
-            for key, message in errors.items():
-                self.error_var_for(mode)(key).set(message)
-                widget = app._cp_entries[mode].get(key)
-                if widget is not None and hasattr(widget, "set_error"):
-                    widget.set_error(True)
-            first = app._cp_entries[mode].get(next(iter(errors)))
-            if first is not None:
-                try:
-                    first.focus_set()
-                except Exception:
-                    pass
+            self._highlight_page_errors(mode, errors)
             ui.alert(
                 app.root, "Ошибки в данных",
                 "Проверьте подсвеченные поля:\n\n"
@@ -535,14 +572,15 @@ class CounterpartyController:
                     pass
 
         def add_field(key, label, kind="text", width=None, required=False,
-                      stretch=True, max_len=None, hint=None):
+                      stretch=True, max_len=None, hint=None, placeholder=None):
             width = width or int(main.ENTRY_WIDTH * app.scale)
             validate = None
             if kind == "digits":
                 validate = app._digits_vcmd_for(max_len) if max_len else (app._digits_vcmd, "%P")
             elif kind == "phone":
                 validate = (app._phone_vcmd, "%P")
-            widget = ui.entry(card.body, width=width, validatecommand=validate)
+            widget = ui.entry(card.body, width=width, validatecommand=validate,
+                              placeholder=placeholder)
             if kind == "digits":
                 # Валидатор отбрасывает вставку целиком, если в буфере есть
                 # недопустимые символы. Вставляем только цифры.
@@ -564,15 +602,19 @@ class CounterpartyController:
         # -- Коды -------------------------------------------------------- #
         card.section("Коды")
         add_field(F.INN, F.INN, kind="digits", max_len=12,
-                  width=int(180 * app.scale), stretch=False, required=True)
+                  width=int(180 * app.scale), stretch=False, required=True,
+                  placeholder=FORMAT_HINTS[F.INN])
         if is_ip:
             add_field(F.OGRNIP, F.OGRNIP, kind="digits", max_len=15,
-                      width=int(180 * app.scale), stretch=False, required=True)
+                      width=int(180 * app.scale), stretch=False, required=True,
+                      placeholder=FORMAT_HINTS[F.OGRNIP])
         else:
             add_field(F.KPP, F.KPP, kind="digits", max_len=9,
-                      width=int(140 * app.scale), stretch=False, required=True)
+                      width=int(140 * app.scale), stretch=False, required=True,
+                      placeholder=FORMAT_HINTS[F.KPP])
             add_field(F.OGRN, F.OGRN, kind="digits", max_len=13,
-                      width=int(180 * app.scale), stretch=False, required=True)
+                      width=int(180 * app.scale), stretch=False, required=True,
+                      placeholder=FORMAT_HINTS[F.OGRN])
 
         # -- Организация / Предприниматель -------------------------------- #
         card.section("Организация" if not is_ip else "Предприниматель")
@@ -616,12 +658,15 @@ class CounterpartyController:
         # -- Банк ---------------------------------------------------------- #
         card.section("Банковские реквизиты")
         add_field(F.ACCOUNT, F.ACCOUNT, kind="digits", max_len=20,
-                  width=int(260 * app.scale), required=True)
+                  width=int(260 * app.scale), required=True,
+                  placeholder=FORMAT_HINTS[F.ACCOUNT])
         add_field(F.CORR_ACCOUNT, F.CORR_ACCOUNT, kind="digits", max_len=20,
-                  width=int(260 * app.scale), required=True)
+                  width=int(260 * app.scale), required=True,
+                  placeholder=FORMAT_HINTS[F.CORR_ACCOUNT])
         add_field(F.BANK, F.BANK, required=True)
         add_field(F.BIK, F.BIK, kind="digits", max_len=9,
-                  width=int(140 * app.scale), stretch=False, required=True)
+                  width=int(140 * app.scale), stretch=False, required=True,
+                  placeholder=FORMAT_HINTS[F.BIK])
 
         # -- Защита карточки при закрытии (DEF-1: D4 + U8-MVP) -------------- #
         # Снимок полей при открытии: сравнение «до/текущие» решает, нужно ли
@@ -659,6 +704,11 @@ class CounterpartyController:
             if first is not None:
                 try:
                     first.focus_set()
+                except Exception:
+                    pass
+                # U5 (UX-A): прокрутка окна редактирования к ошибочному полю.
+                try:
+                    ui.scroll_to_widget(ui.containing_scroller(first), first)
                 except Exception:
                     pass
 

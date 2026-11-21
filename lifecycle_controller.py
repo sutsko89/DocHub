@@ -152,7 +152,8 @@ class LifecycleController:
             f"{source or '—'}\n\n"
             "Восстановить документ можно в разделе «Корзина»."
         )
-        if not ui.confirm(self.app.root, "Удалить документ", message, ok_text="В корзину"):
+        if not ui.confirm(self.app.root, "Удалить документ", message, ok_text="В корзину",
+                          destructive=True):
             return
         if not self.app.store.trash_document(rec.get("id")):
             ui.alert(
@@ -190,7 +191,8 @@ class LifecycleController:
             f"{folder}\n\n"
             "Восстановить можно в разделе «Корзина»."
         )
-        if not ui.confirm(self.app.root, "Удалить контрагента", message, ok_text="В корзину"):
+        if not ui.confirm(self.app.root, "Удалить контрагента", message, ok_text="В корзину",
+                          destructive=True):
             return
         if len(docs) > 20:
             if not ui.confirm(
@@ -198,6 +200,7 @@ class LifecycleController:
                 f"У контрагента «{name}» {len(docs)} документов.\n\n"
                 "Точно переместить всё в корзину?",
                 ok_text="Да, в корзину",
+                destructive=True,
             ):
                 return
         removed = self.app.store.trash_counterparty(party_id)
@@ -264,6 +267,7 @@ class LifecycleController:
             "Файл на диске останется, но восстановить документ из корзины "
             "будет уже нельзя.",
             ok_text="Удалить навсегда",
+            destructive=True,
         ):
             return
         if not self.app.store.purge_document(rec.get("id")):
@@ -286,6 +290,7 @@ class LifecycleController:
             f"Вместе с карточкой будут удалены записи документов — {len(docs)} шт.\n"
             "Файлы на диске останутся. Восстановить записи будет нельзя.",
             ok_text="Удалить навсегда",
+            destructive=True,
         ):
             return
         self.app.store.purge_counterparty(party_id)
@@ -310,6 +315,7 @@ class LifecycleController:
             "Удалить их окончательно? Файлы документов на диске останутся, "
             "но записи восстановить будет нельзя.",
             ok_text="Очистить корзину",
+            destructive=True,
         ):
             return
         removed = self.app.store.purge_all_trash()

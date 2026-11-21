@@ -36,6 +36,7 @@ Tk; рабочий поток не трогает Tk и не вызывает ``
 
 from __future__ import annotations
 
+import applog
 import os
 import queue
 import subprocess
@@ -486,6 +487,7 @@ class UpdateController:
         перезагрузку. Программа закрывается сразу после запуска — так
         установщик не встречает занятые файлы.
         """
+        self._snapshot_registry_before_update()
         try:
             run_installer_command(path)
         except Exception as exc:
@@ -498,6 +500,25 @@ class UpdateController:
         # Небольшая задержка: установщик стартует, затем приложение
         # закрывается штатно (очистки, сохранение настроек).
         self.app.root.after(500, self.app.close)
+
+    def _snapshot_registry_before_update(self) -> None:
+        """Снимок реестра перед установкой новой версии (BKUP-1, D-карточка).
+
+        Хук перед run_installer_command: обновление — необратимая на уровне
+        данных операция, снимок сохраняет состояние базы с меткой текущей
+        версии. Снимок ≠ откат версии приложения: восстановление базы —
+        ручная операция. Отказ снимка обновление не блокирует — факт виден
+        в журнале.
+        """
+        try:
+            import main  # поздний импорт: APP_VERSION без цикла
+            import storage
+
+            storage.create_update_snapshot(self.app.store, main.APP_VERSION)
+        except Exception as exc:  # noqa: BLE001 — обновление не блокируем
+            applog.get_logger("updater").warning(
+                "Снимок реестра перед обновлением не создан: %s", type(exc).__name__,
+            )
 
     # ------------------------------------------------------------------ #
     #  Текст статуса для страницы «Настройки»

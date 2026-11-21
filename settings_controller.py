@@ -55,6 +55,7 @@ import customtkinter as ctk
 import tkinter as tk
 
 import dadata_client as dadata
+import storage
 import ui_macos as ui
 import updater
 import win_shell
@@ -226,6 +227,64 @@ class SettingsController:
         )
         card.wide(auto_switch, pady=(int(8 * app.scale), int(2 * app.scale)))
         auto_switch.grid_configure(sticky="w")
+
+        # -- Копии реестра (BKUP-1) --------------------------------------- #
+        # Автокопии создаются в стартовой цепочке; здесь — состояние копий,
+        # папка и ручная инструкция восстановления (без мастера восстановления).
+        card = ui.Card(left, labels_above=True)
+        card.grid(row=4, column=0, sticky="new", padx=int(4 * app.scale), pady=(0, int(12 * app.scale)))
+        card.section("Копии реестра")
+        app._backup_status_var = tk.StringVar(
+            value=app._settings_flow.backup_status_text())
+        card.wide(
+            ctk.CTkLabel(
+                card.body, textvariable=app._backup_status_var,
+                font=ui.font(12), text_color=ui.COLORS["text"],
+                anchor="w", justify="left",
+                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+            ),
+            pady=(int(2 * app.scale), int(6 * app.scale)),
+        )
+        backup_buttons = ctk.CTkFrame(card.body, fg_color="transparent")
+        card.wide(backup_buttons)
+        ui.secondary_button(
+            backup_buttons, "Открыть папку копий", app._settings_flow.open_backups_folder,
+            width=int(170 * app.scale), height=int(30 * app.scale),
+        ).pack(side="left")
+        card.wide(
+            ctk.CTkLabel(
+                card.body,
+                text="Копия базы создаётся при запуске, если реестр менялся "
+                     "с прошлой копии (содержимое — состояние на конец "
+                     "предыдущего прогона); перед обновлением — снимок с меткой "
+                     "версии. Восстановление вручную: закройте программу, "
+                     "переименуйте файл копии registry_…db в database.db рядом "
+                     "с текущей базой (сначала сохранив текущий database.db). "
+                     "Ключ DaData в копии настроек не включается. Копия лежит "
+                     "на том же диске — от отказа диска она не защищает.",
+                font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
+                anchor="w", justify="left",
+                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+            ),
+            pady=(int(4 * app.scale), int(2 * app.scale)),
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Копии реестра (BKUP-1)
+    # ------------------------------------------------------------------ #
+    def backup_status_text(self) -> str:
+        """Состояние автокопий для блока настроек (из storage)."""
+        return storage.backup_status_text()
+
+    def open_backups_folder(self) -> None:
+        """Открывает папку автокопий (создаёт её, если копий ещё не было)."""
+        import os as _os
+
+        try:
+            _os.makedirs(storage.backups_dir(), exist_ok=True)
+        except OSError:
+            pass
+        self.app._open_file(storage.backups_dir())
 
     # ------------------------------------------------------------------ #
     #  Ключ DaData

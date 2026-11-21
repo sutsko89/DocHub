@@ -90,6 +90,21 @@ LOAD_RETRY_DELAY = 0.25
 TRASH_RETENTION_DAYS = 30
 BAD_COPY_RETENTION_DAYS = 30   # сколько дней хранить database.db.bad-*
 
+# Автокопии реестра (BKUP-1): ротация 7 копий + отдельные снимки перед
+# обновлением (до 3); снимки не вытесняют обычные копии и в лимит 7 не входят.
+SETTINGS_FILENAME = "settings.json"
+BACKUPS_DIR_NAME = "backups"
+SNAPSHOTS_DIR_NAME = "snapshots"
+BACKUP_FILE_PREFIX = "registry_"
+BACKUP_MARKER_FILENAME = "last_backup.json"
+BACKUP_SETTINGS_SUFFIX = "_settings.json"
+BACKUP_RETENTION = 7
+SNAPSHOT_RETENTION = 3
+# Ключ — секрет пользователя: в копию настроек не включается никогда
+# (включение в копию «по явному выбору» не предусмотрено, ключ хранится
+# отдельным файлом и в settings.json не пишется).
+_SECRET_KEY_MARKERS = ("dadata",)
+
 KIND_CONTRACT = "contract"
 KIND_ADDITIONAL = "additional"
 KIND_SPEC = "spec"
@@ -168,6 +183,26 @@ def legacy_json_path() -> str:
     return os.path.join(data_dir(), LEGACY_JSON_FILENAME)
 
 
+def settings_json_path() -> str:
+    """Файл настроек программы (тот же путь, что в main.settings_path)."""
+    return os.path.join(data_dir(), SETTINGS_FILENAME)
+
+
+def backups_dir() -> str:
+    """Каталог автокопий реестра (BKUP-1): <профиль>/backups/."""
+    return os.path.join(data_dir(), BACKUPS_DIR_NAME)
+
+
+def snapshots_dir() -> str:
+    """Каталог снимков перед обновлением: backups/snapshots/ (своя ротация)."""
+    return os.path.join(backups_dir(), SNAPSHOTS_DIR_NAME)
+
+
+def backup_marker_path() -> str:
+    """Отметка о последней успешной копии (ревизия реестра на момент копии)."""
+    return os.path.join(backups_dir(), BACKUP_MARKER_FILENAME)
+
+
 def _connect_db(path: str) -> sqlite3.Connection:
     """Открывает базу: WAL (параллельное чтение), FULL-синхронизация, схема.
 
@@ -229,12 +264,24 @@ class DataStore:
         self.documents: list[dict] = []
         self._seq = 1
         self.schema_version = SQLITE_SCHEMA_VERSION
+        # Ревизия реестра: увеличивается каждой успешной записью и хранится
+        # в meta — триггер автокопии «изменено с последней копии» (BKUP-1)
+        # сравнивает ревизию базы с отметкой последней копии.
+        self._rev = 0
+        # Флаг «реестр менялся с последней успешной копии»: ставится каждым
+        # успешным save(), снимается успешной копией (BKUP-1).
+        self.dirty_since_backup = False
         # Причина последней неудачной записи: UI обязан проверять её перед
         # сообщением «сохранено».
         self.last_error = ""
         # Предупреждение о проблемах при чтении файла (показывается пользователю).
         self.load_warning = ""
         self._load()
+
+    @property
+    def registry_rev(self) -> int:
+        """Текущая ревизия реестра (количество успешных записей в базе)."""
+        return self._rev
 
     # ------------------------------------------------------------------ #
     #  Загрузка / сохранение
@@ -256,7 +303,7 @@ class DataStore:
                     with applog.timed("Чтение реестра", 500, "storage"):
                         conn = _connect_db(path)
                         try:
-                            parties, documents, seq = self._read_all(conn)
+                            parties, documents, seq, rev = self._read_all(conn)
                         finally:
                             conn.close()
                     break
@@ -303,6 +350,7 @@ class DataStore:
             + [_safe_int(rec.get("id"), 0) for rec in self.counterparties]
             + [_safe_int(rec.get("id"), 0) for rec in self.documents]
         ) + 1
+        self._rev = _safe_int(rev, 0)
         log.info(
             "Реестр загружен: контрагентов=%d, документов=%d, в корзине=%d",
             len(self.counterparties), len(self.documents),
@@ -469,7 +517,7 @@ class DataStore:
         return rec
 
     @classmethod
-    def _read_all(cls, conn) -> tuple[list[dict], list[dict], int | None]:
+    def _read_all(cls, conn) -> tuple[list[dict], list[dict], int | None, int | None]:
         parties: list[dict] = []
         documents: list[dict] = []
         dropped = 0
@@ -499,7 +547,9 @@ class DataStore:
             )
         seq_row = conn.execute("SELECT value FROM meta WHERE key = 'seq'").fetchone()
         seq = _safe_int(seq_row[0], None) if seq_row else None
-        return parties, documents, seq
+        rev_row = conn.execute("SELECT value FROM meta WHERE key = 'rev'").fetchone()
+        rev = _safe_int(rev_row[0], None) if rev_row else None
+        return parties, documents, seq, rev
 
     # ------------------------ Повреждённая база ------------------------ #
     def _quarantine_corrupt_db(self, path: str, exc: Exception) -> bool:
@@ -670,6 +720,9 @@ class DataStore:
                     (
                         ("schema_version", str(SQLITE_SCHEMA_VERSION)),
                         ("seq", str(self._seq)),
+                        # Ревизия каждой успешной записи — триггер автокопий (BKUP-1).
+                        # Схема не меняется: старые версии читают meta без этой строки.
+                        ("rev", str(self._rev)),
                     ),
                 )
         finally:
@@ -695,11 +748,14 @@ class DataStore:
 
         path = db_path()
         last_exc: Exception | None = None
+        # Ревизия увеличивается каждой УСПЕШНОЙ записью (сбой — откат счётчика).
+        self._rev += 1
         with applog.timed("Запись реестра", 500, "storage"):
             for attempt in range(1, SAVE_RETRIES + 1):
                 try:
                     self._write_all(path, party_rows, document_rows)
                     self.schema_version = SQLITE_SCHEMA_VERSION
+                    self.dirty_since_backup = True  # BKUP-1: «изменено с последней копии»
                     log.info(
                         "Реестр записан: контрагентов=%d, документов=%d",
                         len(self.counterparties), len(self.documents),
@@ -714,8 +770,49 @@ class DataStore:
                         )
                         time.sleep(RETRY_DELAY_SECONDS * attempt)
 
+        self._rev -= 1  # ревизия не записана в базу — счётчик откатывается
         self.last_error = f"Не удалось записать реестр: {last_exc}"
         log.error("Реестр не записан после %d попыток: %s", SAVE_RETRIES, last_exc)
+        return False
+
+    def backup_db(self, dest: str, retries: int = 3,
+                  retry_delay: float = 0.25) -> bool:
+        """Консистентная копия базы через sqlite backup API (BKUP-1).
+
+        Backup API переносит и содержимое WAL: копия соответствует состоянию
+        базы на момент вызова, останавливать программу не нужно. Ретраи —
+        против секундной блокировки файла антивирусом (как в _load/save).
+        Ошибка копирования не поднимается наружу: возвращается False,
+        подробности — в журнале.
+        """
+        log = applog.get_logger("storage")
+        source_path = db_path()
+        if not os.path.exists(source_path):
+            log.warning("Копия реестра: файл базы ещё не создан — копировать нечего")
+            return False
+        last_exc: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+                source = sqlite3.connect(source_path, timeout=BUSY_TIMEOUT_SECONDS)
+                try:
+                    target = sqlite3.connect(dest)
+                    try:
+                        source.backup(target)
+                    finally:
+                        target.close()
+                finally:
+                    source.close()
+                return True
+            except (sqlite3.Error, OSError) as exc:
+                last_exc = exc
+                if attempt < retries:
+                    log.warning(
+                        "Копия реестра не удалась (попытка %d из %d): %s",
+                        attempt, retries, type(exc).__name__,
+                    )
+                    time.sleep(retry_delay * attempt)
+        log.error("Копия реестра не создана после %d попыток: %s", retries, last_exc)
         return False
 
     def _next_id(self) -> int:
@@ -1074,3 +1171,224 @@ def display_with_inn(rec: dict) -> str:
     inn = str(rec.get("fields", {}).get("ИНН", "")).strip()
     name = display_name(rec)
     return f"{name} · ИНН {inn}" if inn else name
+
+
+# --------------------------------------------------------------------------- #
+#  Автокопии реестра и снимки перед обновлением (BKUP-1)
+# --------------------------------------------------------------------------- #
+def _backup_files() -> list[str]:
+    """Копии базы в backups/ (только файлы ``registry_*.db``, снимки не считаются)."""
+    directory = backups_dir()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return sorted(
+        os.path.join(directory, name) for name in names
+        if name.startswith(BACKUP_FILE_PREFIX) and name.endswith(".db")
+    )
+
+
+def _snapshot_files() -> list[str]:
+    """Снимки перед обновлением в backups/snapshots/."""
+    directory = snapshots_dir()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return sorted(
+        os.path.join(directory, name) for name in names
+        if name.startswith(BACKUP_FILE_PREFIX) and name.endswith(".db")
+    )
+
+
+def _read_backup_marker() -> dict:
+    """Отметка последней успешной копии; {} — отметки нет (первый запуск)."""
+    try:
+        with open(backup_marker_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_backup_marker(state: dict) -> bool:
+    try:
+        os.makedirs(backups_dir(), exist_ok=True)
+        tmp = backup_marker_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, backup_marker_path())
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _strip_secret_keys(payload: dict) -> dict:
+    """Копия настроек без ключей-секретов (ключ DaData — секрет пользователя)."""
+    out = {}
+    for key, value in payload.items():
+        lowered = str(key).lower()
+        if any(marker in lowered for marker in _SECRET_KEY_MARKERS):
+            continue
+        out[key] = value
+    return out
+
+
+def _copy_settings_snapshot(dest_path: str) -> bool:
+    """settings.json в копию — без ключа DaData. False — файла нет или сбой."""
+    try:
+        with open(settings_json_path(), "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return False
+        os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+        with open(dest_path, "w", encoding="utf-8") as fh:
+            json.dump(_strip_secret_keys(payload), fh, ensure_ascii=False, indent=2)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _rotate(directory: str, keep: int) -> None:
+    """Вытесняет самые старые копии (по времени создания) сверх ``keep``.
+
+    Файл настроек-сателлит (``*_settings.json``) удаляется вместе со своей
+    копией базы.
+    """
+    try:
+        names = sorted(
+            name for name in os.listdir(directory)
+            if name.startswith(BACKUP_FILE_PREFIX) and name.endswith(".db")
+        )
+    except OSError:
+        return
+    stats = []
+    for name in names:
+        try:
+            stats.append((os.path.getmtime(os.path.join(directory, name)), name))
+        except OSError:
+            continue
+    stats.sort(reverse=True)  # свежие первыми
+    for _mtime, name in stats[keep:]:
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            continue
+        sidecar = os.path.join(directory, name[:-3] + BACKUP_SETTINGS_SUFFIX)
+        if os.path.exists(sidecar):
+            try:
+                os.remove(sidecar)
+            except OSError:
+                pass
+
+
+def create_startup_backup(store, version_label: str = "") -> dict:
+    """Автокопия реестра при запуске (BKUP-1): до 7 копий, только при изменениях.
+
+    Триггер: первый запуск (папки копий или отметки нет) либо реестр менялся
+    с момента последней успешной копии (ревизия в meta отличается от отметки,
+    или флаг dirty_since_backup). Содержимое копии — состояние базы на конец
+    предыдущего прогона: копия создаётся до изменений текущего сеанса.
+    Повторный запуск без изменений новых файлов не создаёт.
+
+    Отказ копирования не блокирует старт: предупреждение в журнале и
+    настройках, флаг изменений сохраняется — следующая попытка создаст копию.
+
+    Возвращает ``{'status': 'created'|'skipped'|'failed', 'path', 'message'}``.
+    """
+    log = applog.get_logger("storage")
+    # Карантин повреждённой базы / непрочитанный реестр: копировать пустое
+    # состояние нельзя — автокопии вытеснили бы хорошие копии.
+    if getattr(store, "load_warning", ""):
+        return {
+            "status": "skipped", "path": "",
+            "message": "Реестр не прочитан — автокопия отложена до чистого старта.",
+        }
+    marker = _read_backup_marker()
+    first_run = not marker or not _backup_files()
+    changed = bool(getattr(store, "dirty_since_backup", False)) or (
+        not first_run and marker.get("rev") != getattr(store, "registry_rev", 0)
+    )
+    if not first_run and not changed:
+        return {
+            "status": "skipped", "path": "",
+            "message": "Изменений с последней копии нет — копия не создаётся.",
+        }
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(backups_dir(), f"{BACKUP_FILE_PREFIX}{stamp}.db")
+    if not store.backup_db(dest):
+        return {
+            "status": "failed", "path": dest,
+            "message": (
+                "Копия реестра не создана (подробности в журнале). "
+                "Старт продолжен; попытка повторится при следующем запуске."
+            ),
+        }
+    settings_copied = _copy_settings_snapshot(
+        os.path.join(backups_dir(), f"{BACKUP_FILE_PREFIX}{stamp}{BACKUP_SETTINGS_SUFFIX}")
+    )
+    _rotate(backups_dir(), BACKUP_RETENTION)
+    state = {
+        "rev": getattr(store, "registry_rev", 0),
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "version": str(version_label or ""),
+        "file": os.path.basename(dest),
+        "settings": bool(settings_copied),
+    }
+    if not _write_backup_marker(state):
+        log.warning("Отметка о копии реестра не записана: %s", backup_marker_path())
+    # Флаг снимается только успешной копией (карточка BKUP-1).
+    store.dirty_since_backup = False
+    log.info(
+        "Автокопия реестра создана: %s (ревизия %d, settings=%s)",
+        dest, state["rev"], settings_copied,
+    )
+    message = "Копия реестра создана."
+    if not settings_copied:
+        message = "Копия реестра создана; settings.json скопировать не удалось."
+    return {"status": "created", "path": dest, "message": message}
+
+
+def create_update_snapshot(store, version_label: str = "") -> str:
+    """Снимок реестра перед обновлением (BKUP-1): отдельная папка, ротация до 3.
+
+    Снимок создаётся до скачивания/запуска установщика и до любых изменений
+    базы новой версией. Снимок ≠ автоматический откат версии приложения:
+    восстановление базы в более старую/новую версию — ручная операция,
+    совместимость данных проверяется владельцем. Снимки не вытесняют обычные
+    копии и в лимит 7 не входят.
+    """
+    log = applog.get_logger("storage")
+    if getattr(store, "load_warning", ""):
+        log.warning("Снимок перед обновлением не создан: реестр не прочитан")
+        return ""
+    safe_label = re.sub(r"[^0-9A-Za-z.\-]", "", str(version_label or "")) or "unknown"
+    dest = os.path.join(
+        snapshots_dir(), f"{BACKUP_FILE_PREFIX}v{safe_label}_pre-update.db"
+    )
+    if not store.backup_db(dest):
+        log.error("Снимок реестра перед обновлением не создан: %s", dest)
+        return ""
+    _rotate(snapshots_dir(), SNAPSHOT_RETENTION)
+    log.info("Снимок реестра перед обновлением создан: %s", dest)
+    return dest
+
+
+def backup_status_text() -> str:
+    """Состояние копий для блока настроек (без персональных данных)."""
+    marker = _read_backup_marker()
+    files = _backup_files()
+    if not marker and not files:
+        return ("Копий реестра пока нет — копия создаётся при запуске "
+                "после изменений в реестре.")
+    parts = []
+    if marker.get("time"):
+        parts.append(f"Последняя копия: {marker['time']}")
+    if marker.get("version"):
+        parts.append(f"версия {marker['version']}")
+    parts.append(f"копий в папке: {len(files)}")
+    if marker and not marker.get("settings", True):
+        parts.append("settings.json в последней копии нет")
+    return ", ".join(parts) + "."

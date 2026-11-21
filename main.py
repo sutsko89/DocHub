@@ -570,6 +570,9 @@ class ContractApp:
         if not self.store.active_counterparties():
             self.root.after(250, lambda: self._select_page("counterparty"))
         self.root.after(250, self._refresh_scrollbars)
+        # Автокопия реестра при запуске (BKUP-1): до 7 копий, только при
+        # изменениях с последней копии; отказ копирования старт не блокирует.
+        self.root.after(400, self._create_startup_backup)
         self.root.after(600, self._cleanup_temp_documents)
         # Автоочистка старой корзины и сверка «реестр ↔ папка документов».
         self.root.after(900, self._cleanup_expired_trash)
@@ -985,6 +988,23 @@ class ContractApp:
             self.root.destroy()
         except Exception:
             pass
+
+    def _create_startup_backup(self) -> None:
+        """Автокопия реестра при запуске (BKUP-1, карточка в roadmap)."""
+        try:
+            result = storage.create_startup_backup(self.store, APP_VERSION)
+        except Exception as exc:  # noqa: BLE001 — стартовая задача не должна падать
+            self._log.warning("Автокопия реестра не удалась: %s", type(exc).__name__)
+            return
+        if result["status"] == "failed":
+            self._log.warning("Автокопия реестра: %s", result["message"])
+        status_var = getattr(self, "_backup_status_var", None)
+        if status_var is not None:
+            status_var.set(
+                f"Последняя копия не удалась: {result['message']}"
+                if result["status"] == "failed"
+                else storage.backup_status_text()
+            )
 
     def _cleanup_temp_documents(self) -> None:
         """Удаляет *.docx.tmp, оставшиеся после аварийного завершения записи."""

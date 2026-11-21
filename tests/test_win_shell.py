@@ -223,3 +223,57 @@ def test_install_window_hooks_is_noop_on_linux():
     )
     assert not any(call[0] == "after" for call in fake.calls)
     assert not hasattr(fake, "_ew_hook")
+
+
+# --------------------------------------------------------------------------- #
+#  R-06 (PERF-2): кэш рабочей области по монитору
+# --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _clean_workarea_cache():
+    """Тесты кэша изолированы: пустой кэш до и после каждого теста."""
+    win_shell._WORKAREA_CACHE.clear()
+    yield
+    win_shell._WORKAREA_CACHE.clear()
+
+
+def test_cached_workarea_fetches_once_per_monitor():
+    calls: list[int] = []
+
+    def fetch():
+        calls.append(1)
+        return (0, 0, 1920, 1040)
+
+    assert win_shell._cached_workarea(11, fetch) == (0, 0, 1920, 1040)
+    assert win_shell._cached_workarea(11, fetch) == (0, 0, 1920, 1040)
+    assert len(calls) == 1, "второй тик того же монитора идёт в кэш"
+
+
+def test_cached_workarea_keeps_monitors_apart():
+    calls: list[int] = []
+
+    def fetch():
+        calls.append(1)
+        return (-1920, 0, 1920, 1040)
+
+    assert win_shell._cached_workarea(1, fetch) == (-1920, 0, 1920, 1040)
+    assert win_shell._cached_workarea(2, fetch) == (-1920, 0, 1920, 1040)
+    assert len(calls) == 2, "другой монитор опрашивается отдельно (не смешивается)"
+
+
+def test_cached_workarea_failure_is_not_cached():
+    attempts: list[int] = []
+
+    def fetch():
+        attempts.append(1)
+        return None
+
+    assert win_shell._cached_workarea(7, fetch) is None
+    assert win_shell._cached_workarea(7, fetch) is None
+    assert len(attempts) == 2, "сбой не кэшируется — следующий тик пробует снова"
+
+
+def test_cached_workarea_stays_bounded():
+    """Смена топологии дисплеев (много ключей) не растит кэш бесконечно."""
+    for key in range(win_shell._WORKAREA_CACHE_LIMIT + 3):
+        win_shell._cached_workarea(key, lambda: (0, 0, 1, 1))
+    assert len(win_shell._WORKAREA_CACHE) <= win_shell._WORKAREA_CACHE_LIMIT

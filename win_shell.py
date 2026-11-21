@@ -207,18 +207,60 @@ def workarea_at(root: tk.Misc | None, x: int, y: int) -> tuple[int, int, int, in
             # обязательны, restype — 64-битный хендл (как в _main_hwnd).
             user32.MonitorFromPoint.argtypes = [_POINT, ctypes.c_ulong]
             user32.MonitorFromPoint.restype = ctypes.c_void_p
+            user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            user32.GetMonitorInfoW.restype = ctypes.c_bool
             hmon = user32.MonitorFromPoint(
                 _POINT(int(x), int(y)), 2  # MONITOR_DEFAULTTONEAREST
             )
             if hmon:
-                info = _MONITORINFO()
-                info.cbSize = ctypes.sizeof(info)
-                if user32.GetMonitorInfoW(ctypes.c_void_p(hmon), ctypes.byref(info)):
-                    rc = info.rcWork
-                    return rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top
+                # R-06 (PERF-2): GetMonitorInfoW — через кэш по HMONITOR.
+                area = _cached_workarea(
+                    int(hmon), lambda: _monitor_workarea_from(user32, hmon),
+                )
+                if area is not None:
+                    return area
         except Exception as exc:  # noqa: BLE001 — есть fallback workarea()
             _log_win32_failure("MonitorFromPoint/GetMonitorInfoW", exc)
     return workarea(root)
+
+
+#: R-06 (PERF-2): кэш рабочих областей по хендлу монитора. Жесты
+#: перетаскивания спрашивают рабочую область ~60 раз в секунду; вызов
+#: GetMonitorInfoW на каждый тик — разовый хитч на медленных машинах.
+#: Кэш безопасен, потому что рабочая область монитора не меняется посреди
+#: жеста; ключ — сам HMONITOR, поэтому мониторы не смешиваются (курсор
+#: может переехать на второй монитор посреди переноса). Переполнение
+#: (смена топологии дисплеев — редкое событие) очищает кэш целиком.
+_WORKAREA_CACHE: dict[int, tuple[int, int, int, int]] = {}
+_WORKAREA_CACHE_LIMIT = 8
+
+
+def _cached_workarea(monitor_key: int, fetch) -> tuple[int, int, int, int] | None:
+    """Кэш рабочей области по ключу монитора (R-06, точка подмены в тестах).
+
+    ``fetch`` опрашивает Win32 ровно один раз на монитор; ``None``
+    (сбой GetMonitorInfoW) не кэшируется — следующий тик пробует снова.
+    """
+    cached = _WORKAREA_CACHE.get(monitor_key)
+    if cached is not None:
+        return cached
+    area = fetch()
+    if area is None:
+        return None
+    if len(_WORKAREA_CACHE) >= _WORKAREA_CACHE_LIMIT:
+        _WORKAREA_CACHE.clear()
+    _WORKAREA_CACHE[monitor_key] = area
+    return area
+
+
+def _monitor_workarea_from(user32, hmon) -> tuple[int, int, int, int] | None:
+    """Рабочая область конкретного монитора через GetMonitorInfoW."""
+    info = _MONITORINFO()
+    info.cbSize = ctypes.sizeof(info)
+    if user32.GetMonitorInfoW(ctypes.c_void_p(hmon), ctypes.byref(info)):
+        rc = info.rcWork
+        return rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top
+    return None
 def minimize_window(window: tk.Misc) -> None:
     if sys.platform == "win32":
         try:

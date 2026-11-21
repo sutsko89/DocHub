@@ -112,10 +112,28 @@ def test_press_arms_offset_without_blocking_calls():
     drag._press(event(150, 120))
     # offset = (x_root - winfo_x, y_root - winfo_y) = (50, 40)
     assert drag._offset == (50, 40)
-    assert any(call[0] == "update_idletasks" for call in window.calls), \
-        "геометрия пересчитывается на нажатии (on_start мог её сменить)"
+    assert not any(call[0] == "update_idletasks" for call in window.calls), \
+        "PERF-2 (P-11): update_idletasks в момент захвата нет — стартовый рывок"
     assert not any(call[0] == "geometry" for call in window.calls), \
         "в колбэке нажатия нет переноса окна"
+
+
+def test_on_start_placement_sets_offset_without_idle_flush():
+    """Восстановление из максимизации: offset считается от позиции,
+    которую отдал on_start, — без update_idletasks (PERF-2, P-11)."""
+    window = FakeDragWindow()
+    drag = ui.WindowDrag(window, on_start=lambda ev: (300, 200))
+    drag._press(event(350, 220))
+    assert drag._offset == (50, 20), "offset от позиции, отданной on_start"
+    assert not any(call[0] == "update_idletasks" for call in window.calls)
+
+
+def test_on_start_none_returns_falls_back_to_winfo():
+    """on_start без возврата (обычное окно): offset от winfo как раньше."""
+    window = FakeDragWindow()
+    drag = ui.WindowDrag(window, on_start=lambda ev: None)
+    drag._press(event(150, 120))
+    assert drag._offset == (50, 40)
 
 
 def test_manual_drag_moves_window():
@@ -335,7 +353,45 @@ def test_drag_center_does_not_snap(monkeypatch):
     drag._move(event(600, 500))
     drag._release(event(600, 500))
     assert applied == [], "в центре экрана прилипания нет"
-    assert "preview" not in preview_box, "подложка не создаётся без зоны"
+    preview = preview_box["preview"]
+    assert preview.shown == [], "подложка не показывается без зоны (P-12)"
+    assert preview.hidden >= 1, "заранее созданная подложка скрыта после жеста"
+
+
+def test_press_creates_no_preview_without_resolver():
+    """Без snap-резольвера подложка не создаётся вовсе (2.19.3-совместимость)."""
+    window = FakeDragWindow()
+    drag = ui.WindowDrag(window)
+    drag._press(event(150, 120))
+    assert drag._preview is None
+
+
+def test_preview_created_once_and_reused_across_gestures(monkeypatch):
+    """Подложка создаётся заранее скрытой один раз и переиспользуется:
+    Toplevel посреди жеста был разовым хитчем (PERF-2, P-12)."""
+    window = FakeDragWindow()
+    applied: list[tuple] = []
+    preview_box: dict = {}
+    factory_calls: list[int] = []
+    monkeypatch.setattr(ui, "virtual_screen_bounds", lambda: (0, 0, 1920, 1080))
+    drag = ui.WindowDrag(
+        window,
+        snap_resolver=lambda *a: ("left", (0, 0, 960, 1080)),
+        snap_apply=lambda zone, rect, start: applied.append((zone, rect, start)),
+        preview_factory=lambda: (
+            factory_calls.append(1),
+            preview_box.setdefault("preview", FakePreview()),
+        )[-1],
+    )
+    drag._press(event(150, 120))
+    assert len(factory_calls) == 1, "создание — в момент нажатия, заранее"
+    drag._move(event(60, 500))
+    drag._release(event(60, 500))
+    drag._press(event(150, 120))
+    drag._move(event(60, 500))
+    drag._release(event(60, 500))
+    assert len(factory_calls) == 1, "второй жест переиспользует подложку"
+    assert preview_box["preview"].hidden >= 2
 
 
 def test_drag_zone_leaving_hides_preview(monkeypatch):

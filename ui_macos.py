@@ -738,6 +738,10 @@ class SnapPreview(tk.Toplevel):
         self._rect = rect
         x, y, w, h = rect
         try:
+            # Подложка создаётся заранее и переиспользуется между жестами
+            # (PERF-2, P-12): тема могла смениться с момента создания —
+            # цвет акцента актуализируется при показе.
+            self.configure(bg=resolve(COLORS["accent"]))
             self.geometry(f"{max(w, 1)}x{max(h, 1)}+{x}+{y}")
             self.deiconify()
             self.lift()
@@ -866,14 +870,26 @@ class WindowDrag:
             widget.bind("<ButtonRelease-1>", self._release, add="+")
 
     def _press(self, event) -> None:
+        # PERF-2 (P-11): update_idletasks в жесте нажатия нет — он делал
+        # главный поток занятым в момент захвата (стартовый рывок).
+        # Геометрию мог сменить on_start (восстановление из максимизации
+        # /прилипания): позицию отдаёт сам on_start — winfo_x/winfo_y
+        # после geometry() могут быть устаревшими, а пересчитывать раскладку
+        # посреди жеста запрещено. Без восстановления winfo актуален и без
+        # принудительного прохода раскладки.
+        placed = None
         if self._on_start is not None:
-            self._on_start(event)
+            placed = self._on_start(event)
         try:
-            # Геометрия могла измениться в on_start (восстановление из
-            # максимизации/прилипания) — пересчитываем окно, чтобы оно
-            # не «убегало».
-            self._window.update_idletasks()
-            self._offset = (event.x_root - self._window.winfo_x(), event.y_root - self._window.winfo_y())
+            if isinstance(placed, tuple) and len(placed) == 2:
+                self._offset = (
+                    event.x_root - int(placed[0]), event.y_root - int(placed[1]),
+                )
+            else:
+                self._offset = (
+                    event.x_root - self._window.winfo_x(),
+                    event.y_root - self._window.winfo_y(),
+                )
         except Exception:
             self._offset = None
             return
@@ -890,6 +906,12 @@ class WindowDrag:
             self._bounds = virtual_screen_bounds()
         except Exception:
             self._bounds = None
+        # PERF-2 (P-12): подложка прилипания создаётся ЗАРАНЕЕ скрытой —
+        # Toplevel посреди жеста (первый вход в snap-зону) был разовым
+        # хитчем. Без snap-резольвера подложки нет вовсе. Созданный экземпляр
+        # переиспользуется между жестами (просто скрывается в _finish).
+        if self._snap_resolver is not None and self._preview is None:
+            self._preview = self._make_preview()
         self._poller.start()
 
     def _move(self, event) -> None:

@@ -485,6 +485,8 @@ class ContractApp:
         self._resize_origin = None
         self._resize_start = None
         self._resize_edge = None
+        # R-06 (PERF-2): рабочая область кэшируется на весь жест растягивания.
+        self._resize_area = None
         # Плавное растягивание (2.20.0): опрос курсора ~60 Гц вместо рваных
         # <B1-Motion> — тот же механизм, что и в плавном переносе шапки.
         self._resize_poller = ui.PointerPoller(self.root, self._resize_poll_step)
@@ -698,9 +700,15 @@ class ContractApp:
 
     def _start_move(self, event=None):
         """Перетаскивание развёрнутого/прилипшего окна: восстанавливаем размер
-        и ставим окно под курсор (пропорциональный перенос)."""
+        и ставим окно под курсор (пропорциональный перенос).
+
+        PERF-2 (P-03): update_idletasks в жесте снят — он делал главный
+        поток занятым прямо в момент захвата. Окно встаёт на (x, y)
+        силами geometry(), а фактическая позиция возвращается WindowDrag,
+        который считает offset от неё без пересчёта раскладки.
+        """
         if not self._zoomed and self._snap_zone is None:
-            return
+            return None
         self._zoomed = False
         self._snap_zone = None
         self.lights.set_zoomed(False)
@@ -720,9 +728,9 @@ class ContractApp:
             x = int(event.x_root - width * rel)
             y = int(event.y_root - int(24 * self.scale))
             self.root.geometry(f"{int(width)}x{int(height)}+{x}+{y}")
-        else:
-            self.root.geometry(f"{int(width)}x{int(height)}")
-        self.root.update_idletasks()
+            return x, y
+        self.root.geometry(f"{int(width)}x{int(height)}")
+        return None
 
     def toggle_zoom(self):
         """Настоящая максимизация окна (Win32 SW_MAXIMIZE / SW_RESTORE)."""
@@ -888,7 +896,7 @@ class ContractApp:
             self._snap_zone = None
             self.lights.set_zoomed(False)
             ui.restore_window(self.root)
-        self.root.update_idletasks()
+        # PERF-2 (P-03): update_idletasks в жесте растягивания снят.
         # 2.19.3: только ручное растягивание. Нативный модальный цикл
         # (2.17.0/2.19.1) удалён как причина вылетов без traceback —
         # см. WindowDrag._press. Ручной путь ниже — единственный.
@@ -898,6 +906,13 @@ class ContractApp:
         )
         self._resize_start = (event.x_root, event.y_root)
         self._resize_edge = edge
+        # R-06 (PERF-2): рабочая область кэшируется на весь жест — каждый
+        # тик пулера раньше звал workarea(), который внутри _main_hwnd
+        # гоняет update_idletasks (P-03) и Win32-опрос на ~60 Гц.
+        try:
+            self._resize_area = ui.workarea(self.root)
+        except Exception:
+            self._resize_area = None
         # Плавное растягивание (2.20.0): пулер тянет кромку ~60 Гц по
         # актуальной позиции курсора — Tk доставляет <B1-Motion> рвано.
         self._resize_poller.start()
@@ -924,8 +939,12 @@ class ContractApp:
         x, y, width, height = self._resize_origin
         # Рабочая область ТОГО монитора, где окно сейчас (п. 6.3): иначе
         # при частичном переносе на второй монитор растягивание зажималось
-        # размерами основного.
-        _area_x, _area_y, area_w, area_h = ui.workarea(self.root)
+        # размерами основного. R-06 (PERF-2): берётся из кэша жеста —
+        # без Win32-опроса и update_idletasks на каждый тик.
+        _area = self._resize_area
+        if _area is None:
+            _area = ui.workarea(self.root)
+        _area_x, _area_y, area_w, area_h = _area
         max_w = max(area_w, self._min_width)
         max_h = max(area_h, self._min_height)
 

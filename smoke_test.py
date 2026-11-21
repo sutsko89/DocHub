@@ -284,6 +284,12 @@ _orig_connect = storage._connect_db
 def _locked_connect(path, *args, **kwargs):
     raise sqlite3.OperationalError("database is locked (имитация антивируса)")
 
+# STORE-1A: инкрементальный save() пишет только dirty-изменения —
+# для проверки ретраев нужно несохранённое изменение (save=False).
+_p1.add_counterparty("ooo", {
+    "ИНН": "7709992222", "Сокращенное название компании": "ООО Вторая",
+}, save=False)
+
 storage._connect_db = _locked_connect
 _orig_sleep = time.sleep
 time.sleep = lambda _seconds: None  # ускоряем повторы записи

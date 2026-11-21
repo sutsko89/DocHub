@@ -165,10 +165,12 @@ def test_cp_save_reports_collect_failure_and_saves_nothing(monkeypatch):
 def test_cp_save_with_valid_data_passes_validation(monkeypatch):
     alerts: list[tuple] = []
     monkeypatch.setattr(main.ui, "alert", lambda *args, **kwargs: alerts.append(args))
+    # CHKSUM: значения с корректными контрольными цифрами (save_card
+    # отклоняет ИНН/ОГРН с опечаткой в контрольном разряде).
     app = make_app({"ooo": {
-        F.INN: FakeEntry("7701234567"),
+        F.INN: FakeEntry("7701234560"),
         F.KPP: FakeEntry("770101001"),
-        F.OGRN: FakeEntry("1037739010221"),
+        F.OGRN: FakeEntry("1037739010220"),
         F.LEGAL_ADDRESS: FakeEntry("г. Москва"),
         F.ACCOUNT: FakeEntry("40702810123456789012"),
         F.CORR_ACCOUNT: FakeEntry("30101810100000000225"),
@@ -200,4 +202,4 @@ def test_cp_save_with_valid_data_passes_validation(monkeypatch):
         app._counterparty_flow.save_card()
     assert not alerts, "валидация валидных данных не показывает ошибок"
     assert app.store.added[0] == "ooo"
-    assert app.store.added[1][F.INN] == "7701234567"
+    assert app.store.added[1][F.INN] == "7701234560"

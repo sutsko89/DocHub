@@ -95,6 +95,96 @@ def validate_bik(bik):
     if not bik:
         return False
     return bik.isdigit() and len(bik) == 9
+
+
+# --------------------------------------------------------------------------- #
+#  Контрольные цифры реквизитов (CHKSUM, этап 2 roadmap)
+# --------------------------------------------------------------------------- #
+# ИНН 10 (юр. лицо): веса для расчёта 10-й контрольной цифры.
+_INN10_WEIGHTS = (2, 4, 10, 3, 5, 9, 4, 6, 8)
+# ИНН 12 (ИП): веса для 11-й и 12-й контрольных цифр.
+_INN12_WEIGHTS_1 = (7, 2, 4, 10, 3, 5, 9, 4, 6, 8)
+_INN12_WEIGHTS_2 = (3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8)
+
+
+def _digits_of(value: str) -> list[int]:
+    return [int(ch) for ch in value]
+
+
+def inn_checksum_valid(inn) -> bool:
+    """Контрольные цифры ИНН: 10 цифр (юр. лицо) и 12 (ИП).
+
+    Официальный алгоритм (Приказ ФНС): 10-й разряд — взвешенная сумма
+    первых 9 цифр с весами _INN10_WEIGHTS по модулю 11 (младший разряд
+    остатка); для 12-значного ИНН — два прохода с разными весами
+    (11-я цифра, затем 11-я+12-я).
+    """
+    text = str(inn or "").strip()
+    if not text.isdigit():
+        return False
+    digits = _digits_of(text)
+    if len(digits) == 10:
+        control = sum(d * w for d, w in zip(digits[:9], _INN10_WEIGHTS)) % 11 % 10
+        return control == digits[9]
+    if len(digits) == 12:
+        control_11 = sum(d * w for d, w in zip(digits[:10], _INN12_WEIGHTS_1)) % 11 % 10
+        control_12 = sum(d * w for d, w in zip(digits[:11], _INN12_WEIGHTS_2)) % 11 % 10
+        return control_11 == digits[10] and control_12 == digits[11]
+    return False
+
+
+def ogrn_checksum_valid(ogrn) -> bool:
+    """Контрольная цифра ОГРН (13 цифр).
+
+    Официальный алгоритм: 13-й разряд — младший разряд остатка от
+    деления первых 12 цифр (как одного числа) на 11.
+    """
+    text = str(ogrn or "").strip()
+    if not text.isdigit() or len(text) != 13:
+        return False
+    return int(text[:12]) % 11 % 10 == int(text[12])
+
+
+def ogrnip_checksum_valid(ogrnip) -> bool:
+    """Контрольная цифра ОГРНИП (15 цифр).
+
+    Официальный алгоритм: 15-й разряд — младший разряд остатка от
+    деления первых 14 цифр (как одного числа) на 13.
+    """
+    text = str(ogrnip or "").strip()
+    if not text.isdigit() or len(text) != 15:
+        return False
+    return int(text[:14]) % 13 % 10 == int(text[14])
+
+
+def checksum_errors(data: dict, is_ip: bool = False, previous: dict | None = None) -> dict:
+    """Контрольные цифры только для НОВЫХ/ИЗМЕНЁННЫХ реквизитов (CHKSUM).
+
+    Возвращает словарь «поле → текст ошибки» в формате validate_party_fields.
+    Старые карточки не перепроверяются: значение сверяется с ``previous``
+    (поля карточки до редактирования) — если пользователь не менял реквизит,
+    проверка не выполняется. Это защищает существующие реестры: номер мог
+    быть введён до включения проверки контрольных сумм (длину по-прежнему
+    проверяет validate_party_fields).
+    """
+    errors: dict[str, str] = {}
+    old = previous or {}
+
+    inn = str(data.get(F.INN, "")).strip()
+    old_inn = str(old.get(F.INN, "")).strip()
+    if inn and inn != old_inn and not inn_checksum_valid(inn):
+        errors.setdefault(F.INN, "ИНН не проходит проверку контрольной цифры — проверьте ввод")
+
+    ogrn_key = F.OGRNIP if is_ip else F.OGRN
+    ogrn = str(data.get(ogrn_key, "")).strip()
+    old_ogrn = str(old.get(ogrn_key, "")).strip()
+    if ogrn and ogrn != old_ogrn:
+        if is_ip and not ogrnip_checksum_valid(ogrn):
+            errors.setdefault(ogrn_key, "ОГРНИП не проходит проверку контрольной цифры — проверьте ввод")
+        elif not is_ip and not ogrn_checksum_valid(ogrn):
+            errors.setdefault(ogrn_key, "ОГРН не проходит проверку контрольной цифры — проверьте ввод")
+
+    return errors
 REQUIRED_COMMON = (
     F.NUMBER, F.DAY, F.MONTH, F.INN,
     F.LEGAL_ADDRESS,

@@ -41,13 +41,28 @@ CounterpartyController = cc.CounterpartyController
 # Поля документа (номер/дата) в карточку контрагента не входят.
 DOCUMENT_KEYS = (F.NUMBER, F.DAY, F.MONTH)
 
+# CHKSUM (этап 2): карточки проходят проверку контрольных цифр — save_card
+# проверяет их для НОВЫХ/ИЗМЕНЁННЫХ реквизитов, поэтому тестовые ИНН/ОГРН
+# должны быть корректны. Значения ОOO_FIELDS/IP_FIELDS оставлены без изменений:
+# на них построены golden-эталоны печатных форм.
+OOO_CARD = {
+    k: str(v) for k, v in OOO_FIELDS.items() if k not in DOCUMENT_KEYS
+}
+OOO_CARD[F.INN] = "2540123459"       # контрольная цифра валидна
+OOO_CARD[F.OGRN] = "1035001234564"   # контрольная цифра валидна
+IP_CARD = {
+    k: str(v) for k, v in IP_FIELDS.items() if k not in DOCUMENT_KEYS
+}
+IP_CARD[F.INN] = "254012345692"       # 12-значный ИНН, обе контрольные валидны
+IP_CARD[F.OGRNIP] = "304253600012343"  # контрольная цифра валидна
+
 
 def ooo_card() -> dict:
-    return {k: str(v) for k, v in OOO_FIELDS.items() if k not in DOCUMENT_KEYS}
+    return dict(OOO_CARD)
 
 
 def ip_card() -> dict:
-    return {k: str(v) for k, v in IP_FIELDS.items() if k not in DOCUMENT_KEYS}
+    return dict(IP_CARD)
 
 
 # --------------------------------------------------------------------------- #
@@ -277,7 +292,7 @@ def test_save_card_duplicate_inn_open_existing(app, flow, ui_stub):
     assert len(app.choice_calls) == 1
     title, message, options = app.choice_calls[0]
     assert title == "Контрагент с таким ИНН уже есть"
-    assert OOO_FIELDS[F.INN] in message
+    assert OOO_CARD[F.INN] in message
     assert [opt[0] for opt in options] == ["open", "create", "cancel"]
 
     assert app.current_party == existing, "выбрана существующая карточка"
@@ -338,7 +353,7 @@ def test_save_card_success_flow(app, flow, ui_stub):
     assert len(app.store.counterparties) == 1
     rec = app.store.counterparties[0]
     assert rec["type"] == "ooo"
-    assert rec["fields"][F.INN] == OOO_FIELDS[F.INN]
+    assert rec["fields"][F.INN] == OOO_CARD[F.INN]
     assert app.calls == [
         ("baseline", "counterparty"), "combo", "status", "registry",
         ("set_party", rec), ("page", "contract"),

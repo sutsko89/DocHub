@@ -391,6 +391,11 @@ class CounterpartyController:
             return
 
         errors = validate_party_fields(data, is_ip)
+        # CHKSUM (этап 2): контрольные цифры для НОВОЙ карточки — все
+        # реквизиты считаются новыми (previous=None); опечатка в
+        # контрольной цифре ловится при вводе, а не у контрагента.
+        for key, message in services.checksum_errors(data, is_ip, previous=None).items():
+            errors.setdefault(key, message)
         if errors:
             for var in app._cp_error_vars[mode].values():
                 var.set("")
@@ -701,6 +706,11 @@ class CounterpartyController:
                 data[F.FACT_ADDRESS] = data.get(F.LEGAL_ADDRESS, "")
 
             errors = validate_party_fields(data, is_ip)
+            # CHKSUM (этап 2): контрольные цифры — только для изменённых
+            # реквизитов; старые карточки открываются и пересохраняются
+            # без перепроверки (сверка с прежним значением поля).
+            for key, message in services.checksum_errors(data, is_ip, previous=saved).items():
+                errors.setdefault(key, message)
             # ИНН должен оставаться уникальным в реестре.
             duplicate = app.store.find_by_inn(data.get(F.INN, "").strip())
             if duplicate is not None and duplicate.get("id") != rec.get("id"):

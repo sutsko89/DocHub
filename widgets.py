@@ -126,7 +126,7 @@ class SpecTable(ctk.CTkFrame):
         for col in (2, 3, 4):
             self.body.grid_columnconfigure(col, weight=0)
 
-        ui.register_theme_listener(self._apply_theme)
+        ui.register_theme_listener(self._apply_theme, owner=self)  # D8 (LEAK-1)
         self._apply_theme()
 
         for _ in range(self.MIN_ROWS):

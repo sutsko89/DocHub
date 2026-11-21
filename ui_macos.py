@@ -138,9 +138,34 @@ def resolve(color):
     return color
 
 
-def register_theme_listener(callback: Callable[[], None]) -> None:
-    """Регистрирует перерисовку для виджетов, которые рисуют себя сами (canvas)."""
+def register_theme_listener(callback: Callable[[], None], owner=None) -> None:
+    """Регистрирует перерисовку для виджетов, которые рисуют себя сами (canvas).
+
+    ``owner`` — виджет-владелец подписки (D8, LEAK-1): на его <Destroy>
+    подписка снимается автоматически. Раньше список был append-only:
+    каждое диалоговое окно (Sheet/Alert) и каждая подсказка ошибки в
+    окне редактирования навсегда оставляли своё замыкание в списке —
+    слушатели накапливались с каждым открытым окном, держали
+    уничтоженные виджеты в памяти и роняли исключения на смене темы.
+    Без ``owner`` подписка живёт до явного unregister_theme_listener
+    или до конца приложения.
+    """
     _LISTENERS.append(callback)
+    if owner is None:
+        return
+    try:
+        owner.bind(
+            "<Destroy>",
+            lambda _event, cb=callback: unregister_theme_listener(cb),
+            add="+",
+        )
+    except Exception:
+        pass  # duck-typed окно в тестах без bind — подписка живёт как раньше
+
+
+def unregister_theme_listener(callback: Callable[[], None]) -> None:
+    """Снимает подписку на смену темы (D8, LEAK-1)."""
+    _LISTENERS[:] = [item for item in _LISTENERS if item is not callback]
 
 
 def set_appearance_mode(mode: str) -> None:
@@ -466,7 +491,7 @@ class TrafficLights(tk.Canvas):
         self._glyph_items: list[int] = []
         self.bind("<Enter>", lambda _event: self._show_glyphs(True))
         self.bind("<Leave>", lambda _event: self._show_glyphs(False))
-        register_theme_listener(self._sync_theme)
+        register_theme_listener(self._sync_theme, owner=self)
 
     # -- внешний вид ------------------------------------------------------ #
     def _sync_theme(self) -> None:
@@ -559,7 +584,7 @@ class WindowControls(tk.Canvas):
         self.bind("<Leave>", lambda _event: self._set_hover(-1), add="+")
         self.bind("<ButtonPress-1>", self._on_press, add="+")
         self.bind("<ButtonRelease-1>", self._on_release, add="+")
-        register_theme_listener(self._sync_theme)
+        register_theme_listener(self._sync_theme, owner=self)
         self._draw()
 
     # -- состояния -------------------------------------------------------- #
@@ -1032,7 +1057,7 @@ class NavItem(tk.Canvas):
         self.bind("<Leave>", self._on_leave)
         self.bind("<Button-1>", lambda _event: self._command())
         self._draw()
-        register_theme_listener(self._draw)
+        register_theme_listener(self._draw, owner=self)
 
     def set_selected(self, selected: bool) -> None:
         if self._selected == selected:
@@ -1100,7 +1125,7 @@ class TopNavItem(tk.Canvas):
         self.bind("<Leave>", self._on_leave)
         self.bind("<Button-1>", lambda _event: self._command())
         self._draw()
-        register_theme_listener(self._draw)
+        register_theme_listener(self._draw, owner=self)
 
     def set_selected(self, selected: bool) -> None:
         if self._selected == selected:
@@ -1245,7 +1270,10 @@ class Card(ctk.CTkFrame):
                 fg=resolve(COLORS["error_text"]), bg=resolve(COLORS["card"]),
             )
             hint_label.grid(row=self._row, column=0, columnspan=2, sticky="w", pady=(0, 3))
-            register_theme_listener(lambda: _sync_error_hint(hint_label))
+            # D8 (LEAK-1): замыкание снимается вместе с подсказкой — окна
+            # редактирования создают подписки на каждое открытие.
+            hint_sync = lambda: _sync_error_hint(hint_label)  # noqa: E731
+            register_theme_listener(hint_sync, owner=hint_label)
             self._row += 1
 
         if hint:
@@ -1788,7 +1816,7 @@ class IconButton(tk.Canvas):
         self.bind("<Leave>", self._on_leave)
         self.bind("<Button-1>", lambda _event: self._command())
         self._draw()
-        register_theme_listener(self._draw)
+        register_theme_listener(self._draw, owner=self)
 
     def _on_enter(self, _event) -> None:
         self._hover = True
@@ -1872,7 +1900,7 @@ class ThemeIcon(tk.Canvas):
         self.bind("<Leave>", self._on_leave)
         self.bind("<Button-1>", lambda _event: self._command())
         self._draw()
-        register_theme_listener(self._draw)
+        register_theme_listener(self._draw, owner=self)
 
     def set_selected(self, selected: bool) -> None:
         if self._selected == selected:
@@ -1931,7 +1959,7 @@ class ThemeToggle(tk.Frame):
             btn.pack(side="left", padx=(0, px(6)))
             self._buttons[key] = btn
         self._sync()
-        register_theme_listener(self._sync)
+        register_theme_listener(self._sync, owner=self)
 
     def set(self, mode: str) -> None:
         self._mode = mode
@@ -1998,7 +2026,7 @@ class Sheet(ctk.CTkToplevel):
         self._drag.attach(self._header, self._title_label)
         self.geometry(f"{width}x{height}")
         self.bind("<Escape>", lambda _event: self._cancel())
-        register_theme_listener(self._sync_theme)
+        register_theme_listener(self._sync_theme, owner=self)
 
     def _sync_theme(self) -> None:
         try:
@@ -2104,7 +2132,7 @@ class Alert(ctk.CTkToplevel):
 
         self.bind("<Escape>", lambda _event: self._close())
         self.bind("<Return>", lambda _event: self._close())
-        register_theme_listener(self._sync_theme)
+        register_theme_listener(self._sync_theme, owner=self)
 
     def _draw_icon(self) -> None:
         self._icon.delete("all")

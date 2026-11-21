@@ -873,9 +873,9 @@ class ContractApp:
             handle.bind("<B1-Motion>", lambda event, e=edge: self._resize_drag(event, e))
             handle.bind("<ButtonRelease-1>", self._resize_release, add="+")
             handle.bind("<Double-Button-1>", lambda _event, e=edge: self.toggle_zoom())
-            ui.register_theme_listener(
-                lambda h=handle, key=color_key: self._sync_handle_theme(h, key)
-            )
+            # D8 (LEAK-1): подписка снимается вместе с хэндлом.
+            handle_sync = lambda h=handle, key=color_key: self._sync_handle_theme(h, key)  # noqa: E731
+            ui.register_theme_listener(handle_sync, owner=handle)
             self._resize_handles.append(handle)
 
         # Шапка — над корневыми хэндлами (иначе «e» перекрывал правый край

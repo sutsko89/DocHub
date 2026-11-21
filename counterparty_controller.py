@@ -55,6 +55,108 @@ import ui_macos as ui
 from document_builder import F, digits_only
 from services import validate_party_fields
 
+# Маркер в снимке полей: сбой чтения виджета отличается от пустой строки,
+# поэтому «поле сломалось» никогда не выглядит как «пользователь стёр значение».
+READ_ERROR_MARKER = "\x00поле-недоступно\x00"
+
+
+def read_entry_values(entries, log=None) -> tuple[dict, list[str]]:
+    """Читает значения полей; сбой чтения не превращается в пустую строку (D4).
+
+    Возвращает ``(data, failed)``: сбойные ключи в ``data`` не попадают —
+    вызывающий код обязан решить: блокировать сохранение (обязательные
+    поля) или явно спросить пользователя (необязательные). Поведение
+    совпадает с ``collect()`` страницы карточки: тип исключения — в журнал.
+    """
+    data: dict = {}
+    failed: list[str] = []
+    for key, widget in entries.items():
+        try:
+            data[key] = widget.get().strip()
+        except Exception as exc:
+            failed.append(key)
+            if log is not None:
+                log.warning(
+                    "Не удалось прочитать поле карточки «%s»: %s",
+                    key, type(exc).__name__,
+                )
+    return data, failed
+
+
+def form_signature(entries) -> dict:
+    """Снимок значений полей: сбой чтения помечается маркером, не пустотой."""
+    signature: dict = {}
+    for key, widget in entries.items():
+        try:
+            signature[key] = widget.get().strip()
+        except Exception:
+            signature[key] = READ_ERROR_MARKER
+    return signature
+
+
+def split_read_failures(failed: list[str], required_keys) -> tuple[list[str], list[str]]:
+    """Делит сбойные поля на обязательные (блокируют сохранение) и необязательные.
+
+    Пустое поле ввода — не сбой: блокируется только сохранение, когда
+    сломано чтение виджета обязательного поля. Сбой в необязательном поле
+    даёт пользователю явный выбор — молчаливой замены нет (аудит 2.0.1).
+    """
+    blocking = [key for key in failed if key in required_keys]
+    optional = [key for key in failed if key not in required_keys]
+    return blocking, optional
+
+
+def merge_saved_values(data: dict, optional: list[str], saved: dict) -> dict:
+    """Подставляет прежние значения сбойных необязательных полей.
+
+    Вызывается только после явного согласия пользователя («Сохранить
+    с прежними значениями») — молчаливой замены нет. Ключи, которых нет
+    среди сбойных, не трогаются.
+    """
+    for key in optional:
+        if key not in data:
+            data[key] = str(saved.get(key, "")).strip()
+    return data
+
+
+class EditCloseGuard:
+    """Подтверждение закрытия окна правки с несохранёнными изменениями (U8-MVP).
+
+    Закрытие крестиком молча теряло изменения: базовая защита форм (п. 4.4)
+    охватывает страницы, но не Toplevel. Guard снимает значения полей при
+    открытии окна и перед закрытием сравнивает снимок с текущими: без
+    изменений окно закрывается сразу (безопасно и для Escape), с
+    изменениями — спрашивает подтверждение. Сбой чтения поля считается
+    изменением (сравнение по маркеру, не по пустоте).
+    """
+
+    def __init__(self, window, entries, baseline, confirm_discard, log=None):
+        self.window = window
+        self.entries = entries
+        self.baseline = dict(baseline or {})
+        self._confirm_discard = confirm_discard
+        self._log = log
+        self._dialog_open = False
+
+    def has_changes(self) -> bool:
+        """Сравнение текущих значений с снимком открытия окна."""
+        return form_signature(self.entries) != self.baseline
+
+    def request_close(self) -> None:
+        """Единый обработчик крестика и Escape: закрывает или спрашивает."""
+        if not self.has_changes():
+            self.window.destroy()
+            return
+        if self._dialog_open:
+            return
+        self._dialog_open = True
+        try:
+            discard = bool(self._confirm_discard())
+        finally:
+            self._dialog_open = False
+        if discard:
+            self.window.destroy()
+
 
 class CounterpartyController:
     """Страница «Добавить контрагента» и редактирование карточки.
@@ -516,6 +618,27 @@ class CounterpartyController:
         add_field(F.BIK, F.BIK, kind="digits", max_len=9,
                   width=int(140 * app.scale), stretch=False, required=True)
 
+        # -- Защита карточки при закрытии (DEF-1: D4 + U8-MVP) -------------- #
+        # Снимок полей при открытии: сравнение «до/текущие» решает, нужно ли
+        # подтверждение при закрытии крестиком или Escape.
+        baseline = form_signature(entries)
+
+        def confirm_discard() -> bool:
+            choice = app._choice_dialog(
+                "Несохранённые изменения",
+                "Изменения карточки ещё не сохранены.\n\n"
+                "Закрыть окно без сохранения?",
+                [
+                    ("stay", "Вернуться к правке", True),
+                    ("close", "Закрыть без сохранения", False),
+                ],
+            )
+            return choice == "close"
+
+        close_guard = EditCloseGuard(win, entries, baseline, confirm_discard, log=app._log)
+        win.protocol("WM_DELETE_WINDOW", close_guard.request_close)
+        win.bind("<Escape>", lambda _event: close_guard.request_close())
+
         def highlight_errors(errors: dict[str, str]):
             for var in error_vars.values():
                 var.set("")
@@ -535,12 +658,45 @@ class CounterpartyController:
                     pass
 
         def save():
-            data = {}
-            for key, widget in entries.items():
-                try:
-                    data[key] = widget.get().strip()
-                except Exception:
-                    data[key] = ""
+            # D4: сбой чтения виджета не превращается в пустую строку —
+            # иначе «Сохранить» мог записать карточку с обнулёнными реквизитами.
+            data, failed = read_entry_values(entries, log=app._log)
+            if failed:
+                required_keys = (
+                    services.REQUIRED_PARTY_COMMON
+                    + (services.REQUIRED_IP if is_ip else services.REQUIRED_OOO)
+                )
+                blocking, optional = split_read_failures(failed, required_keys)
+                if blocking:
+                    app._log.error(
+                        "Сохранение карточки прервано: не удалось прочитать поля %s",
+                        ", ".join(blocking),
+                    )
+                    ui.alert(
+                        win, "Не удалось прочитать поля карточки",
+                        "Сохранение прервано: часть полей карточки недоступна "
+                        "(ошибка интерфейса).\n\nПоля: "
+                        + ", ".join(blocking)
+                        + "\n\nПереоткройте окно редактирования и попробуйте ещё раз. "
+                        "Подробности — в журнале (%APPDATA%\\DogovorGenerator\\logs).",
+                        "error",
+                    )
+                    return
+                # Сбой только в необязательных полях: явный выбор пользователя —
+                # молчаливой замены нет (частичный результат из карточки DEF-1).
+                choice = app._choice_dialog(
+                    "Поля недоступны",
+                    "Не удалось прочитать необязательные поля: "
+                    + ", ".join(optional) + ".\n\n"
+                    "Сохранить карточку с прежними значениями этих полей?",
+                    [
+                        ("keep", "Сохранить с прежними значениями", True),
+                        ("cancel", "Вернуться к правке", False),
+                    ],
+                )
+                if choice != "keep":
+                    return
+                data = merge_saved_values(data, optional, saved)
             if is_ip:
                 data[F.FACT_ADDRESS] = data.get(F.LEGAL_ADDRESS, "")
 
@@ -587,7 +743,7 @@ class CounterpartyController:
         footer = ctk.CTkFrame(win, fg_color="transparent")
         footer.pack(fill="x", padx=int(24 * app.scale), pady=(0, int(16 * app.scale)))
         ui.secondary_button(
-            footer, "Отмена", win.destroy,
+            footer, "Отмена", close_guard.request_close,
             width=int(140 * app.scale), height=int(30 * app.scale),
         ).pack(side="right")
         ui.primary_button(

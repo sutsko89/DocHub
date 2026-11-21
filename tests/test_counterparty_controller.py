@@ -31,6 +31,7 @@ import pytest
 
 import counterparty_controller as cc
 import document_context_controller
+import services
 import storage
 from document_builder import F
 from render_helpers import IP_FIELDS, OOO_FIELDS
@@ -372,3 +373,95 @@ def test_form_signature_degrades_to_none_on_widget_failure(app, flow):
     app._cp_entries["ooo"][F.INN] = BrokenEntry()
     assert document_context_controller.DocumentContextController(
         app).form_signature("counterparty") is None
+
+
+# --------------------------------------------------------------------------- #
+#  DEF-1: защита карточки при редактировании (D4 + U8-MVP)
+# --------------------------------------------------------------------------- #
+class FakeWindow:
+    """Минимальный аналог Toplevel: только destroy() (без Tk)."""
+
+    def __init__(self):
+        self.destroyed = 0
+
+    def destroy(self) -> None:
+        self.destroyed += 1
+
+
+def test_read_entry_values_returns_failed_keys():
+    entries = {"inn": FakeEntry(" 123 "), "email": BrokenEntry()}
+    data, failed = cc.read_entry_values(entries)
+    assert data == {"inn": "123"}
+    assert failed == ["email"], "сбойное поле не попадает в data молча"
+
+
+def test_read_entry_values_logs_failure(caplog):
+    with caplog.at_level(logging.WARNING, logger="test-counterparty-controller"):
+        cc.read_entry_values({"email": BrokenEntry()}, log=logging.getLogger(
+            "test-counterparty-controller"))
+    assert "email" in caplog.text and "RuntimeError" in caplog.text
+
+
+def test_form_signature_marks_broken_field():
+    signature = cc.form_signature({"a": FakeEntry("x"), "b": BrokenEntry()})
+    assert signature["b"] == cc.READ_ERROR_MARKER
+    assert signature["b"] != "", "сбой чтения не выглядит как пустая строка"
+
+
+def test_split_read_failures_separates_required_and_optional():
+    required = services.REQUIRED_PARTY_COMMON + services.REQUIRED_OOO
+    blocking, optional = cc.split_read_failures([F.INN, F.EMAIL, F.PHONE], required)
+    assert blocking == [F.INN], "обязательное поле блокирует сохранение"
+    assert optional == [F.EMAIL, F.PHONE]
+
+
+def test_merge_saved_values_fills_only_failed_optional():
+    saved = {F.EMAIL: "old@test.ru", F.PHONE: "+7 4212 00-00-00"}
+    data = cc.merge_saved_values({F.INN: "2540123456"}, [F.EMAIL], saved)
+    assert data[F.EMAIL] == "old@test.ru", "прежнее значение подставлено"
+    assert F.PHONE not in data, "несбойные поля не трогаются"
+
+
+def test_close_guard_closes_without_changes():
+    window = FakeWindow()
+    entries = {"a": FakeEntry("x")}
+    guard = cc.EditCloseGuard(window, entries, cc.form_signature(entries),
+                              lambda: pytest.fail("без изменений подтверждения нет"))
+    guard.request_close()
+    assert window.destroyed == 1
+
+
+def test_close_guard_asks_confirm_with_changes_and_closes():
+    window = FakeWindow()
+    entries = {"a": FakeEntry("x")}
+    baseline = cc.form_signature(entries)
+    asked = []
+    guard = cc.EditCloseGuard(
+        window, entries, baseline, lambda: asked.append(1) or True)
+    entries["a"]._value = "y"  # пользователь изменил поле
+    guard.request_close()
+    assert asked, "при изменениях показано подтверждение"
+    assert window.destroyed == 1, "согласие закрывает окно"
+
+
+def test_close_guard_stays_when_discard_declined():
+    window = FakeWindow()
+    entries = {"a": FakeEntry("x")}
+    baseline = cc.form_signature(entries)
+    guard = cc.EditCloseGuard(window, entries, baseline, lambda: False)
+    entries["a"]._value = "y"
+    guard.request_close()
+    assert window.destroyed == 0, "отказ оставляет окно открытым"
+
+
+def test_close_guard_treats_read_failure_as_change():
+    window = FakeWindow()
+    entries = {"a": FakeEntry("x"), "b": FakeEntry("y")}
+    baseline = cc.form_signature(entries)
+    asked = []
+    guard = cc.EditCloseGuard(
+        window, entries, baseline, lambda: asked.append(1) or False)
+    entries["b"] = BrokenEntry()  # виджет сломался посреди правки
+    guard.request_close()
+    assert asked, "сбой чтения поля не позволяет закрыть окно молча"
+    assert window.destroyed == 0

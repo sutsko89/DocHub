@@ -13,6 +13,8 @@ import sys
 
 import tkinter as tk
 
+import applog  # WINLOG-1: деградации Win32-вызовов видны в app.log
+
 #: Сообщения окна, обрабатываемые единым подклассом WndProc (п. 6.3).
 WM_DROPFILES = 0x0233
 WM_DPICHANGED = 0x02E0
@@ -27,6 +29,23 @@ _SM_YVIRTUALSCREEN = 77
 _SM_CXVIRTUALSCREEN = 78
 _SM_CYVIRTUALSCREEN = 79
 _SWP_FRAMECHANGED_FLAGS = 0x1 | 0x2 | 0x4 | 0x20  # NOMOVE|NOSIZE|NOZORDER|FRAMECHANGED
+
+
+def _log_win32_failure(operation: str, exc: Exception) -> None:
+    """WINLOG-1: сбой Win32-вызова остаётся в app.log с именем операции.
+
+    История вылетов 2.17.0–2.19.3 с пустым crash.log показала цену
+    недиагностируемости: 24 молчаливых except в этом модуле съедали
+    и ошибку, и след. Теперь каждый сбой пишет предупреждение с
+    системным именем операции (без персональных данных: тип исключения
+    и имя вызова, без текста с путями).
+    """
+    try:
+        applog.get_logger("win_shell").warning(
+            "Win32 «%s» не выполнен: %s", operation, type(exc).__name__,
+        )
+    except Exception:  # noqa: BLE001 — лог никогда не роняет вызывающий код
+        pass
 
 
 class _RECT(ctypes.Structure):
@@ -57,8 +76,8 @@ def enable_rounded_corners(window: tk.Misc) -> None:
         ctypes.windll.dwmapi.DwmSetWindowAttribute(
             hwnd, 33, ctypes.byref(preference), ctypes.sizeof(preference)
         )
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — скругление не критично
+        _log_win32_failure("DwmSetWindowAttribute", exc)
 def make_borderless(window: tk.Misc, taskbar_button: bool = True) -> None:
     """Убирает системную рамку, оставляя окно в панели задач и Alt+Tab.
 
@@ -95,19 +114,19 @@ def make_borderless(window: tk.Misc, taskbar_button: bool = True) -> None:
             _SWP_FRAMECHANGED_FLAGS,
         )
         enable_rounded_corners(window)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — рамка не критична
+        _log_win32_failure("SetWindowLongW/SetWindowPos", exc)
 def focus_window(window: tk.Misc) -> None:
     if sys.platform == "win32":
         try:
             ctypes.windll.user32.SetForegroundWindow(_main_hwnd(window))
             return
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — есть fallback focus_force
+            _log_win32_failure("SetForegroundWindow", exc)
     try:
         window.focus_force()
     except Exception:
-        pass
+        pass  # tk-fallback: не Win32, тишина допустима
 def refresh_taskbar(window: tk.Misc) -> None:
     """Пересоздаёт кнопку в панели задач после смены стиля окна."""
     if sys.platform != "win32":
@@ -115,8 +134,8 @@ def refresh_taskbar(window: tk.Misc) -> None:
     try:
         window.withdraw()
         window.after(12, lambda: (window.deiconify(), focus_window(window)))
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — кнопка уже на месте
+        _log_win32_failure("refresh_taskbar", exc)
 class _MONITORINFO(ctypes.Structure):
     _fields_ = [
         ("cbSize", ctypes.c_ulong),
@@ -136,21 +155,33 @@ def workarea(window: tk.Misc | None = None) -> tuple[int, int, int, int]:
         if window is not None:
             try:
                 hwnd = _main_hwnd(window)
-                hmon = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+                user32 = ctypes.windll.user32
+                # D6 (WINLOG-1): argtypes/restype обязательны — без них
+                # ctypes вернёт усечённый c_int вместо 64-битного HMONITOR
+                # (как в MonitorFromPoint/workarea_at и _main_hwnd).
+                user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+                user32.MonitorFromWindow.restype = ctypes.c_void_p
+                user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                user32.GetMonitorInfoW.restype = ctypes.c_bool
+                hmon = user32.MonitorFromWindow(
+                    ctypes.c_void_p(hwnd), 2,  # MONITOR_DEFAULTTONEAREST
+                )
                 if hmon:
                     info = _MONITORINFO()
                     info.cbSize = ctypes.sizeof(info)
-                    if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                    if user32.GetMonitorInfoW(
+                        ctypes.c_void_p(hmon), ctypes.byref(info),
+                    ):
                         rc = info.rcWork
                         return rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 — есть fallback ниже
+                _log_win32_failure("MonitorFromWindow/GetMonitorInfoW", exc)
         rect = _RECT()
         try:
             if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
                 return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — крайний fallback 1920×1080
+            _log_win32_failure("SystemParametersInfoW(SPI_GETWORKAREA)", exc)
     else:
         # Не Windows: используем размеры экрана Tk (п. 6.3 — не «только 1920×1080»).
         try:
@@ -158,7 +189,7 @@ def workarea(window: tk.Misc | None = None) -> tuple[int, int, int, int]:
             if source is not None:
                 return 0, 0, source.winfo_screenwidth(), source.winfo_screenheight()
         except Exception:
-            pass
+            pass  # tk-fallback: не Win32, тишина допустима
     return 0, 0, 1920, 1080
 def workarea_at(root: tk.Misc | None, x: int, y: int) -> tuple[int, int, int, int]:
     """Рабочая область монитора, на котором лежит точка (x, y) (2.20.0).
@@ -185,20 +216,20 @@ def workarea_at(root: tk.Misc | None, x: int, y: int) -> tuple[int, int, int, in
                 if user32.GetMonitorInfoW(ctypes.c_void_p(hmon), ctypes.byref(info)):
                     rc = info.rcWork
                     return rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — есть fallback workarea()
+            _log_win32_failure("MonitorFromPoint/GetMonitorInfoW", exc)
     return workarea(root)
 def minimize_window(window: tk.Misc) -> None:
     if sys.platform == "win32":
         try:
             ctypes.windll.user32.ShowWindow(_main_hwnd(window), 6)  # SW_MINIMIZE
             return
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — есть fallback iconify()
+            _log_win32_failure("ShowWindow(SW_MINIMIZE)", exc)
     try:
         window.iconify()
     except Exception:
-        pass
+        pass  # tk-fallback: не Win32, тишина допустима
 def maximize_window(window: tk.Misc) -> None:
     """Разворачивает окно ровно на рабочую область: панель задач остаётся видимой.
 
@@ -214,12 +245,12 @@ def maximize_window(window: tk.Misc) -> None:
         if width > 0 and height > 0:
             window.geometry(f"{width}x{height}+{x}+{y}")
             return
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — есть системный fallback
+        _log_win32_failure("maximize_window(workarea)", exc)
     try:
         window.state("zoomed")
     except Exception:
-        pass
+        pass  # tk-fallback: не Win32, тишина допустима
 def restore_window(window: tk.Misc, geometry: str = "") -> None:
     """Возврат из максимизации: применяет прежнюю геометрию, если она задана.
 
@@ -234,17 +265,17 @@ def restore_window(window: tk.Misc, geometry: str = "") -> None:
             window.geometry(geometry)
             return
         except Exception:
-            pass
+            pass  # tk-fallback: не Win32, тишина допустима
     if sys.platform == "win32":
         try:
             ctypes.windll.user32.ShowWindow(_main_hwnd(window), 9)  # SW_RESTORE
             return
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — есть fallback state('normal')
+            _log_win32_failure("ShowWindow(SW_RESTORE)", exc)
     try:
         window.state("normal")
     except Exception:
-        pass
+        pass  # tk-fallback: не Win32, тишина допустима
 
 
 def _get_system_metrics(index: int) -> int:
@@ -272,14 +303,14 @@ def virtual_screen_bounds() -> tuple[int, int, int, int]:
             height = _get_system_metrics(_SM_CYVIRTUALSCREEN)
             if width > 0 and height > 0:
                 return x, y, width, height
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — есть экран Tk и fallback
+            _log_win32_failure("GetSystemMetrics(SM_*VIRTUALSCREEN)", exc)
     try:
         source = getattr(tk, "_default_root", None)
         if source is not None:
             return 0, 0, source.winfo_screenwidth(), source.winfo_screenheight()
     except Exception:
-        pass
+        pass  # tk-fallback: не Win32, тишина допустима
     return 0, 0, 1920, 1080
 
 
@@ -297,11 +328,12 @@ def enable_dpi_awareness() -> None:
         return
     try:  # чёткий текст на экранах с масштабированием (125 %, 150 % и т. д.)
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — легально: режим уже установлен
+        _log_win32_failure("SetProcessDpiAwareness", exc)
         try:
             ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
+        except Exception as exc2:  # noqa: BLE001 — системный DPI по умолчанию
+            _log_win32_failure("SetProcessDPIAware", exc2)
 
 
 def dpi_scale_from_wparam(wparam: int) -> float:
@@ -358,11 +390,37 @@ def documents_known_folder() -> str:
                 return documents
             if out.value:
                 ctypes.windll.ole32.CoTaskMemFree(out)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — есть USERPROFILE-fallback
+            _log_win32_failure("SHGetKnownFolderPath", exc)
         profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
         return os.path.join(profile, "Documents")
     return os.path.join(os.path.expanduser("~"), "Documents")
+
+
+def _drag_files(shell32, wparam: int) -> list[str]:
+    """Читает список файлов из HDROP; DragFinish — ВСЕГДА (D7, WINLOG-1).
+
+    DragFinish освобождает системную память списка файлов: без него при
+    каждом сбое DragQueryFileW HDROP утекал (D7). Раньше DragFinish
+    стоял в середине try — при исключении чтения он не выполнялся.
+    Здесь он в finally: освобождение гарантировано при любом исходе,
+    включая сбой чтения имени файла посреди списка.
+    """
+    files: list[str] = []
+    try:
+        count = shell32.DragQueryFileW(ctypes.c_void_p(wparam), 0xFFFFFFFF, None, 0)
+        for index in range(count):
+            length = shell32.DragQueryFileW(ctypes.c_void_p(wparam), index, None, 0)
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            shell32.DragQueryFileW(ctypes.c_void_p(wparam), index, buffer, length + 1)
+            if buffer.value:
+                files.append(buffer.value)
+        return files
+    finally:
+        try:
+            shell32.DragFinish(ctypes.c_void_p(wparam))
+        except Exception:  # noqa: BLE001 — освобождение не роняет хендлер
+            pass
 
 
 def install_window_hooks(
@@ -416,26 +474,12 @@ def install_window_hooks(
         def handler(h, msg, wparam, lparam):
             if msg == WM_DROPFILES and on_files is not None:
                 try:
-                    count = shell32.DragQueryFileW(
-                        ctypes.c_void_p(wparam), 0xFFFFFFFF, None, 0
-                    )
-                    files: list[str] = []
-                    for index in range(count):
-                        length = shell32.DragQueryFileW(
-                            ctypes.c_void_p(wparam), index, None, 0
-                        )
-                        buffer = ctypes.create_unicode_buffer(length + 1)
-                        shell32.DragQueryFileW(
-                            ctypes.c_void_p(wparam), index, buffer, length + 1
-                        )
-                        if buffer.value:
-                            files.append(buffer.value)
-                    shell32.DragFinish(ctypes.c_void_p(wparam))
+                    files = _drag_files(shell32, wparam)
                     if files:
                         window.after(0, lambda f=list(files): on_files(f))
                     return 0
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001 — хук не роняет окно
+                    _log_win32_failure("DragQueryFileW(WM_DROPFILES)", exc)
             if msg == WM_DPICHANGED and on_dpi_changed is not None:
                 try:
                     dpi = (int(wparam) >> 16) & 0xFFFF
@@ -443,8 +487,8 @@ def install_window_hooks(
                         rect = suggested_rect_from_lparam(lparam)
                         window.after(0, lambda d=dpi, r=rect: on_dpi_changed(d, r))
                         return 0
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001 — хук не роняет окно
+                    _log_win32_failure("WM_DPICHANGED", exc)
             return user32.CallWindowProcW(old_proc, h, msg, wparam, lparam)
 
         hook = wndproc_type(handler)
@@ -456,5 +500,5 @@ def install_window_hooks(
         window._ew_hook = hook
         window._ew_hook_old_proc = old_proc
         window._ew_hook_hwnd = hwnd
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — хуки не обязательны для работы
+        _log_win32_failure("install_window_hooks", exc)

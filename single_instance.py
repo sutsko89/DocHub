@@ -79,6 +79,25 @@ def _user_sid() -> str:
         return ""
 
 
+def _log_mutex_degradation(name: str, last_error: int) -> None:
+    """WINLOG-1 (D10): деградация Global → Local видна в app.log.
+
+    CreateMutexW вернул NULL для кандидата с ``Global\\`` — обычно
+    нет прав на сессионное пространство объектов. Сл­учайная деградация
+    на ``Local\\`` раньше была молчаливой: у пользователя одной сессии
+    всё работало, а две сессии одного пользователя (консоль + RDP)
+    могли запуститься одновременно без единой записи в журнале.
+    """
+    try:
+        applog.get_logger("single_instance").warning(
+            "Мьютекс «%s» не создан (CreateMutexW: ошибка %d) — "
+            "деградация на Local-вариант: защита между сессиями ослаблена",
+            name, last_error,
+        )
+    except Exception:  # noqa: BLE001 — лог никогда не роняет блокировку
+        pass
+
+
 def mutex_name() -> str:
     """Имя мьютекса защиты данных: ``Global\\`` + SID пользователя.
 
@@ -118,15 +137,20 @@ class InstanceLock:
                 handle = kernel32.CreateMutexW(None, False, name)
                 # GetLastError читаем сразу после вызова: use_last_error=True
                 # сохраняет именно ошибку этого вызова (аудит 2.0.1).
-                exists = ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+                last_error = ctypes.get_last_error()
+                exists = last_error == ERROR_ALREADY_EXISTS
                 if exists and handle:
                     kernel32.CloseHandle(handle)
                     self._release_all()
                     return False
                 if not handle:
-                    # Создать не удалось (например, нет прав на Global\ в этой
-                    # сессии) — пробуем следующий вариант имени, но не роняем
-                    # и не блокируем запуск.
+                    # Создать не удалось (например, нет прав на Global\ в
+                    # этой сессии) — пробуем следующий вариант имени, но
+                    # не роняем и не блокируем запуск. Деградация — в лог
+                    # (WINLOG-1, D10): иначе две сессии одного пользователя
+                    # работают без взаимной блокировки, и никто об этом
+                    # не узнает.
+                    _log_mutex_degradation(name, last_error)
                     continue
                 self._handles.append(handle)
             return True
@@ -166,6 +190,10 @@ def activate_existing_window() -> bool:
         return False
     try:
         user32 = ctypes.windll.user32
+        # WINLOG-1 (D6): restype обязателен — HWND не должен усекаться
+        # до c_int (та же гигиена, что в _main_hwnd/install_window_hooks).
+        user32.FindWindowW.restype = ctypes.c_void_p
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
         hwnd = user32.FindWindowW(None, WINDOW_TITLE)
         if not hwnd:
             return False

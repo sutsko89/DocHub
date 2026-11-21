@@ -60,6 +60,8 @@ import ui_macos as ui
 import updater
 import win_shell
 
+import applog  # WINLOG-1: кнопка «Открыть папку журналов»
+
 
 class SettingsController:
     """Страница «Настройки», ключ DaData и папка документов.
@@ -269,6 +271,32 @@ class SettingsController:
             pady=(int(4 * app.scale), int(2 * app.scale)),
         )
 
+        # -- Диагностика (WINLOG-1) ----------------------------------------- #
+        # app.log — события и Win32-деградации, crash.log — дамп критических
+        # сбоев, perf.log — замеры производительности (EWDOCHUB_PERF_LOG).
+        # Кнопка нужна для диагностики машин пользователей: по журналу видно,
+        # какой Win32-вызов деградировал (до и после правок перетаскивания).
+        card = ui.Card(left, labels_above=True)
+        card.grid(row=5, column=0, sticky="new", padx=int(4 * app.scale), pady=(0, int(12 * app.scale)))
+        card.section("Диагностика")
+        card.wide(
+            ctk.CTkLabel(
+                card.body,
+                text="В журнале видны события программы, медленные операции и "
+                     "сбои Win32-вызовов с именем операции. Журнал не содержит "
+                     "реквизитов и раскрывает путь только внутри профиля "
+                     "пользователя — его можно переслать целиком.",
+                font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
+                anchor="w", justify="left",
+                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+            ),
+            pady=(int(2 * app.scale), int(6 * app.scale)),
+        )
+        ui.secondary_button(
+            card.body, "Открыть папку журналов", app._settings_flow.open_logs_folder,
+            width=int(190 * app.scale), height=int(30 * app.scale),
+        ).pack(anchor="w")
+
     # ------------------------------------------------------------------ #
     #  Копии реестра (BKUP-1)
     # ------------------------------------------------------------------ #
@@ -285,6 +313,19 @@ class SettingsController:
         except OSError:
             pass
         self.app._open_file(storage.backups_dir())
+
+    def open_logs_folder(self) -> None:
+        """Открывает папку журналов app.log/crash.log/perf.log (WINLOG-1).
+
+        Папка создаётся при отсутствии: кнопка работает и на свежей
+        установке, где журналов ещё нет. Открытие — через общий фасад
+        ``app._open_file`` (см. маршруты подмен в докстринге модуля).
+        """
+        try:
+            os.makedirs(applog.log_dir(), exist_ok=True)
+        except OSError:
+            pass
+        self.app._open_file(applog.log_dir())
 
     # ------------------------------------------------------------------ #
     #  Ключ DaData

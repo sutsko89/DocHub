@@ -92,7 +92,8 @@ class DocumentSaveController:
         right.grid_rowconfigure(1, weight=0)
         right.grid_rowconfigure(2, weight=1)
 
-        app.spec_table = SpecTable(right, scale=app.scale)
+        # PERF-1: сообщение об обрезке вставки из Excel — тостом, немодально.
+        app.spec_table = SpecTable(right, scale=app.scale, on_notice=app._notify)
         app.spec_table.grid(row=1, column=0, sticky="ew",
                             padx=int(12 * app.scale), pady=(int(4 * app.scale), 0))
 

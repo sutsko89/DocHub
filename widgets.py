@@ -33,10 +33,15 @@ class SpecTable(ctk.CTkFrame):
     # Ширина фиксированных колонок в логических пикселях (№, Кол-во, Ед. изм., Цена).
     COL_WIDTHS = {0: 34, 2: 64, 3: 84, 4: 150}
 
-    def __init__(self, master, scale: float = 1.0, on_change=None, **kwargs):
+    def __init__(self, master, scale: float = 1.0, on_change=None,
+                 on_notice=None, **kwargs):
         super().__init__(master, fg_color="transparent", corner_radius=0, **kwargs)
         self.scale = scale
         self.on_change = on_change
+        # Немодальное сообщение об обрезке вставки (PERF-1): вызывающий код
+        # показывает его тостом; None — только last_paste_notice для тестов.
+        self.on_notice = on_notice
+        self.last_paste_notice = ""
         self._rows: list[dict] = []
         self._batch = False  # подавление on_change при массовой вставке
         self._selected_row: int | None = None
@@ -483,7 +488,13 @@ class SpecTable(ctk.CTkFrame):
         return "break"
 
     def _paste_block(self, start_cell: tuple[int, int]) -> bool:
-        """Вставляет блок текста (TSV) начиная с ячейки start_cell."""
+        """Вставляет блок текста (TSV) начиная с ячейки start_cell.
+
+        PERF-1 (D2/R-08): вставка ограничена MAX_ROWS с учётом стартовой
+        ячейки r0 — как поле «Строк:». Обрезанные строки не теряются
+        незаметно: сообщение называет оба числа («Вставлено 500, отброшено
+        100»), данные остаются в источнике. Ровно до лимита — без сообщения.
+        """
         try:
             raw = self.clipboard_get()
         except Exception:
@@ -496,13 +507,14 @@ class SpecTable(ctk.CTkFrame):
             return False
 
         r0, c0 = start_cell
-        need = r0 + len(matrix) - len(self._rows)
+        usable, dropped = self._paste_plan(matrix, r0, self.MAX_ROWS)
+        need = r0 + len(usable) - len(self._rows)
         for _ in range(max(0, need)):
             self._add_row()
 
         self._batch = True
         try:
-            for dr, values in enumerate(matrix):
+            for dr, values in enumerate(usable):
                 mapped = self._map_row(values)
                 for dc, value in enumerate(mapped):
                     col = c0 + dc
@@ -515,8 +527,43 @@ class SpecTable(ctk.CTkFrame):
                     self._rows[r0 + dr][key].set(self._sanitize_value(key, value))
         finally:
             self._batch = False
+        if dropped:
+            self.last_paste_notice = self.paste_notice_text(
+                len(usable), dropped, self.MAX_ROWS,
+            )
+            if self.on_notice:
+                try:
+                    self.on_notice(self.last_paste_notice)
+                except Exception:
+                    pass
+        else:
+            self.last_paste_notice = ""
         self._notify()
         return True
+
+    @staticmethod
+    def _paste_plan(matrix: list[list[str]], start_row: int,
+                    max_rows: int) -> tuple[list[list[str]], int]:
+        """Обрезает вставляемый блок до лимита таблицы (PERF-1).
+
+        Возвращает ``(usable, dropped)`` — строки, которые встанут в таблицу
+        (итого после вставки не более ``max_rows`` с учётом стартовой ячейки
+        ``start_row``), и число отброшенных строк. Логика совпадает с полем
+        «Строк:» (set_row_count ограничена тем же MAX_ROWS).
+        """
+        capacity = max(0, max_rows - max(0, start_row))
+        if len(matrix) <= capacity:
+            return matrix, 0
+        return matrix[:capacity], len(matrix) - capacity
+
+    @staticmethod
+    def paste_notice_text(inserted: int, dropped: int, max_rows: int) -> str:
+        """Сообщение об обрезке вставки: «Вставлено 500, отброшено 100 …»."""
+        return (
+            f"Вставлено {inserted}, отброшено {dropped}: лимит таблицы — "
+            f"{max_rows} строк. Остальные строки остались в источнике и в "
+            "буфере обмена."
+        )
 
     def _map_row(self, cells: list[str]) -> list[str]:
         """Эвристика раскладки вставленных столбцов по колонкам таблицы."""

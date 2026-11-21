@@ -36,6 +36,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Публичный репозиторий проекта: последний релиз (не pre-release, не draft).
@@ -58,11 +59,37 @@ SETTINGS_KEY_AUTO = "auto_update_check"
 CHUNK_SIZE = 256 * 1024
 SUMS_ASSET_NAME = "sha256sums.txt"
 
+# SEC-1 (D11): канал обновлений ходит только на хосты GitHub. Ссылки
+# ассетов приходят из JSON релиза — компрометация релиза/перенаправление
+# больше не подменяет источник установщика. objects.githubusercontent.com —
+# фактический хост раздачи ассетов GitHub Releases (redirect от github.com).
+ALLOWED_DOWNLOAD_HOSTS = frozenset({
+    "api.github.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+})
+
+# SEC-1 (D11): лимит размера скачивания. Установщик PyInstaller ~ 40–80 МБ;
+# лимит — с запасом на рост. Превышение обрывает загрузку: усечённый файл
+# всё равно не пройдёт проверку SHA-256, тянуть гигабайты бессмысленно.
+MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
+# SHA256SUMS.txt — маленький текстовый файл; большего не бывает.
+MAX_TEXT_BYTES = 1024 * 1024
+
 _USER_AGENT = "EW.DocHub-Updater"
 
 
 class DownloadCancelled(Exception):
     """Пользователь отменил скачивание обновления (кнопка «Отмена»)."""
+
+
+class DownloadNotAllowed(Exception):
+    """URL вне allowlist хостов или превышен лимит размера (SEC-1, D11).
+
+    Возбуждается ДО сетевого запроса для чужого хоста — скачивание не
+    начинается вовсе; превышение размера обрывает загрузку посреди потока.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -75,6 +102,40 @@ def check_enabled() -> bool:
     для тестов и офлайн-сред, где сетевой вызов недопустим в принципе.
     """
     return not os.environ.get(DISABLE_ENV)
+
+
+def is_allowed_download_url(url: str) -> bool:
+    """True, если URL можно скачивать: https и хост из allowlist (SEC-1, D11).
+
+    Небезопасные схемы (http, file, ftp) и чужие хосты отклоняются.
+    """
+    try:
+        parts = urllib.parse.urlparse(str(url or "").strip())
+    except ValueError:
+        return False
+    if parts.scheme.lower() != "https" or not parts.hostname:
+        return False
+    return parts.hostname.lower() in ALLOWED_DOWNLOAD_HOSTS
+
+
+def ensure_allowed_download_url(url: str) -> str:
+    """Проверяет URL и возвращает его; чужой хост — исключение без запроса.
+
+    Вызывается до построения Request: сторонний URL отклоняется БЕЗ
+    скачивания (критерий карточки SEC-1).
+    """
+    if not is_allowed_download_url(url):
+        host = ""
+        try:
+            host = urllib.parse.urlparse(str(url or "")).hostname or ""
+        except ValueError:
+            pass
+        raise DownloadNotAllowed(
+            "Скачивание разрешено только с хостов GitHub "
+            f"({', '.join(sorted(ALLOWED_DOWNLOAD_HOSTS))}). "
+            f"Получен адрес с хостом: {host or '(не определён)'}"
+        )
+    return str(url)
 
 
 def auto_check_enabled(settings: dict) -> bool:
@@ -174,6 +235,10 @@ def parse_release_payload(payload: object) -> dict | None:
 
 def human_error(exc: Exception) -> str:
     """Сетевую ошибку переводит в сообщение, понятное пользователю."""
+    if isinstance(exc, DownloadNotAllowed):
+        # SEC-1 (D11): отказ allowlist/лимита — не «ошибка сети», а понятный
+        # запрет с причиной; текст уже сформулирован в исключении.
+        return str(exc)
     if isinstance(exc, urllib.error.HTTPError):
         if exc.code == 403 or exc.code == 429:
             return (
@@ -264,7 +329,12 @@ def download_file(url: str, dest_path: str, progress_cb=None,
     Файл пишется во временный ``.part`` и переименовывается по успехе,
     поэтому после отмены/ошибки не остаётся «полуфабриката» с целевым
     именем.
+
+    SEC-1 (D11): URL проверяется по allowlist хостов ДО сетевого запроса;
+    превышение ``MAX_DOWNLOAD_BYTES`` — по Content-Length до начала и
+    по факту счёта порций во время загрузки — обрывает загрузку.
     """
+    ensure_allowed_download_url(url)
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     part_path = dest_path + ".part"
     os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
@@ -272,6 +342,10 @@ def download_file(url: str, dest_path: str, progress_cb=None,
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             total = int(response.headers.get("Content-Length") or 0)
+            if total > MAX_DOWNLOAD_BYTES:
+                raise DownloadNotAllowed(
+                    f"Файл больше лимита {MAX_DOWNLOAD_BYTES} байт: {total}"
+                )
             if callable(progress_cb):
                 progress_cb(0, total)
             with open(part_path, "wb") as out:
@@ -285,6 +359,10 @@ def download_file(url: str, dest_path: str, progress_cb=None,
                     done += len(chunk)
                     if callable(progress_cb):
                         progress_cb(done, total)
+                    if done > MAX_DOWNLOAD_BYTES:
+                        raise DownloadNotAllowed(
+                            f"Загрузка превысила лимит {MAX_DOWNLOAD_BYTES} байт — оборвана"
+                        )
         os.replace(part_path, dest_path)
         return dest_path
     finally:
@@ -296,10 +374,20 @@ def download_file(url: str, dest_path: str, progress_cb=None,
 
 
 def fetch_text(url: str, timeout: float = TIMEOUT) -> str:
-    """Скачивает небольшой текстовый файл целиком (SHA256SUMS.txt)."""
+    """Скачивает небольшой текстовый файл целиком (SHA256SUMS.txt).
+
+    SEC-1 (D11): allowlist хостов до запроса и лимит размера — читается
+    не больше ``MAX_TEXT_BYTES``; больший ответ отклоняется.
+    """
+    ensure_allowed_download_url(url)
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read().decode("utf-8", errors="replace")
+        data = response.read(MAX_TEXT_BYTES + 1)
+    if len(data) > MAX_TEXT_BYTES:
+        raise DownloadNotAllowed(
+            f"Текстовый файл больше лимита {MAX_TEXT_BYTES} байт"
+        )
+    return data.decode("utf-8", errors="replace")
 
 
 def match_sums_line(sums_text: str, filename: str) -> str:

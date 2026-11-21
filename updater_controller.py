@@ -362,6 +362,10 @@ class UpdateController:
             result_queue.put(("done", dest_path))
         except updater.DownloadCancelled:
             result_queue.put(("cancelled", None))
+        except updater.DownloadNotAllowed as exc:
+            # SEC-1 (D11): чужой хост / превышение лимита — честный отказ
+            # пользователю, а не «ошибка сети».
+            result_queue.put(("error", str(exc)))
         except Exception as exc:  # сеть/диск: пользовательская ошибка
             result_queue.put(("error", updater.human_error(exc)))
 

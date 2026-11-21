@@ -772,7 +772,12 @@ class DataStore:
 
         self._rev -= 1  # ревизия не записана в базу — счётчик откатывается
         self.last_error = f"Не удалось записать реестр: {last_exc}"
-        log.error("Реестр не записан после %d попыток: %s", SAVE_RETRIES, last_exc)
+        # SEC-1 (D12): сообщение sqlite содержит полный путь базы —
+        # в журнале корень профиля маскируется.
+        log.error(
+            "Реестр не записан после %d попыток: %s",
+            SAVE_RETRIES, applog.mask_path(str(last_exc)),
+        )
         return False
 
     def backup_db(self, dest: str, retries: int = 3,
@@ -812,7 +817,11 @@ class DataStore:
                         attempt, retries, type(exc).__name__,
                     )
                     time.sleep(retry_delay * attempt)
-        log.error("Копия реестра не создана после %d попыток: %s", retries, last_exc)
+        # SEC-1 (D12): путь источника в сообщении исключения маскируется.
+        log.error(
+            "Копия реестра не создана после %d попыток: %s",
+            retries, applog.mask_path(str(last_exc)),
+        )
         return False
 
     def _next_id(self) -> int:

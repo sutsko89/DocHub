@@ -124,6 +124,47 @@ def redact(value: str, visible: int = 2) -> str:
     return text[:visible] + "*" * (len(text) - visible)
 
 
+def mask_path(value: str) -> str:
+    """Маскирует пути профиля пользователя в тексте для журнала (SEC-1, D12).
+
+    Сообщения sqlite/OSError содержат полный путь файла базы
+    (например, ``unable to open database file: C:\\Users\\<имя>\\…``) —
+    журнал не должен раскрывать имя пользователя и структуру профиля.
+    Известные корни (APPDATA, USERPROFILE, HOME) заменяются на
+    ``<профиль>``; хвост пути внутри профиля остаётся видимым: он нужен
+    для диагностики и персональных данных не содержит. Корни берутся
+    из ``_profile_roots`` — точка подмены в тестах.
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    roots = [str(root) for root in _profile_roots() if root]
+    candidates: list[str] = []
+    for root in roots:
+        for variant in (
+            root,
+            os.path.normpath(root),
+            root.replace("\\", "/"),
+            root.replace("/", "\\"),
+        ):
+            if variant and variant not in candidates:
+                candidates.append(variant)
+    # Самые длинные варианты первыми: APPDATA лежит внутри USERPROFILE.
+    for candidate in sorted(candidates, key=len, reverse=True):
+        if candidate in text:
+            text = text.replace(candidate, "<профиль>")
+    return text
+
+
+def _profile_roots() -> list[str]:
+    """Корни профиля пользователя для mask_path (точка подмены в тестах)."""
+    return [
+        os.environ.get("APPDATA") or "",
+        os.environ.get("USERPROFILE") or "",
+        os.path.expanduser("~") or "",
+    ]
+
+
 @contextmanager
 def timed(operation: str, threshold_ms: int = 500, logger_name: str = ""):
     """Контекстный менеджер: пишет в лог только «медленные» операции.

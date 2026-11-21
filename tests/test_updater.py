@@ -481,44 +481,190 @@ def test_parse_release_payload_extracts_sums_and_installer_name():
     assert release["installer_name"] == "EW.DocHub-2.18.0-setup.exe"
 
 
-def test_download_file_streams_and_reports_progress(tmp_path):
+class _FakeResponse:
+    """Duck-typed ответ urlopen: отдаёт payload порциями с заголовками."""
+
+    def __init__(self, payload: bytes = b"", headers=None, huge=False):
+        self._payload = payload
+        self._pos = 0
+        self.headers = headers or {}
+        self._huge = huge
+
+    def read(self, size=-1):
+        if self._huge:
+            return b"z" * (size if size and size > 0 else 4096)
+        if self._pos >= len(self._payload):
+            return b""
+        chunk = self._payload[self._pos:self._pos + size] if size and size > 0 \
+            else self._payload[self._pos:]
+        self._pos += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+SETUP_URL = (
+    "https://github.com/sutsko89/DocHub/releases/download/"
+    "v2.22.0/EW.DocHub-2.22.0-setup.exe"
+)
+
+
+def test_download_file_streams_and_reports_progress(tmp_path, monkeypatch):
     import urllib.request
 
-    source = tmp_path / "payload.bin"
-    source.write_bytes(b"x" * 5000)
+    payload = b"x" * 5000
+    opened: list[str] = []
+
+    def fake_urlopen(request, timeout=None):
+        opened.append(request.full_url)
+        return _FakeResponse(payload, headers={"Content-Length": "5000"})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     dest = tmp_path / "out.bin"
-    url = "file://" + urllib.request.pathname2url(str(source))
     progress: list = []
 
-    result = updater.download_file(url, str(dest), progress_cb=lambda d, t: progress.append((d, t)))
+    result = updater.download_file(
+        SETUP_URL, str(dest), progress_cb=lambda d, t: progress.append((d, t)),
+    )
 
     assert result == str(dest)
-    assert dest.read_bytes() == source.read_bytes()
+    assert dest.read_bytes() == payload
+    assert opened == [SETUP_URL], "запрос ушёл на allowlist-хост"
     assert progress[0] == (0, 5000), "первый отчёт — ноль из известного размера"
     assert progress[-1] == (5000, 5000)
 
 
-def test_download_file_cancelled_leaves_no_output(tmp_path):
+def test_download_file_cancelled_leaves_no_output(tmp_path, monkeypatch):
     import threading
     import urllib.request
 
-    source = tmp_path / "payload.bin"
-    source.write_bytes(b"y" * 100000)
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda request, timeout=None: _FakeResponse(b"y" * 100000),
+    )
     dest = tmp_path / "out.bin"
-    url = "file://" + urllib.request.pathname2url(str(source))
     cancel = threading.Event()
 
     def cancel_at(done, total):
         cancel.set()  # отменяемся на первом же отчёте
 
     try:
-        updater.download_file(url, str(dest), progress_cb=cancel_at, cancel_event=cancel)
+        updater.download_file(
+            SETUP_URL, str(dest), progress_cb=cancel_at, cancel_event=cancel,
+        )
         cancelled = False
     except updater.DownloadCancelled:
         cancelled = True
     assert cancelled
     assert not dest.exists(), "после отмены целевого файла нет"
     assert not (dest.with_suffix(dest.suffix + ".part")).exists()
+
+
+# --------------------------------------------------------------------------- #
+#  SEC-1 (D11): allowlist хостов и лимит размера
+# --------------------------------------------------------------------------- #
+def test_is_allowed_download_url_matrix():
+    assert updater.is_allowed_download_url(SETUP_URL), "github.com разрешён"
+    assert updater.is_allowed_download_url(
+        "https://objects.githubusercontent.com/asset/exe"
+    ), "хост раздачи ассетов разрешён"
+    assert updater.is_allowed_download_url(
+        "https://API.GitHub.com/repos/x/releases/latest"
+    ), "регистр хоста не важен"
+    assert not updater.is_allowed_download_url(
+        "https://evil.example.com/setup.exe"
+    ), "чужой хост отклонён"
+    assert not updater.is_allowed_download_url(
+        "http://github.com/setup.exe"
+    ), "не-https отклонён"
+    assert not updater.is_allowed_download_url(
+        "file:///C:/Windows/System32/cmd.exe"
+    ), "локальная схема отклонена"
+    assert not updater.is_allowed_download_url("")
+    assert not updater.is_allowed_download_url("не URL")
+
+
+def test_download_foreign_host_rejected_without_request(monkeypatch, tmp_path):
+    import urllib.request
+
+    def fake_urlopen(request, timeout=None):
+        raise AssertionError("сетевой запрос не должен выполняться")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(updater.DownloadNotAllowed):
+        updater.download_file(
+            "https://evil.example.com/EW.DocHub-setup.exe",
+            str(tmp_path / "x.exe"),
+        )
+    with pytest.raises(updater.DownloadNotAllowed):
+        updater.fetch_text("https://evil.example.com/sha256sums.txt")
+
+
+def test_human_error_explains_allowlist_rejection():
+    exc = updater.DownloadNotAllowed("Скачивание разрешено только с хостов GitHub")
+    assert "GitHub" in updater.human_error(exc), "пользователю видна причина"
+
+
+def test_download_size_limit_aborts_by_content_length(monkeypatch, tmp_path):
+    import urllib.request
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda request, timeout=None: _FakeResponse(
+            b"", headers={"Content-Length": str(updater.MAX_DOWNLOAD_BYTES + 1)},
+        ),
+    )
+    dest = tmp_path / "big.exe"
+    with pytest.raises(updater.DownloadNotAllowed):
+        updater.download_file(SETUP_URL, str(dest))
+    assert not dest.exists() and not (tmp_path / "big.exe.part").exists()
+
+
+def test_download_size_limit_aborts_midstream(monkeypatch, tmp_path):
+    """Сервер без честного Content-Length: лимит ловится по счёту порций."""
+    import urllib.request
+
+    monkeypatch.setattr(updater, "CHUNK_SIZE", 64)
+    monkeypatch.setattr(updater, "MAX_DOWNLOAD_BYTES", 128)
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda request, timeout=None: _FakeResponse(huge=True),
+    )
+    dest = tmp_path / "endless.exe"
+    with pytest.raises(updater.DownloadNotAllowed):
+        updater.download_file(SETUP_URL, str(dest))
+    assert not dest.exists(), "усечённый файл не попадает в целевое имя"
+
+
+def test_fetch_text_limit_rejects_oversized_sums(monkeypatch):
+    import urllib.request
+
+    monkeypatch.setattr(updater, "MAX_TEXT_BYTES", 100)
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda request, timeout=None: _FakeResponse(b"a" * 201),
+    )
+    with pytest.raises(updater.DownloadNotAllowed):
+        updater.fetch_text(
+            "https://github.com/sutsko89/DocHub/releases/download/sha256sums.txt"
+        )
+
+
+def test_fetch_text_passes_within_limit(monkeypatch):
+    import urllib.request
+
+    sums = b"{" * 0 + ("abc" * 20).encode()
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda request, timeout=None: _FakeResponse(sums),
+    )
+    assert updater.fetch_text(
+        "https://github.com/sutsko89/DocHub/releases/download/sha256sums.txt"
+    ) == sums.decode()
 
 
 def test_match_sums_line_formats():

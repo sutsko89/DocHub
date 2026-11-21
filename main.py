@@ -1710,8 +1710,11 @@ def main():
     # EWDOCHUB_PERF_LOG=1 (по умолчанию выключен). Флаг кэшируется здесь,
     # чтобы весь сеанс работал по одному решению.
     if perflog.enabled():
+        # SEC-1 (D12): путь журнала внутри профиля маскируется — журнал
+        # не раскрывает имя пользователя и структуру профиля.
         applog.get_logger("perf").info(
-            "Perf-лог включён (EWDOCHUB_PERF_LOG): %s", perflog.perf_path(),
+            "Perf-лог включён (EWDOCHUB_PERF_LOG): %s",
+            applog.mask_path(perflog.perf_path()),
         )
     # Дамп критических сбоев (2.19.1): хард-падения Tcl/Tk (например,
     # при перетаскивании окна) умирают без Python-traceback — faulthandler
@@ -1719,7 +1722,7 @@ def main():
     crash_log = applog.enable_crash_dump()
     log = applog.get_logger("main")
     if crash_log:
-        log.info("Дамп критических сбоев включён: %s", crash_log)
+        log.info("Дамп критических сбоев включён: %s", applog.mask_path(crash_log))
     try:
         app = ContractApp()
         app.run()

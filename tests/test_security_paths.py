@@ -133,3 +133,78 @@ def test_copy_with_zone_identifier_missing_source_stream(tmp_path):
     src.write_bytes(b"data")
     services.copy_with_zone_identifier(str(src), str(dst))
     assert dst.read_bytes() == b"data"
+
+
+# ---------- SEC-1 (D12): маскирование пути профиля в журнале ----------
+
+def test_mask_path_hides_profile_root(appdata, monkeypatch):
+    import applog
+
+    db = os.path.join(str(appdata), "DogovorGenerator", "database.db")
+    message = f"unable to open database file: {db}"
+    masked = applog.mask_path(message)
+    assert str(appdata) not in masked, "путь профиля не раскрывается"
+    assert "<профиль>" in masked
+    assert "DogovorGenerator\\database.db" in masked or \
+        "DogovorGenerator/database.db" in masked, \
+        "хвост внутри профиля виден для диагностики"
+
+
+def test_mask_path_keeps_foreign_paths_intact(appdata):
+    import applog
+
+    foreign = "C:\\Program Files\\EW.DocHub\\EW.DocHub.exe"
+    assert applog.mask_path(f"ошибка: {foreign}") == f"ошибка: {foreign}", \
+        "пути вне профиля не искажаются"
+
+
+def test_mask_path_prefers_longest_root(appdata, monkeypatch):
+    """APPDATA лежит внутри USERPROFILE: замена начинается с длинного корня,
+    иначе внутри остаётся хвост с AppData/Roaming."""
+    import applog
+
+    monkeypatch.setattr(applog, "_profile_roots", lambda: [str(appdata)])
+    deep = os.path.join(str(appdata), "logs", "app.log")
+    assert applog.mask_path(deep) == "<профиль>\\logs\\app.log" or \
+        applog.mask_path(deep).endswith("<профиль>" + os.sep + "logs" + os.sep + "app.log")
+
+
+def test_mask_path_empty_is_empty():
+    import applog
+
+    assert applog.mask_path("") == ""
+
+
+def test_storage_save_failure_logs_masked_path(appdata, caplog, monkeypatch):
+    """Запись реестра в занятый файл: путь базы в строке лога маскирован."""
+    import logging
+
+    import storage
+
+    store = storage.DataStore()
+    store.add_counterparty("ooo", {"ИНН": "2540123456"})
+    # Уводим путь базы на неписуемое место через monkeypatch db_path.
+    locked = os.path.join(str(appdata), "locked-dir", "database.db")
+    os.makedirs(os.path.dirname(locked), exist_ok=True)
+    monkeypatch.setattr(storage, "db_path", lambda: locked)
+    # Каталог оставляем, но заменяем файл на каталог: sqlite вернёт ошибку с путём.
+    os.makedirs(locked, exist_ok=True)
+
+    logger = logging.getLogger(storage.applog.LOGGER_NAME + ".storage")
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.ERROR)
+    logger.addHandler(handler)
+    try:
+        store.save()
+    finally:
+        logger.removeHandler(handler)
+
+    errors = [r.getMessage() for r in records if r.levelno == logging.ERROR]
+    assert errors, "сбой записи дошёл до журнала"
+    assert all(str(appdata) not in message for message in errors), \
+        "полный путь профиля в строке лога отсутствует"

@@ -252,3 +252,88 @@ def test_orphan_docx_restored_into_registry(store, tmp_path):
     assert rec["party_id"] == party["id"]
     assert (rec.get("extra") or {}).get("restored") is True
     assert not find_orphans(str(docs_root), store)
+
+
+# --------------------------------------------------------------------------- #
+#  D1: восстановление осиротевших файлов поднимает весь реестр
+# --------------------------------------------------------------------------- #
+def test_restore_fifty_orphans_fully(store, tmp_path):
+    from reconcile import find_orphans, restore_orphans
+    from services import safe_filename
+
+    party = store.add_counterparty(
+        "ooo", {k: v for k, v in OOO_FIELDS.items()
+                if k not in (F.NUMBER, F.DAY, F.MONTH)}
+    )
+    docs_root = tmp_path / "docs"
+    party_dir = docs_root / safe_filename(storage.display_name(party), "Контрагент")
+    party_dir.mkdir(parents=True)
+    for number in range(1, 51):
+        (party_dir / f"Договор поставки №{number} ООО Ромашка.docx").write_bytes(b"PK\x05\x06")
+
+    orphans = find_orphans(str(docs_root), store)
+    assert len(orphans) == 50
+    restored = restore_orphans(store, str(docs_root), orphans, safe_filename)
+    assert restored == 50, "восстановление не обрывается после первой записи"
+    assert not find_orphans(str(docs_root), store)
+
+
+def test_restore_not_broken_by_stale_last_error(store, tmp_path):
+    """Устаревшая last_error прошлых операций не прерывает цикл (D1)."""
+    from reconcile import restore_orphans
+    from services import safe_filename
+
+    party = store.add_counterparty(
+        "ooo", {k: v for k, v in OOO_FIELDS.items()
+                if k not in (F.NUMBER, F.DAY, F.MONTH)}
+    )
+    docs_root = tmp_path / "docs"
+    party_dir = docs_root / safe_filename(storage.display_name(party), "Контрагент")
+    party_dir.mkdir(parents=True)
+    paths = []
+    for number in (1, 2, 3):
+        path = party_dir / f"Договор поставки №{number}.docx"
+        path.write_bytes(b"PK\x05\x06")
+        paths.append(str(path))
+
+    store.last_error = "устаревшая ошибка прошлой операции"
+    restored = restore_orphans(store, str(docs_root), paths, safe_filename)
+    assert restored == 3, "проверка после add_document(save=False) больше не ложная"
+    assert store.last_error == "", "устаревшая ошибка сброшена"
+
+
+def test_restore_save_failure_gives_honest_message(store, tmp_path, monkeypatch):
+    """Сбой финального save() — честное сообщение, счётчики корректны."""
+    from reconcile import restore_orphans
+    from services import safe_filename
+
+    party = store.add_counterparty(
+        "ooo", {k: v for k, v in OOO_FIELDS.items()
+                if k not in (F.NUMBER, F.DAY, F.MONTH)}
+    )
+    docs_root = tmp_path / "docs"
+    party_dir = docs_root / safe_filename(storage.display_name(party), "Контрагент")
+    party_dir.mkdir(parents=True)
+    paths = []
+    for number in (1, 2):
+        path = party_dir / f"Договор поставки №{number}.docx"
+        path.write_bytes(b"PK\x05\x06")
+        paths.append(str(path))
+
+    def failing_save():
+        store.last_error = "Не удалось записать реестр: диск недоступен"
+        return False
+
+    monkeypatch.setattr(store, "save", failing_save)
+    restored = restore_orphans(store, str(docs_root), paths, safe_filename)
+    assert restored == 2, "записи добавлены в память, счётчик корректен"
+    assert "Не удалось записать реестр" in store.last_error, (
+        "сбой записи доносится до вызывающего кода"
+    )
+
+
+def test_restore_empty_path_list_unchanged(store):
+    from reconcile import restore_orphans
+
+    assert restore_orphans(store, "/nonexistent", []) == 0
+    assert store.documents == []

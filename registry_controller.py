@@ -896,17 +896,27 @@ class RegistryController:
         )
         if choice == "restore":
             added = reconcile.restore_orphans(app.store, base, orphans, safe_filename)
+            failed = len(orphans) - added
             if app.store.last_error:
+                # D1: сбой финальной записи — честные счётчики «восстановлено /
+                # не восстановлено», а не молчаливый успех.
                 ui.alert(
                     app.root, "Восстановление не удалось",
-                    app.store.last_error, "error",
+                    f"{app.store.last_error}\n\n"
+                    f"Восстановлено файлов: {added}, не восстановлено: {failed}.",
+                    "error",
                 )
             else:
+                message = f"Добавлено записей в реестр: {added}."
+                if failed:
+                    message += (
+                        f"\nНе восстановлено файлов: {failed} "
+                        "(подробности в журнале)."
+                    )
+                message += "\n\nПроверьте типы документов и контрагентов в реестре."
                 ui.alert(
                     app.root, "Реестр восстановлен",
-                    f"Добавлено записей в реестр: {added}.\n\n"
-                    "Проверьте типы документов и контрагентов в реестре.",
-                    "success",
+                    message, "success",
                 )
             app._orphans = reconcile.find_orphans(base, app.store)
             app._doc_context_flow.refresh_party_combo_values()

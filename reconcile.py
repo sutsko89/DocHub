@@ -130,35 +130,63 @@ def guess_party_id(path: str, base_dir: str, store, name_key=None):
 
 
 def restore_orphans(store, base_dir: str, paths: list[str], name_key=None) -> int:
-    """Создаёт записи реестра для найденных файлов. Возвращает число записей."""
+    """Создаёт записи реестра для найденных файлов. Возвращает число записей.
+
+    D1: раньше в цикле проверялся ``store.last_error`` после
+    ``add_document(save=False)`` — при save=False он не обновляется, поэтому
+    проверка либо ложно прерывала цикл по устаревшей ошибке (восстановление
+    обрывалось после первой записи), либо не проверяла ничего. Теперь ошибки
+    добавления собираются локально, а финальный ``save()`` проверяется
+    отдельно: реальный сбой записи даёт честное сообщение, и пользователь
+    видит, сколько файлов восстановлено и сколько нет.
+    """
     log = applog.get_logger("reconcile")
+    # Сбрасываем устаревшую ошибку прошлых операций: при save=False она
+    # не перезаписывается и не должна прерывать восстановление.
+    store.last_error = ""
     added = 0
+    failed: list[str] = []
     for path in paths:
         filename = os.path.basename(path)
-        party_id = guess_party_id(path, base_dir, store, name_key)
-        party = store.get_counterparty(party_id) if party_id is not None else None
-        fields = dict((party or {}).get("fields") or {})
-        store.add_document(
-            guess_kind(filename),
-            party_id,
-            extract_number(filename),
-            "",
-            data=fields,
-            extra={
-                "imported": True,
-                "source_file": path,
-                "restored": True,
-                "is_ip": (party or {}).get("type") == "ip",
-            },
-            text="",
-            save=False,
-        )
-        if store.last_error:
-            log.error("Не удалось добавить запись восстановления: %s", store.last_error)
-            break
+        try:
+            party_id = guess_party_id(path, base_dir, store, name_key)
+            party = store.get_counterparty(party_id) if party_id is not None else None
+            fields = dict((party or {}).get("fields") or {})
+            rec = store.add_document(
+                guess_kind(filename),
+                party_id,
+                extract_number(filename),
+                "",
+                data=fields,
+                extra={
+                    "imported": True,
+                    "source_file": path,
+                    "restored": True,
+                    "is_ip": (party or {}).get("type") == "ip",
+                },
+                text="",
+                save=False,
+            )
+            if rec is None:
+                raise RuntimeError("add_document не вернул запись")
+        except Exception as exc:  # noqa: BLE001 — один битый файл не роняет цикл
+            failed.append(filename)
+            log.error(
+                "Не удалось добавить запись восстановления (%s): %s",
+                filename, type(exc).__name__,
+            )
+            continue
         added += 1
     if added:
         store.save()
+    if store.last_error:
+        log.error(
+            "Не удалось сохранить восстановленные записи (%d шт.): %s",
+            added, store.last_error,
+        )
+    if failed:
+        log.warning("Не восстановлено файлов: %d из %d", len(failed), len(paths))
+    if added:
         log.info("В реестр восстановлено файлов: %d", added)
     return added
 

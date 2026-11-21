@@ -193,7 +193,9 @@ def test_unknown_record_keys_roundtrip(appdata):
     store = storage.DataStore()
     party = store.add_counterparty("ooo", {"ИНН": "2540123456"})
     party["custom_flag"] = "тест"  # ключ, для которого нет колонки
-    assert store.save() is True
+    # STORE-1A: мутация мимо мутатора — полный путь save_full()
+    # (самопроверка перезаписывает весь реестр, включая extra_keys).
+    assert store.save_full() is True
     reloaded = storage.DataStore()
     assert reloaded.counterparties[0].get("custom_flag") == "тест"
 
@@ -210,7 +212,9 @@ def test_save_returns_false_when_os_refuses_write(appdata, monkeypatch):
     открытие базы отказывает в доступе.
     """
     store = storage.DataStore()
-    store.add_counterparty("ooo", {"ИНН": "2540123456"})
+    # STORE-1A: запись с помеченным dirty-изменением (save=False) — иначе
+    # инкрементальный save() без изменений верно вернул бы True no-op.
+    store.add_counterparty("ooo", {"ИНН": "2540123456"}, save=False)
 
     def denied_connect(path, *args, **kwargs):
         raise PermissionError(13, "Отказано в доступе")

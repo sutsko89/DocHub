@@ -1700,20 +1700,21 @@ class ContractApp:
                 continue
 
     def _update_status(self, *_args):
-        """Строка в футере: сколько контрагентов и документов в реестре."""
+        """Строка в футере: сколько контрагентов и документов в реестре.
+
+        STORE-1A (R-05a): счётчики — тремя COUNT(*) по покрывающим индексам
+        (storage.status_counts); раньше здесь строились списки активных
+        записей и три прохода по памяти (П-аудит P-10).
+        """
         if not hasattr(self, "status_label"):
             return
-        parties = len(self.store.active_counterparties())
-        active_docs = self.store.active_documents()
-        documents = sum(
-            1 for rec in active_docs
-            if rec.get("kind") != storage.KIND_UNKNOWN
+        counts = self.store.status_counts()
+        status = (
+            f"Контрагентов: {counts['parties']} · "
+            f"Документов: {counts['documents']} (договоров: {counts['contracts']})"
         )
-        contracts = sum(1 for rec in active_docs if rec.get("kind") == storage.KIND_CONTRACT)
-        trash = self.store.trash_count()
-        status = f"Контрагентов: {parties} · Документов: {documents} (договоров: {contracts})"
-        if trash:
-            status += f" · В корзине: {trash}"
+        if counts["trash"]:
+            status += f" · В корзине: {counts['trash']}"
         self.status_label.configure(
             text=status,
             text_color=ui.resolve(ui.COLORS["text_secondary"]),

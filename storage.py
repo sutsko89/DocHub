@@ -52,31 +52,38 @@ LEGACY_JSON_FILENAME = "database.json"   # реестр прежних верс�
 LEGACY_FULL_NAME_FIELD = "Полное название компании (Покупь)"
 
 
-def _rename_field_key(payload: dict) -> None:
+def _rename_field_key(payload: dict) -> bool:
     """Переименовывает один ключ в словаре полей: старый → канонический.
 
     Если канонический ключ уже заполнен (обе версии в одной записи),
     остаётся новое значение — старое отбрасывается, чтобы предпросмотр
-    и печатная форма не увидели расхождения.
+    и печатная форма не увидели расхождения. Возвращает True, если
+    словарь изменился (STORE-1A: загрузка помечает такую запись dirty,
+    чтобы нормализация доезжала до диска).
     """
     if LEGACY_FULL_NAME_FIELD not in payload:
-        return
+        return False
     value = payload.pop(LEGACY_FULL_NAME_FIELD)
     payload.setdefault(F.FULL_NAME, value)
+    return True
 
 
-def _normalize_field_names(rec: dict) -> None:
+def _normalize_field_names(rec: dict) -> bool:
     """Миграция имён полей v2.13.0 для записи реестра (идемпотентно).
 
     Затрагивает карточку контрагента (``fields``) и сохранённые данные
     документа (``data`` — копия полей карточки на момент сохранения).
+    Возвращает True, если запись изменилась (STORE-1A: загрузка помечает
+    её dirty — нормализация доезжает до диска следующей save()).
     """
+    changed = False
     fields = rec.get("fields")
     if isinstance(fields, dict):
-        _rename_field_key(fields)
+        changed = _rename_field_key(fields) or changed
     data = rec.get("data")
     if isinstance(data, dict):
-        _rename_field_key(data)
+        changed = _rename_field_key(data) or changed
+    return changed
 
 
 SQLITE_SCHEMA_VERSION = 1
@@ -157,6 +164,10 @@ _SCHEMA_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_documents_party ON documents(party_id)",
     "CREATE INDEX IF NOT EXISTS idx_documents_kind ON documents(kind, party_id)",
     "CREATE INDEX IF NOT EXISTS idx_documents_deleted ON documents(deleted_at)",
+    # STORE-1A (R-05a): покрывающий индекс для COUNT(*) статусной строки —
+    # подсчёт активных документов и договоров идёт index-only сканом
+    # (deleted_at ведущий колонкой, kind — внутри индекса).
+    "CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(deleted_at, kind)",
     """
     CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
@@ -271,6 +282,17 @@ class DataStore:
         # Флаг «реестр менялся с последней успешной копии»: ставится каждым
         # успешным save(), снимается успешной копией (BKUP-1).
         self.dirty_since_backup = False
+        # STORE-1A (R-01): dirty-наборы инкрементальной записи. Мутаторы
+        # (add/update/trash/restore/purge…) помечают id, save() пишет
+        # ТОЛЬКО эти строки (INSERT OR REPLACE) и удаляет перечисленные
+        # (DELETE). Наборы очищаются только после подтверждения транзакции:
+        # сбой записи оставляет изменения «грязными», повторный save()
+        # их дописывает. Полный путь (перезапись всех строк) — save_full():
+        # откат и самопроверка, перенос старого JSON.
+        self._dirty_parties: set[int] = set()
+        self._dirty_documents: set[int] = set()
+        self._deleted_party_ids: set[int] = set()
+        self._deleted_document_ids: set[int] = set()
         # Причина последней неудачной записи: UI обязан проверять её перед
         # сообщением «сохранено».
         self.last_error = ""
@@ -303,7 +325,7 @@ class DataStore:
                     with applog.timed("Чтение реестра", 500, "storage"):
                         conn = _connect_db(path)
                         try:
-                            parties, documents, seq, rev = self._read_all(conn)
+                            parties, documents, seq, rev, migrated_ids = self._read_all(conn)
                         finally:
                             conn.close()
                     break
@@ -351,6 +373,20 @@ class DataStore:
             + [_safe_int(rec.get("id"), 0) for rec in self.documents]
         ) + 1
         self._rev = _safe_int(rev, 0)
+        # STORE-1A (R-01): записи, нормализованные при загрузке (миграция
+        # имён полей v2.13.0), помечаются dirty — их перезапишет следующая
+        # save(), и старый ключ уйдёт с диска без полной перезаписи.
+        for rec in self.counterparties:
+            if _safe_int(rec.get("id"), 0) in migrated_ids:
+                self._mark_party_dirty(rec)
+        for rec in self.documents:
+            if _safe_int(rec.get("id"), 0) in migrated_ids:
+                self._mark_document_dirty(rec)
+        if migrated_ids:
+            log.info(
+                "Миграция имён полей при загрузке: записей=%d — будут "
+                "перезаписаны при ближайшем сохранении", len(migrated_ids),
+            )
         log.info(
             "Реестр загружен: контрагентов=%d, документов=%d, в корзине=%d",
             len(self.counterparties), len(self.documents),
@@ -372,7 +408,9 @@ class DataStore:
             _normalize_field_names(rec)
         for rec in self.documents:
             _normalize_field_names(rec)
-        if not self.save():
+        # STORE-1A: полный путь — перенос идёт мимо мутаторов, dirty-наборы
+        # пусты; save() посчитал бы реестр «не изменённым» и ничего не записал.
+        if not self.save_full():
             self.load_warning = (
                 "Реестр прочитан из старого файла database.json, но записать "
                 "новую базу не удалось: " + (self.last_error or "неизвестная ошибка")
@@ -517,9 +555,10 @@ class DataStore:
         return rec
 
     @classmethod
-    def _read_all(cls, conn) -> tuple[list[dict], list[dict], int | None, int | None]:
+    def _read_all(cls, conn) -> tuple[list[dict], list[dict], int | None, int | None, set[int]]:
         parties: list[dict] = []
         documents: list[dict] = []
+        migrated_ids: set[int] = set()
         dropped = 0
         for row in conn.execute(
             "SELECT id, type, fields, created_at, deleted_at, extra_keys "
@@ -529,7 +568,11 @@ class DataStore:
             if rec is None:
                 dropped += 1
             else:
-                _normalize_field_names(rec)
+                # STORE-1A: миграция имён полей при загрузке помечает запись
+                # dirty — следующая save() перезапишет только её и старый
+                # ключ уйдёт с диска (раньше полный save() переписывал всё).
+                if _normalize_field_names(rec):
+                    migrated_ids.add(_safe_int(rec.get("id"), 0))
                 parties.append(rec)
         for row in conn.execute(
             "SELECT id, kind, party_id, number, date, data, extra, text, "
@@ -539,7 +582,8 @@ class DataStore:
             if rec is None:
                 dropped += 1
             else:
-                _normalize_field_names(rec)
+                if _normalize_field_names(rec):
+                    migrated_ids.add(_safe_int(rec.get("id"), 0))
                 documents.append(rec)
         if dropped:
             applog.get_logger("storage").warning(
@@ -549,7 +593,7 @@ class DataStore:
         seq = _safe_int(seq_row[0], None) if seq_row else None
         rev_row = conn.execute("SELECT value FROM meta WHERE key = 'rev'").fetchone()
         rev = _safe_int(rev_row[0], None) if rev_row else None
-        return parties, documents, seq, rev
+        return parties, documents, seq, rev, migrated_ids
 
     # ------------------------ Повреждённая база ------------------------ #
     def _quarantine_corrupt_db(self, path: str, exc: Exception) -> bool:
@@ -728,11 +772,212 @@ class DataStore:
         finally:
             conn.close()
 
-    def save(self) -> bool:
-        """Атомарно записывает реестр транзакцией. Возвращает False и заполняет
-        last_error при сбое; предыдущая версия базы при этом не теряется.
+    def _has_dirty(self) -> bool:
+        """Есть ли неподтверждённые изменения (R-01)."""
+        return bool(
+            self._dirty_parties or self._dirty_documents
+            or self._deleted_party_ids or self._deleted_document_ids
+        )
 
-        Долгая запись (более 500 мс — обычно антивирус или медленный диск)
+    def _mark_party_dirty(self, rec: dict) -> None:
+        rec_id = _safe_int(rec.get("id"), 0)
+        if rec_id > 0:
+            self._dirty_parties.add(rec_id)
+
+    def _mark_document_dirty(self, rec: dict) -> None:
+        rec_id = _safe_int(rec.get("id"), 0)
+        if rec_id > 0:
+            self._dirty_documents.add(rec_id)
+
+    def _mark_party_deleted(self, rec_id) -> None:
+        rec_id = _safe_int(rec_id, 0)
+        if rec_id > 0:
+            self._deleted_party_ids.add(rec_id)
+            self._dirty_parties.discard(rec_id)
+
+    def _mark_document_deleted(self, rec_id) -> None:
+        rec_id = _safe_int(rec_id, 0)
+        if rec_id > 0:
+            self._deleted_document_ids.add(rec_id)
+            self._dirty_documents.discard(rec_id)
+
+    def _clear_dirty(self) -> None:
+        """Сброс dirty-наборов — ТОЛЬКО после подтверждения транзакции (R-01)."""
+        self._dirty_parties.clear()
+        self._dirty_documents.clear()
+        self._deleted_party_ids.clear()
+        self._deleted_document_ids.clear()
+
+    def mark_dirty(self, rec: dict) -> None:
+        """Публичная пометка записи «изменена мимо мутатора» (R-01).
+
+        Для редких случаев прямого изменения словаря записи вне add/update-
+        методов (миграция при загрузке, сценарии восстановления): следующая
+        save() перезапишет только эту строку. Полная перезапись — save_full().
+        """
+        # Сравнение по тождеству (is): dict.__eq__ для больших карточек
+        # дорог и может упасть на нестандартном содержимом.
+        if any(rec is item for item in self.documents):
+            self._mark_document_dirty(rec)
+        else:
+            self._mark_party_dirty(rec)
+
+    def _collect_dirty_changes(self):
+        """Готовит точечные изменения (R-01). None — сбой сериализации.
+
+        Dirty id без записи в памяти — «фантом», удалённый из памяти вне
+        мутатора (services.save_document снимает запись при сбое сохранения,
+        counterparty_controller убирает фантом после сбоя add): такой id
+        становится DELETE — точечная запись не воскресит строку.
+        """
+        log = applog.get_logger("storage")
+        try:
+            party_index = {_safe_int(rec.get("id"), 0): rec for rec in self.counterparties}
+            document_index = {_safe_int(rec.get("id"), 0): rec for rec in self.documents}
+            for rec_id in list(self._dirty_parties):
+                if rec_id not in party_index:
+                    self._dirty_parties.discard(rec_id)
+                    self._deleted_party_ids.add(rec_id)
+            for rec_id in list(self._dirty_documents):
+                if rec_id not in document_index:
+                    self._dirty_documents.discard(rec_id)
+                    self._deleted_document_ids.add(rec_id)
+            party_rows = [self._party_row(party_index[rec_id]) for rec_id in self._dirty_parties]
+            document_rows = [
+                self._document_row(document_index[rec_id]) for rec_id in self._dirty_documents
+            ]
+            return (
+                party_rows, document_rows,
+                set(self._deleted_party_ids), set(self._deleted_document_ids),
+            )
+        except (TypeError, ValueError) as exc:
+            self.last_error = f"Данные реестра не удалось сериализовать: {exc}"
+            log.error("Сериализация реестра не удалась: %s", type(exc).__name__)
+            return None
+
+    def _write_incremental(self, path: str, party_rows: list, document_rows: list,
+                           deleted_party_ids: set, deleted_document_ids: set) -> None:
+        """Точечная запись dirty-строк одной транзакцией: либо всё, либо ничего (R-01).
+
+        Порядок — сначала DELETE, затем INSERT OR REPLACE: даже если бы id
+        одновременно попал в удалённые и изменённые, финальное состояние
+        базы соответствует памяти. seq обновляется при добавлении записи
+        (мутатор уже сдвинул _seq), rev — каждой успешной записью (триггер
+        автокопий BKUP-1). Остальные ключи meta не трогаются.
+        """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        conn = _connect_db(path)
+        try:
+            with conn:
+                if deleted_party_ids:
+                    conn.executemany(
+                        "DELETE FROM counterparties WHERE id = ?",
+                        [(rec_id,) for rec_id in deleted_party_ids],
+                    )
+                if deleted_document_ids:
+                    conn.executemany(
+                        "DELETE FROM documents WHERE id = ?",
+                        [(rec_id,) for rec_id in deleted_document_ids],
+                    )
+                if party_rows:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO counterparties "
+                        "(id, type, fields, created_at, deleted_at, inn, extra_keys) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        party_rows,
+                    )
+                if document_rows:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO documents "
+                        "(id, kind, party_id, number, date, data, extra, text, "
+                        "created_at, deleted_at, deleted_with_party, extra_keys) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        document_rows,
+                    )
+                conn.executemany(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    (
+                        ("schema_version", str(SQLITE_SCHEMA_VERSION)),
+                        ("seq", str(self._seq)),
+                        # Ревизия каждой успешной записи — триггер автокопий (BKUP-1).
+                        ("rev", str(self._rev)),
+                    ),
+                )
+        finally:
+            conn.close()
+
+    def save(self) -> bool:
+        """Инкрементальная запись реестра (STORE-1A, R-01).
+
+        Пишет только изменённые строки (INSERT OR REPLACE по изменённым id)
+        и удаляет изъятые (DELETE по id) — одной транзакцией. Мутаторы
+        помечают id в dirty-наборах; наборы очищаются ТОЛЬКО после
+        подтверждения транзакции, поэтому сбой записи не теряет изменения.
+        При отсутствии изменений запись не выполняется вовсе: ревизия
+        не растёт, автокопия BKUP-1 не запускается.
+
+        Полный путь (перезапись всех строк) остаётся в save_full(): откат
+        и самопроверка, перенос старого JSON. Ошибка записи доходит до
+        last_error и UI; длительная запись (>500 мс) — в журнал.
+        """
+        log = applog.get_logger("storage")
+        self.last_error = ""
+        if not self._has_dirty():
+            log.info("Реестр не изменён с последней записи — сохранение не требуется")
+            return True
+
+        changes = self._collect_dirty_changes()
+        if changes is None:
+            return False
+        party_rows, document_rows, deleted_party_ids, deleted_document_ids = changes
+
+        path = db_path()
+        last_exc: Exception | None = None
+        # Ревизия увеличивается каждой УСПЕШНОЙ записью (сбой — откат счётчика).
+        self._rev += 1
+        with applog.timed("Запись реестра (инкрементально)", 500, "storage"):
+            for attempt in range(1, SAVE_RETRIES + 1):
+                try:
+                    self._write_incremental(
+                        path, party_rows, document_rows,
+                        deleted_party_ids, deleted_document_ids,
+                    )
+                    self.schema_version = SQLITE_SCHEMA_VERSION
+                    self.dirty_since_backup = True  # BKUP-1: «изменено с последней копии»
+                    log.info(
+                        "Реестр записан инкрементально: записано контрагентов=%d, "
+                        "документов=%d, удалено контрагентов=%d, документов=%d",
+                        len(party_rows), len(document_rows),
+                        len(deleted_party_ids), len(deleted_document_ids),
+                    )
+                    self._clear_dirty()
+                    return True
+                except (sqlite3.Error, OSError) as exc:
+                    last_exc = exc
+                    if attempt < SAVE_RETRIES:
+                        log.warning(
+                            "Запись реестра не удалась (попытка %d из %d): %s",
+                            attempt, SAVE_RETRIES, type(exc).__name__,
+                        )
+                        time.sleep(RETRY_DELAY_SECONDS * attempt)
+
+        self._rev -= 1  # ревизия не записана в базу — счётчик откатывается
+        self.last_error = f"Не удалось записать реестр: {last_exc}"
+        # SEC-1 (D12): сообщение sqlite содержит полный путь базы —
+        # в журнале корень профиля маскируется.
+        log.error(
+            "Реестр не записан после %d попыток: %s",
+            SAVE_RETRIES, applog.mask_path(str(last_exc)),
+        )
+        return False
+
+    def save_full(self) -> bool:
+        """Полная перезапись реестра одной транзакцией: либо всё, либо ничего.
+
+        Путь отката и самопроверки (STORE-1A): используется переносом старого
+        JSON (_migrate_from_legacy_json) и доступна вызывающему коду для
+        принудительной сверкой памяти и диска. Повседневная запись — save().
+        Долгая запись (>500 мс — обычно антивирус или медленный диск)
         попадает в журнал (п. 10 этапа 5).
         """
         log = applog.get_logger("storage")
@@ -757,9 +1002,11 @@ class DataStore:
                     self.schema_version = SQLITE_SCHEMA_VERSION
                     self.dirty_since_backup = True  # BKUP-1: «изменено с последней копии»
                     log.info(
-                        "Реестр записан: контрагентов=%d, документов=%d",
+                        "Реестр записан полностью: контрагентов=%d, документов=%d",
                         len(self.counterparties), len(self.documents),
                     )
+                    # Полная запись подтверждает ВСЕ изменения памяти.
+                    self._clear_dirty()
                     return True
                 except (sqlite3.Error, OSError) as exc:
                     last_exc = exc
@@ -842,6 +1089,7 @@ class DataStore:
         # Защита от старых callers, передающих ключ «(Покупь)» (v2.13.0).
         _normalize_field_names(rec)
         self.counterparties.append(rec)
+        self._mark_party_dirty(rec)
         if save:
             self.save()
         return rec
@@ -873,6 +1121,7 @@ class DataStore:
         rec["fields"] = dict(fields)
         # Защита от старых callers, передающих ключ «(Покупь)» (v2.13.0).
         _normalize_field_names(rec)
+        self._mark_party_dirty(rec)
         if not self.save():
             rec["fields"] = previous
             return None
@@ -947,6 +1196,7 @@ class DataStore:
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
         self.documents.append(rec)
+        self._mark_document_dirty(rec)
         if save:
             self.save()
         return rec
@@ -971,6 +1221,7 @@ class DataStore:
         self.documents = [rec for rec in self.documents if rec.get("id") != doc_id]
         removed = len(self.documents) < before
         if removed:
+            self._mark_document_deleted(doc_id)
             return self.save()
         return False
 
@@ -979,14 +1230,20 @@ class DataStore:
 
         Возвращает число удалённых документов; изменения сразу сохраняются.
         """
+        party_exists = any(rec.get("id") == party_id for rec in self.counterparties)
         self.counterparties = [
             rec for rec in self.counterparties if rec.get("id") != party_id
         ]
         before = len(self.documents)
+        removed_doc_ids = [rec.get("id") for rec in self.documents if rec.get("party_id") == party_id]
         self.documents = [
             rec for rec in self.documents if rec.get("party_id") != party_id
         ]
         removed = before - len(self.documents)
+        if party_exists:
+            self._mark_party_deleted(party_id)
+        for rec_id in removed_doc_ids:
+            self._mark_document_deleted(rec_id)
         self.save()
         return removed
 
@@ -1020,6 +1277,7 @@ class DataStore:
         if rec is None or is_deleted(rec):
             return False
         rec["deleted_at"] = _now_iso()
+        self._mark_document_dirty(rec)
         if not self.save():
             rec.pop("deleted_at", None)
             return False
@@ -1039,6 +1297,9 @@ class DataStore:
                 rec["deleted_at"] = stamp
                 rec["deleted_with_party"] = True
                 touched.append(rec)
+        self._mark_party_dirty(party)
+        for rec in touched:
+            self._mark_document_dirty(rec)
         if not self.save():
             party.pop("deleted_at", None)
             for rec in touched:
@@ -1057,6 +1318,7 @@ class DataStore:
             return False
         stamp = rec.pop("deleted_at")
         with_party = rec.pop("deleted_with_party", None)
+        self._mark_document_dirty(rec)
         if not self.save():
             rec["deleted_at"] = stamp
             if with_party is not None:
@@ -1081,6 +1343,9 @@ class DataStore:
                 rec.pop("deleted_at", None)
                 rec.pop("deleted_with_party", None)
                 restored.append(rec)
+        self._mark_party_dirty(party)
+        for rec in restored:
+            self._mark_document_dirty(rec)
         if not self.save():
             party["deleted_at"] = stamp
             for rec in restored:
@@ -1098,18 +1363,27 @@ class DataStore:
         self.documents = [rec for rec in self.documents if rec.get("id") != doc_id]
         if len(self.documents) == before:
             return False
+        self._mark_document_deleted(doc_id)
         return self.save()
 
     def purge_counterparty(self, party_id) -> int:
         """Удаляет карточку и все её документы окончательно."""
         before = len(self.documents)
+        party_exists = any(rec.get("id") == party_id for rec in self.counterparties)
         self.counterparties = [
             rec for rec in self.counterparties if rec.get("id") != party_id
+        ]
+        removed_doc_ids = [
+            rec.get("id") for rec in self.documents if rec.get("party_id") == party_id
         ]
         self.documents = [
             rec for rec in self.documents if rec.get("party_id") != party_id
         ]
         removed = before - len(self.documents)
+        if party_exists:
+            self._mark_party_deleted(party_id)
+        for rec_id in removed_doc_ids:
+            self._mark_document_deleted(rec_id)
         self.save()
         return removed
 
@@ -1118,20 +1392,83 @@ class DataStore:
             1 for rec in self.counterparties + self.documents if is_deleted(rec)
         )
 
+    # ------------------------------------------------------------------ #
+    #  Счётчики статусной строки (STORE-1A, R-05a)
+    # ------------------------------------------------------------------ #
+    def status_counts(self) -> dict[str, int]:
+        """Счётчики статусной строки тремя COUNT(*) по покрывающим индексам (R-05a).
+
+        Раньше _update_status строила списки активных записей и трижды
+        проходила их в памяти (П-аудит P-10) — доля UI-времени каждого
+        refresh при 10k+. Теперь: активные контрагенты; активные документы
+        и договоры ОДНИМ проходом; корзина. Запросы идут index-only сканом
+        по idx_counterparties_deleted и idx_documents_status(deleted_at,
+        kind). Если база недоступна (первый запуск до создания файла,
+        блокировка) — честный откат к подсчёту по памяти: статусная строка
+        не остаётся пустой.
+        """
+        path = db_path()
+        if not os.path.exists(path):
+            return self._status_counts_from_memory()
+        conn = None
+        try:
+            conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_SECONDS)
+            parties = conn.execute(
+                "SELECT COUNT(*) FROM counterparties WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+            documents, contracts = conn.execute(
+                "SELECT COUNT(*), COUNT(CASE WHEN kind = ? THEN 1 END) "
+                "FROM documents WHERE deleted_at IS NULL",
+                (KIND_CONTRACT,),
+            ).fetchone()
+            trash_parties = conn.execute(
+                "SELECT COUNT(*) FROM counterparties WHERE deleted_at IS NOT NULL"
+            ).fetchone()[0]
+            trash_documents = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE deleted_at IS NOT NULL"
+            ).fetchone()[0]
+            return {
+                "parties": int(parties),
+                "documents": int(documents),
+                "contracts": int(contracts),
+                "trash": int(trash_parties + trash_documents),
+            }
+        except sqlite3.Error:
+            return self._status_counts_from_memory()
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _status_counts_from_memory(self) -> dict[str, int]:
+        """Резервный подсчёт по памяти — та же семантика, что у статусной строки."""
+        docs = active_records(self.documents)
+        return {
+            "parties": sum(1 for rec in self.counterparties if not is_deleted(rec)),
+            "documents": sum(1 for rec in docs if rec.get("kind") != KIND_UNKNOWN),
+            "contracts": sum(1 for rec in docs if rec.get("kind") == KIND_CONTRACT),
+            "trash": sum(
+                1 for rec in self.counterparties + self.documents if is_deleted(rec)
+            ),
+        }
+
     def purge_all_trash(self) -> int:
         """Очищает корзину полностью. Возвращает число удалённых записей."""
-        parties = sum(1 for rec in self.counterparties if is_deleted(rec))
-        docs = sum(1 for rec in self.documents if is_deleted(rec))
+        parties = [rec for rec in self.counterparties if is_deleted(rec)]
+        docs = [rec for rec in self.documents if is_deleted(rec)]
         if not parties and not docs:
             return 0
         self.counterparties = [rec for rec in self.counterparties if not is_deleted(rec)]
         self.documents = [rec for rec in self.documents if not is_deleted(rec)]
+        for rec in parties:
+            self._mark_party_deleted(rec.get("id"))
+        for rec in docs:
+            self._mark_document_deleted(rec.get("id"))
         if not self.save():
             return 0
         applog.get_logger("storage").info(
-            "Корзина очищена: контрагентов=%d, документов=%d", parties, docs,
+            "Корзина очищена: контрагентов=%d, документов=%d", len(parties), len(docs),
         )
-        return parties + docs
+        return len(parties) + len(docs)
 
     def _trash_expired_records(self, retention_days: int) -> tuple[list[dict], list[dict]]:
         """Записи в корзине старше срока хранения: (контрагенты, документы)."""
@@ -1166,6 +1503,18 @@ class DataStore:
             return 0
         expired_party_ids = {rec.get("id") for rec in parties}
         expired_ids = {id(rec) for rec in parties + docs}
+        # STORE-1A (R-01): id удаляемых записей помечаются ДО фильтрации —
+        # каскад документы просроченных контрагентов уходит вместе с ними.
+        for rec in parties:
+            self._mark_party_deleted(rec.get("id"))
+        for rec in docs:
+            self._mark_document_deleted(rec.get("id"))
+        for rec in self.documents:
+            if (
+                id(rec) not in expired_ids
+                and rec.get("party_id") in expired_party_ids
+            ):
+                self._mark_document_deleted(rec.get("id"))
         self.counterparties = [
             rec for rec in self.counterparties if id(rec) not in expired_ids
         ]

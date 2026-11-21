@@ -182,7 +182,9 @@ def test_storage_save_failure_logs_masked_path(appdata, caplog, monkeypatch):
     import storage
 
     store = storage.DataStore()
-    store.add_counterparty("ooo", {"ИНН": "2540123456"})
+    # STORE-1A: изменение с несохранённой записью (save=False) — иначе
+    # инкрементальный save() без dirty-изменений не писал бы в базу вовсе.
+    store.add_counterparty("ooo", {"ИНН": "2540123456"}, save=False)
     # Уводим путь базы на неписуемое место через monkeypatch db_path.
     locked = os.path.join(str(appdata), "locked-dir", "database.db")
     os.makedirs(os.path.dirname(locked), exist_ok=True)

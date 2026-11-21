@@ -139,3 +139,43 @@ def test_spec_printed_total_matches_printed_lines(store, ooo_fields):
     assert expected in text, "«Итого» — сумма копеечных строк"
     assert raw not in text, "сырая сумма больше не печатается как итог"
     assert "{{" not in text
+
+
+# --------------------------------------------------------------------------- #
+#  DEF-2: предохранитель остаточных {{…}} перед записью
+# --------------------------------------------------------------------------- #
+def test_save_document_blocked_by_unfilled_token(store, tmp_path, monkeypatch,
+                                                 ooo_fields):
+    """Документ с незаполненным {{…}} не записывается; сообщение называет токен."""
+    party = store.add_counterparty(
+        "ooo", {k: v for k, v in ooo_fields.items()
+                if k not in (F.NUMBER, F.DAY, F.MONTH)}
+    )
+    doc = open_docx()
+    doc.add_paragraph("Спецификация {{item_1}} и {{INN}}")
+    monkeypatch.setattr(services, "build_record_docx", lambda draft, store_: doc)
+    draft = _contract_draft(party, ooo_fields)
+    result = services.save_document(store, draft, str(tmp_path))
+
+    assert result["ok"] is False
+    assert "{{item_1}}" in result["error"] and "{{INN}}" in result["error"]
+    assert result["path"] is None, "файл не записывается вовсе"
+    leftovers = [p for p in tmp_path.iterdir()
+                 if p.name.endswith((".docx", ".docx.tmp"))]
+    assert leftovers == [], "на диске ничего не осталось"
+    assert store.documents == [], "запись в реестр не добавлялась"
+
+
+def test_save_document_allows_imported_text_with_braces(store, tmp_path,
+                                                        monkeypatch):
+    """Импортированный текст с «{{» — легитимное содержимое: guard не мешает."""
+    doc = open_docx()
+    doc.add_paragraph("Файл с {{плейсхолдером}} из сторонней системы")
+    monkeypatch.setattr(services, "build_record_docx", lambda draft, store_: doc)
+    draft = {
+        "kind": storage.KIND_UNKNOWN, "party_id": None, "number": "1",
+        "date": "", "data": {}, "extra": {}, "text": "",
+    }
+    result = services.save_document(store, draft, str(tmp_path))
+    assert result["ok"] is True
+    assert os.path.exists(result["path"])

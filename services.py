@@ -24,7 +24,8 @@ from document_builder import (
     docx_from_text, fill_spec_items, format_amount, format_date,
     format_name_ip2, mark_spec_final_page, number_to_words_ru, parse_decimal,
     prices_valid_until_default, replace_in_doc, spec_total,
-    spec_vat_amount, spec_vat_amount_from_items, valid_until_parts,
+    spec_vat_amount, spec_vat_amount_from_items, unfilled_placeholders,
+    valid_until_parts,
 )
 
 MAX_PATH_LENGTH = 240
@@ -474,6 +475,27 @@ def save_document(store, draft: dict, docs_dir: str) -> dict:
     результат и открывает файл.
     """
     doc = build_record_docx(draft, store)
+    # Предохранитель остаточных {{…}} (DEF-2, D5): печатная форма с
+    # незаполненным плейсхолдером физически не уходит контрагенту. Проверка
+    # применяется только к создаваемым формам: в импортированных файлах «{{»
+    # может быть легитимным содержимым.
+    if draft.get("kind") in (storage.KIND_CONTRACT, storage.KIND_ADDITIONAL, storage.KIND_SPEC):
+        tokens = unfilled_placeholders(doc)
+        if tokens:
+            shown = ", ".join(tokens[:5]) + (" …" if len(tokens) > 5 else "")
+            applog.get_logger("documents").warning(
+                "Сохранение отменено: в печатной форме остались незаполненные "
+                "поля (%d шт.)", len(tokens),
+            )
+            return {
+                "ok": False, "path": None, "record": None,
+                "error": (
+                    "В документе остались незаполненные поля: "
+                    f"{shown}.\n\n"
+                    "Сохранение отменено — заполните данные или проверьте "
+                    "шаблон печатной формы."
+                ),
+            }
     path = write_docx(doc, draft, store, docs_dir)
     rec_doc = store.add_document(
         draft["kind"], draft["party_id"], draft["number"], draft.get("date", ""),

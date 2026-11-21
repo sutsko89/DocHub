@@ -51,6 +51,7 @@ from document_builder import (
     F, MONTHS_GENITIVE, digits_only, format_quantity, format_amount,
     amount_in_words_ru, parse_valid_until, prices_valid_until_default,
     spec_vat_amount_from_items, spec_line_total, spec_total, valid_until_iso,
+    unfilled_placeholders,
 )
 from services import safe_filename, validate_contract_fields
 from widgets import SpecTable
@@ -469,6 +470,37 @@ class DocumentSaveController:
             f"Подписи Сторон: от Поставщика — {spec['spec_supplier_signatory']}, "
             f"от Покупателя — {data.get(F.DIRECTOR, data.get(F.IP_NAME, ''))}"
         )
+        # DEF-2: предпросмотр показывает ту же проверку, что и предохранитель
+        # записи — остаточные {{…}} видны до попытки сохранения. Проверка
+        # только для создаваемой формы; сбор деталей не роняет предпросмотр.
+        if items:
+            try:
+                draft = {
+                    "kind": storage.KIND_SPEC,
+                    "party_id": party["id"],
+                    "number": number,
+                    "date": "",
+                    "data": data,
+                    "extra": {
+                        "contract_id": (contract or {}).get("id"),
+                        "items": [
+                            {"name": str(item["name"]), "qty": float(item["qty"]),
+                             "unit": str(item["unit"]), "price": float(item["price"])}
+                            for item in items
+                        ],
+                    },
+                    "text": "",
+                }
+                tokens = unfilled_placeholders(services.build_record_docx(draft, app.store))
+            except Exception:
+                tokens = []
+            if tokens:
+                shown = ", ".join(tokens[:5]) + (" …" if len(tokens) > 5 else "")
+                lines.append("")
+                lines.append(
+                    "В печатной форме остались незаполненные поля: " + shown
+                    + " — сохранение будет отклонено."
+                )
         app._set_text(app.spec_text, "\n".join(lines))
 
     # ------------------------------------------------------------------ #

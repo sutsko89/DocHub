@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 from docx import Document
+from docx.text.paragraph import Paragraph
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import date, datetime
 import calendar
 import copy
+import re
+from typing import Iterator
 
 
 def digits_only(text: str) -> str:
@@ -477,6 +480,10 @@ def fill_spec_items(doc, items: list[dict]):
     после чего исходная строка-шаблон удаляется. Форматирование ячеек
     сохраняется — текст заменяется внутри существующих runs.
     Цена — с копейками при наличии дробной части, кол-во может быть дробным.
+
+    D5: замена идёт по тексту параграфа с зеркалированием runs (тот же
+    паттерн, что в replace_in_paragraph) — токен, который Word разбил на
+    несколько runs после правки шаблона, теперь заменяется полностью.
     """
     table = spec_items_table(doc)
     if table is None or len(table.rows) < 2:
@@ -498,12 +505,49 @@ def fill_spec_items(doc, items: list[dict]):
         new_tr = copy.deepcopy(tpl_tr)
         tpl_tr.addprevious(new_tr)
         for tc in new_tr.tc_lst:
-            for paragraph in tc.xpath(".//w:p"):
-                for run in paragraph.xpath(".//w:r"):
-                    for token, value in values.items():
-                        if token in run.text:
-                            run.text = run.text.replace(token, value)
+            for p_el in tc.xpath(".//w:p"):
+                replace_in_paragraph(Paragraph(p_el, None), values)
     tpl_tr.getparent().remove(tpl_tr)
+
+
+# Предохранитель остаточных плейсхолдеров (DEF-2, D5): токен, который Word
+# разбил на части, после кросс-run замены остаться не должен, а вот полный
+# {{…}} в создаваемой форме — всегда признак дефектного шаблона или данных.
+UNFILLED_TOKEN_RE = re.compile(r"\{\{[^{}]{0,300}\}\}")
+
+
+def _iter_paragraphs_deep(parent) -> Iterator:
+    """Абзацы таблицы, включая вложенные таблицы (без рекурсии по глубине ячеек)."""
+    for table in parent.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                yield from cell.paragraphs
+                yield from _iter_paragraphs_deep(cell)
+
+
+def unfilled_placeholders(doc) -> list[str]:
+    """Остаточные ``{{…}}`` в документе: абзацы, таблицы, колонтитулы.
+
+    Проверка применяется только к создаваемым печатным формам: в
+    импортированных файлах «{{» может быть легитимным содержимым. Возвращает
+    отсортированный список уникальных токенов — пустой список означает,
+    что незаполненных полей нет.
+    """
+    tokens: set[str] = set()
+    paragraphs = list(doc.paragraphs)
+    paragraphs.extend(_iter_paragraphs_deep(doc))
+    for section in doc.sections:
+        for container in (section.header, section.footer):
+            paragraphs.extend(container.paragraphs)
+            paragraphs.extend(_iter_paragraphs_deep(container))
+    for paragraph in paragraphs:
+        try:
+            text = paragraph.text
+        except Exception:
+            continue
+        for match in UNFILLED_TOKEN_RE.findall(text or ""):
+            tokens.add(match)
+    return sorted(tokens)
 
 
 def prices_valid_until_default() -> str:

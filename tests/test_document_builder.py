@@ -13,10 +13,11 @@ from docx import Document
 
 from document_builder import (
     F, PH, amount_in_words_ru, amount_to_words_ru, build_replacements,
-    digits_only, docx_from_text, docx_to_text, format_amount, format_date,
-    format_phone, number_to_words_ru, parse_decimal, prices_valid_until_default,
-    replace_in_paragraph, spec_line_total, spec_total, spec_vat_amount,
-    spec_vat_amount_from_items,
+    digits_only, docx_from_text, docx_to_text, fill_spec_items,
+    format_amount, format_date, format_phone, number_to_words_ru,
+    parse_decimal, prices_valid_until_default, replace_in_paragraph,
+    spec_line_total, spec_total, spec_vat_amount, spec_vat_amount_from_items,
+    unfilled_placeholders,
 )
 
 
@@ -192,3 +193,56 @@ def test_prices_valid_until_is_end_of_current_month():
     last_day = calendar.monthrange(today.year, today.month)[1]
     expected = f"{last_day:02d}.{today.month:02d}.{today.year} г."
     assert prices_valid_until_default() == expected
+
+
+# ---------- D5: кросс-run замена позиций и остаточные {{…}} ----------
+
+def _spec_table_doc():
+    """Таблица спецификации: заголовок + строка-шаблон с плейсхолдерами."""
+    doc = Document()
+    table = doc.add_table(rows=2, cols=2)
+    header = table.rows[0].cells
+    header[0].paragraphs[0].add_run("№ п/п")
+    header[1].paragraphs[0].add_run("Наименование")
+    row = table.rows[1]
+    row.cells[0].paragraphs[0].add_run("{{item_no}}")
+    paragraph = row.cells[1].paragraphs[0]
+    paragraph.add_run("{{it")   # токен, разбитый Word'ом на три run
+    paragraph.add_run("em_")
+    paragraph.add_run("name}}")
+    return doc
+
+
+def test_fill_spec_items_replaces_token_split_across_runs():
+    doc = _spec_table_doc()
+    fill_spec_items(doc, [{"name": "Болт М8", "qty": "5", "unit": "шт.",
+                           "price": "200"}])
+    row_text = " | ".join(cell.text for cell in doc.tables[0].rows[1].cells)
+    assert row_text == "1 | Болт М8", "разбитый токен заменяется полностью"
+    whole = "\n".join(cell.text for row in doc.tables[0].rows for cell in row.cells)
+    assert "{{" not in whole
+
+
+def test_fill_spec_items_multi_items_keeps_numbering():
+    doc = _spec_table_doc()
+    fill_spec_items(doc, [
+        {"name": "Болт", "qty": "1", "unit": "шт.", "price": "10"},
+        {"name": "Гайка", "qty": "2", "unit": "шт.", "price": "20"},
+    ])
+    numbers = [doc.tables[0].rows[i].cells[0].text for i in (1, 2)]
+    assert numbers == ["1", "2"], "клонированные строки нумеруются по порядку"
+
+
+def test_unfilled_placeholders_finds_body_tables_and_header():
+    doc = Document()
+    doc.add_paragraph("Реквизиты: {{INN}}")
+    table = doc.add_table(rows=1, cols=1)
+    table.rows[0].cells[0].text = "{{item_1}}"
+    doc.sections[0].header.paragraphs[0].add_run("{{PHONE}}")
+    assert unfilled_placeholders(doc) == ["{{INN}}", "{{PHONE}}", "{{item_1}}"]
+
+
+def test_unfilled_placeholders_clean_document_is_empty():
+    doc = Document()
+    doc.add_paragraph("Договор № 516 готов")
+    assert unfilled_placeholders(doc) == []

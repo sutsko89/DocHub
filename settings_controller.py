@@ -292,10 +292,12 @@ class SettingsController:
             ),
             pady=(int(2 * app.scale), int(6 * app.scale)),
         )
+        logs_buttons = ctk.CTkFrame(card.body, fg_color="transparent")
+        card.wide(logs_buttons)
         ui.secondary_button(
-            card.body, "Открыть папку журналов", app._settings_flow.open_logs_folder,
+            logs_buttons, "Открыть папку журналов", app._settings_flow.open_logs_folder,
             width=int(190 * app.scale), height=int(30 * app.scale),
-        ).pack(anchor="w")
+        ).pack(side="left")
 
     # ------------------------------------------------------------------ #
     #  Копии реестра (BKUP-1)

@@ -473,6 +473,13 @@ def save_document(store, draft: dict, docs_dir: str) -> dict:
     записи реестра «осиротевший» файл удаляется и запись не добавляется.
     Возвращает {'ok', 'path', 'record', 'error'} — интерфейс только показывает
     результат и открывает файл.
+
+    Откат честный (DEF-4, D3): либо компенсирующее удаление выполнено
+    (файл убран, созданная транзакцией и оставшаяся пустой папка удалена),
+    либо удаление невозможно — сообщение называет имя файла и путь, остаток
+    помечается ``orphan_path`` и попадает в отчёт сверки как файл вне
+    реестра. Папка, существовавшая до операции, не трогается; папка,
+    занятая другим документом, не удаляется (проверка пустоты).
     """
     doc = build_record_docx(draft, store)
     # Предохранитель остаточных {{…}} (DEF-2, D5): печатная форма с
@@ -496,7 +503,27 @@ def save_document(store, draft: dict, docs_dir: str) -> dict:
                     "шаблон печатной формы."
                 ),
             }
-    path = write_docx(doc, draft, store, docs_dir)
+
+    # Папка документа — часть транзакции: запоминаем, существовала ли она
+    # до операции, чтобы откат удалял только свою, оставшуюся пустой.
+    folder_existed = os.path.isdir(docs_dir)
+    if not folder_existed:
+        try:
+            os.makedirs(docs_dir, exist_ok=True)
+        except OSError as exc:
+            applog.get_logger("documents").error(
+                "Не удалось создать папку документа: %s", type(exc).__name__,
+            )
+            return {"ok": False, "path": None, "record": None,
+                    "error": f"Не удалось создать папку документа:\n{docs_dir}\n\n{exc}"}
+    try:
+        path = write_docx(doc, draft, store, docs_dir)
+    except Exception as exc:
+        applog.get_logger("documents").error(
+            "Не удалось записать файл документа: %s", type(exc).__name__,
+        )
+        return {"ok": False, "path": None, "record": None,
+                "error": f"Не удалось записать файл документа: {exc}"}
     rec_doc = store.add_document(
         draft["kind"], draft["party_id"], draft["number"], draft.get("date", ""),
         data=draft.get("data") or {}, extra=draft.get("extra") or {},
@@ -507,11 +534,42 @@ def save_document(store, draft: dict, docs_dir: str) -> dict:
             store.documents.remove(rec_doc)
         except ValueError:
             pass
-        try:
-            if path and os.path.exists(path):
+        removed = False
+        orphan_path = ""
+        if path and os.path.exists(path):
+            try:
                 os.remove(path)
-        except OSError:
-            pass
-        return {"ok": False, "path": path, "record": None,
-                "error": store.last_error or "Ошибка записи реестра."}
+                removed = True
+            except OSError as remove_exc:
+                # Файл заблокирован (например, антивирусом) — молчаливая ложь
+                # «файл удалён» недопустима: честно называем имя и путь.
+                orphan_path = path
+                applog.get_logger("documents").error(
+                    "Не удалось удалить файл при откате сохранения (%s): %s",
+                    os.path.basename(path), type(remove_exc).__name__,
+                )
+        folder_removed = ""
+        if removed and not folder_existed:
+            try:
+                os.rmdir(docs_dir)  # удаляется, только если папка пуста
+                folder_removed = docs_dir
+            except OSError:
+                folder_removed = ""  # папку занял другой документ — не трогаем
+        error = store.last_error or "Ошибка записи реестра."
+        if orphan_path:
+            error += (
+                "\n\nСозданный файл удалить не удалось — он остался на диске.\n"
+                f"Файл: {os.path.basename(orphan_path)}\n"
+                f"Путь: {orphan_path}\n\n"
+                "Файл будет показан в отчёте сверки как файл вне реестра; "
+                "удалите его вручную."
+            )
+        elif removed:
+            error += "\n\nСозданный файл удалён, запись в реестр не добавлена."
+        result = {"ok": False, "path": path, "record": None, "error": error}
+        if orphan_path:
+            result["orphan_path"] = orphan_path
+        if folder_removed:
+            result["folder_removed"] = True
+        return result
     return {"ok": True, "path": path, "record": rec_doc, "error": None}

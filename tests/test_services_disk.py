@@ -179,3 +179,124 @@ def test_save_document_allows_imported_text_with_braces(store, tmp_path,
     result = services.save_document(store, draft, str(tmp_path))
     assert result["ok"] is True
     assert os.path.exists(result["path"])
+
+
+# --------------------------------------------------------------------------- #
+#  DEF-4: честный откат транзакции save_document
+# --------------------------------------------------------------------------- #
+def _failing_save(store, message="Не удалось записать реестр: отказ ОС"):
+    """Подмена save(): запись реестра падает после того, как файл записан."""
+    def fail():
+        store.last_error = message
+        return False
+    return fail
+
+
+def test_rollback_removes_file_and_created_folder(store, tmp_path, monkeypatch,
+                                                  ooo_fields):
+    """Сценарий 1: файл и созданная транзакцией пустая папка удалены."""
+    party = store.add_counterparty(
+        "ooo", {k: v for k, v in ooo_fields.items()
+                if k not in (F.NUMBER, F.DAY, F.MONTH)}
+    )
+    docs_dir = tmp_path / "ООО Ромашка"  # папки ещё нет — её создаст транзакция
+    monkeypatch.setattr(store, "save", _failing_save(store))
+
+    result = services.save_document(store, _contract_draft(party, ooo_fields),
+                                    str(docs_dir))
+
+    assert result["ok"] is False
+    assert result["path"] and not os.path.exists(result["path"]), "файл удалён"
+    assert not docs_dir.exists(), "папка, созданная транзакцией, удалена"
+    assert store.documents == [], "фантом записи не остаётся"
+    assert "Созданный файл удалён" in result["error"]
+
+
+def test_rollback_locked_file_reports_name_and_path(store, tmp_path, monkeypatch,
+                                                    ooo_fields):
+    """Сценарий 2: удаление невозможно — честное сообщение, файл в сверке."""
+    from reconcile import find_orphans
+
+    party = store.add_counterparty(
+        "ooo", {k: v for k, v in ooo_fields.items()
+                if k not in (F.NUMBER, F.DAY, F.MONTH)}
+    )
+    docs_dir = tmp_path / "ООО Ромашка"
+    monkeypatch.setattr(store, "save", _failing_save(store))
+    real_remove = os.remove
+
+    def locked_remove(path, *args, **kwargs):
+        if str(path).endswith(".docx"):
+            raise PermissionError(32, "файл занят другим процессом")
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", locked_remove)
+
+    result = services.save_document(store, _contract_draft(party, ooo_fields),
+                                    str(docs_dir))
+
+    assert result["ok"] is False
+    orphan = result.get("orphan_path")
+    assert orphan and os.path.exists(orphan), "файл остался на диске"
+    assert os.path.basename(orphan) in result["error"]
+    assert str(orphan) in result["error"], "сообщение называет путь"
+    assert "не удалось" in result["error"].lower(), "без ложного «файл удалён»"
+    # Остаточный файл попадает в отчёт сверки как файл вне реестра.
+    assert find_orphans(str(docs_dir), store) == [orphan]
+
+
+def test_rollback_keeps_folder_that_existed_before(store, tmp_path, monkeypatch,
+                                                   ooo_fields):
+    """Сценарий 3: папка существовала до операции — не удаляется."""
+    party = store.add_counterparty(
+        "ooo", {k: v for k, v in ooo_fields.items()
+                if k not in (F.NUMBER, F.DAY, F.MONTH)}
+    )
+    docs_dir = tmp_path / "ООО Ромашка"
+    docs_dir.mkdir()
+    old_file = docs_dir / "читайте меня.txt"
+    old_file.write_text("папка была здесь", encoding="utf-8")
+    monkeypatch.setattr(store, "save", _failing_save(store))
+
+    result = services.save_document(store, _contract_draft(party, ooo_fields),
+                                    str(docs_dir))
+
+    assert result["ok"] is False
+    assert not os.path.exists(result["path"]), "новый файл удалён"
+    assert docs_dir.exists(), "папка существовала до операции"
+    assert old_file.read_text(encoding="utf-8") == "папка была здесь"
+
+
+def test_rollback_keeps_folder_occupied_by_other_document(store, tmp_path,
+                                                          monkeypatch,
+                                                          ooo_fields):
+    """Сценарий 4: папка транзакции занята другим документом — не удаляется."""
+    party = store.add_counterparty(
+        "ooo", {k: v for k, v in ooo_fields.items()
+                if k not in (F.NUMBER, F.DAY, F.MONTH)}
+    )
+    docs_dir = tmp_path / "ООО Ромашка"
+    docs_dir.mkdir()
+    other = docs_dir / "Договор поставки №100 ООО Ромашка.docx"
+    other.write_bytes(b"PK\x05\x06")
+    monkeypatch.setattr(store, "save", _failing_save(store))
+
+    result = services.save_document(store, _contract_draft(party, ooo_fields),
+                                    str(docs_dir))
+
+    assert result["ok"] is False
+    assert not os.path.exists(result["path"]), "новый файл удалён"
+    assert docs_dir.exists() and other.exists(), "занятая папка не тронута"
+
+
+def test_rollback_success_path_has_no_extra_claims(store, tmp_path, ooo_fields):
+    """Сценарий 5: успешный путь — без дополнительных сообщений об откате."""
+    party = store.add_counterparty(
+        "ooo", {k: v for k, v in ooo_fields.items()
+                if k not in (F.NUMBER, F.DAY, F.MONTH)}
+    )
+    result = services.save_document(store, _contract_draft(party, ooo_fields),
+                                    str(tmp_path))
+    assert result["ok"] is True and result["error"] is None
+    assert "orphan_path" not in result
+    assert "удалён" not in (result["error"] or "")

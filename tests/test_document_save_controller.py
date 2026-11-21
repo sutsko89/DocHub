@@ -863,3 +863,25 @@ def test_render_spec_docx_uses_print_settings(store, ooo_fields, app, flow,
     settings = seen["settings"]
     assert settings["spec_year"] > 0, "год вычисляется на момент вызова (аудит 2.0.1)"
     assert "spec_supplier" in settings
+
+
+# --------------------------------------------------------------------------- #
+#  DEF-4: честное сообщение при неудаче отката
+# --------------------------------------------------------------------------- #
+def test_persist_document_result_alert_orphan_names_file(app, flow, ui_stub):
+    flow.persist_document_result_alert({
+        "error": "Ошибка записи реестра.",
+        "orphan_path": "/docs/ООО Ромашка/Договор №516.docx",
+    })
+    (args, _kwargs) = ui_stub["alerts"][0]
+    assert "Договор №516.docx" in args[1], "имя остаточного файла названо"
+    assert "файл удалён" not in args[1].lower(), "ложного «файл удалён» нет"
+
+
+def test_persist_document_result_alert_removed_states_removal(app, flow, ui_stub):
+    flow.persist_document_result_alert({
+        "error": "Ошибка записи реестра.\n\nСозданный файл удалён, "
+                 "запись в реестр не добавлена.",
+    })
+    (args, _kwargs) = ui_stub["alerts"][0]
+    assert "запись в реестр не добавлена" in args[1]

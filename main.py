@@ -990,6 +990,7 @@ class ContractApp:
             + "\n".join(f"• {label}" for label in dirty)
             + "\n\nЗакрыть программу и потерять их?",
             ok_text="Закрыть без сохранения", cancel_text="Остаться",
+            destructive=True,  # U7: потеря правок — не нейтральное действие
         ):
             return
         saved = write_settings({
@@ -1210,9 +1211,11 @@ class ContractApp:
         inner = ctk.CTkFrame(self.footer, fg_color="transparent")
         inner.pack(fill="both", expand=True, padx=int(20 * self.scale))
 
+        # U14 (UX-A): суффикс «(Ctrl+S)» на кнопке сохранения — горячая
+        # клавиша видна на самой кнопке; ширина подстраивается под текст.
         self.save_button = ui.primary_button(
-            inner, "Сохранить договор", self._doc_save_flow.save_contract,
-            width=int(186 * self.scale), height=int(32 * self.scale),
+            inner, "Сохранить договор (Ctrl+S)", self._doc_save_flow.save_contract,
+            width=int(240 * self.scale), height=int(32 * self.scale),
         )
         self.save_button.pack(side="right", pady=int(15 * self.scale))
 
@@ -1231,8 +1234,13 @@ class ContractApp:
             "spec": ("Сохранить спецификацию", self._doc_save_flow.save_spec),
         }
         if self.current_page in commands:
-            text, command = commands[self.current_page]
-            self.save_button.configure(text=text, command=command)
+            label, command = commands[self.current_page]
+            # U14 (UX-A): суффикс горячей клавиши на самой кнопке.
+            text = f"{label} (Ctrl+S)"
+            self.save_button.configure(
+                text=text, command=command,
+                width=int(max(240, 8.4 * len(text) + 26) * self.scale),
+            )
             self.save_button.pack(side="right", pady=int(15 * self.scale))
         else:
             self.save_button.pack_forget()

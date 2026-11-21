@@ -56,6 +56,36 @@ from document_builder import (
 from services import safe_filename, validate_contract_fields
 from widgets import SpecTable
 
+# U6 (UX-A): не более 8 строк в сводке ошибок позиций — остальное
+# считается и показывается как «…и ещё N», чтобы алерт не вырастал
+# на весь прайс-лист.
+POSITION_ISSUE_LIMIT = 8
+
+
+def position_issues_message(items: list[dict]) -> str:
+    """Сводка ошибок позиций одним сообщением (U6, UX-аудит T2).
+
+    Чистая функция для тестов: раньше каждая ошибка показывала отдельный
+    модальный алерт — при вставке крупного прайса пользователь закрывал
+    десятки одинаковых окон, не видя остальные ошибки.
+
+    Возвращает непустую строку, если есть позиции с количеством или ценой
+    «ноль и меньше»; пустую — если ошибок нет.
+    """
+    lines: list[str] = []
+    for item in items:
+        name = str(item.get("name") or "").strip() or "позиция без названия"
+        if item.get("qty", 0) <= 0:
+            lines.append(f"• «{name}» — количество должно быть больше нуля")
+        if item.get("price", 0) <= 0:
+            lines.append(f"• «{name}» — цена должна быть больше нуля")
+    if not lines:
+        return ""
+    if len(lines) > POSITION_ISSUE_LIMIT:
+        shown = "\n".join(lines[:POSITION_ISSUE_LIMIT])
+        return f"{shown}\n• …и ещё {len(lines) - POSITION_ISSUE_LIMIT}"
+    return "\n".join(lines)
+
 
 class DocumentSaveController:
     """Страница «Спецификация» и сохранение документов в реестр.
@@ -113,6 +143,8 @@ class DocumentSaveController:
             width=int(main.ENTRY_WIDTH * app.scale), variable=app.spec_party_var,
         )
         card.wide(app.spec_party_combo, pady=(int(2 * app.scale), int(10 * app.scale)))
+        # U3 (UX-A): поиск по ИНН как на «Договоре» — не листать комбобокс.
+        app._doc_page_flow.build_party_search_row(card, "spec_search_var")
         app.spec_party_var.trace_add("write", self.on_spec_party_changed)
         app.spec_party_var.trace_add("write", lambda *_: app._doc_context_flow.on_party_selected("spec"))
 
@@ -734,15 +766,12 @@ class DocumentSaveController:
                 ui.alert(app.root, "Нет позиций",
                          "Добавьте хотя бы одну позицию с наименованием.", "error")
                 return
-            for item in items:
-                if item["qty"] <= 0:
-                    ui.alert(app.root, "Проверьте позиции",
-                             f"У позиции «{item['name']}» должно быть количество больше нуля.", "error")
-                    return
-                if item["price"] <= 0:
-                    ui.alert(app.root, "Проверьте позиции",
-                             f"У позиции «{item['name']}» должна быть цена больше нуля.", "error")
-                    return
+            # U6 (UX-A): одна сводка на все ошибочные позиции вместо
+            # алерта на каждую — остальные ошибки видны сразу.
+            issues = position_issues_message(items)
+            if issues:
+                ui.alert(app.root, "Проверьте позиции", issues, "error")
+                return
 
             # Предпросмотр собирается с задержкой — перед сохранением
             # дособираем его синхронно, чтобы текст записи был актуальным.

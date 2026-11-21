@@ -334,6 +334,7 @@ class DocumentContextController:
             f"На странице «{self.form_label(key)}» есть несохранённые данные.\n\n"
             "Перейти и потерять изменения?",
             ok_text="Перейти", cancel_text="Остаться",
+            destructive=True,  # U7: потеря правок — не нейтральное действие
         )
 
     def save_current_page(self) -> None:

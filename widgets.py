@@ -373,6 +373,7 @@ class SpecTable(ctk.CTkFrame):
             return ui.confirm(
                 self.winfo_toplevel(), "Таблица позиций", message,
                 ok_text="Продолжить", cancel_text="Отмена",
+                destructive=True,  # U7: очистка позиций — не нейтральное действие
             )
         except Exception:
             return True

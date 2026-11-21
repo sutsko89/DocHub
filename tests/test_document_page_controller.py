@@ -512,9 +512,15 @@ def test_traces_bind_controller_methods():
 
     src = inspect.getsource(dpc.DocumentPageController.build_contract_page)
     assert 'trace_add("write", self.preview_contract)' in src
-    assert "self.find_party_by_inn" in src
+    # U3 (UX-A): поиск по ИНН — общий блок build_party_search_row,
+    # внутренние привязки Entry живут в нём (self.find_party_by_inn).
+    assert "build_party_search_row" in src
+    assert "self.find_party_by_inn" in inspect.getsource(
+        dpc.DocumentPageController.build_party_search_row)
     src_addl = inspect.getsource(dpc.DocumentPageController.build_additional_page)
     assert 'trace_add("write", self.on_addl_party_changed)' in src_addl
     assert 'trace_add("write", self.preview_additional)' in src_addl
     assert 'trace_add("write", self.update_words)' in src_addl
     assert 'trace_add("write", self.format_limit)' in src_addl
+    assert 'build_party_search_row(card, "addl_search_var")' in src_addl, \
+        "страница «Доп. соглашение» без блока поиска по ИНН (U3)"

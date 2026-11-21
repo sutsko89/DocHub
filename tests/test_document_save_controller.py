@@ -729,7 +729,8 @@ def test_save_spec_zero_quantity(store, ooo_fields, app, flow, ui_stub):
 
     flow.save_spec()
 
-    assert "должно быть количество больше нуля" in ui_stub["alerts"][0][0][1]
+    # U6 (UX-A): сводка ошибок позиций одним алертом.
+    assert "количество должно быть больше нуля" in ui_stub["alerts"][0][0][1]
 
 
 def test_save_spec_zero_price(store, ooo_fields, app, flow, ui_stub):
@@ -744,7 +745,7 @@ def test_save_spec_zero_price(store, ooo_fields, app, flow, ui_stub):
 
     flow.save_spec()
 
-    assert "должна быть цена больше нуля" in ui_stub["alerts"][0][0][1]
+    assert "цена должна быть больше нуля" in ui_stub["alerts"][0][0][1]
 
 
 def test_save_spec_success(store, ooo_fields, app, flow, ui_stub, monkeypatch):

@@ -195,6 +195,37 @@ def test_inn_search_finds_party(app):
     assert app.contract_search_var.get() == "", "поле поиска очищено"
 
 
+def test_inn_search_on_additional_and_spec_pages(app):
+    """U3 (UX-A): блок «Поиск по ИНН» есть на доп. соглашении и спецификации."""
+    for var_name in ("addl_search_var", "spec_search_var"):
+        assert hasattr(app, var_name), f"страница без блока поиска: нет {var_name}"
+
+    rec = app.store.add_counterparty("ip", {
+        F.INN: "253623456789",
+        F.IP_NAME: "ИП Тестов У3",
+    }, save=False)
+
+    # Поиск со страницы «Доп. соглашение».
+    app.addl_search_var.set("253623456789")
+    app._doc_page_flow.find_party_by_inn(app.addl_search_var)
+    assert app._current_party_id == rec["id"], "поиск с доп. соглашения не сработал"
+    assert app.addl_party_var.get() != "", "комбобокс доп. соглашения не заполнен"
+    assert app.contract_party_var.get() == app.addl_party_var.get(), \
+        "найденный контрагент не подставлен на страницу «Договор»"
+    assert app.addl_search_var.get() == "", "поле поиска доп. соглашения не очищено"
+
+    # Поиск со страницы «Спецификация».
+    other = app.store.add_counterparty("ooo", {
+        F.INN: "7709003300",
+        F.SHORT_NAME: "ООО «СпецПоиск»",
+    }, save=False)
+    app.spec_search_var.set("7709003300")
+    app._doc_page_flow.find_party_by_inn(app.spec_search_var)
+    assert app._current_party_id == other["id"], "поиск со спецификации не сработал"
+    assert app.spec_party_var.get() != "", "комбобокс спецификации не заполнен"
+    assert app.spec_search_var.get() == "", "поле поиска спецификации не очищено"
+
+
 def test_spec_table_created_with_rows(app):
     rows = app._doc_save_flow.spec_rows
     assert len(rows) == 10, "стартовое количество строк спецификации — 10"
@@ -222,13 +253,14 @@ def test_footer_save_button_follows_page(app):
     app._select_page("spec")
     assert app.current_page == "spec"
     app.root.update()
-    assert app.save_button.cget("text") == "Сохранить спецификацию"
+    # U14 (UX-A): кнопка сохранения показывает суффикс горячей клавиши.
+    assert app.save_button.cget("text") == "Сохранить спецификацию (Ctrl+S)"
 
     app._select_page("registry")
     app.root.update()
     app._select_page("contract")
     app.root.update()
-    assert app.save_button.cget("text") == "Сохранить договор"
+    assert app.save_button.cget("text") == "Сохранить договор (Ctrl+S)"
 
 
 def test_unsaved_data_guard_sees_changes(app):

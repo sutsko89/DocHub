@@ -1309,11 +1309,79 @@ def _sync_error_hint(label: tk.Label) -> None:
         pass
 
 
+def contrast_ratio(hex_a: str, hex_b: str) -> float:
+    """Контраст двух цветов по формуле WCAG 2.x (V1, UX-аудит T8).
+
+    Чистая функция без Tk: используется авто-проверкой пар палитры
+    (этап 2, критерий «контраст пар палитры проверен автоматически»)
+    и в тестах. Значения ниже 1.0 невозможны: соотношение всегда ≥ 1.
+    """
+    def _channel(part: str) -> float:
+        value = int(part, 16) / 255.0
+        # Линеаризация по спецификации WCAG 2.x.
+        return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+    def _luminance(hex_color: str) -> float:
+        text = str(hex_color).lstrip("#")
+        if len(text) == 3:
+            text = "".join(ch * 2 for ch in text)
+        r, g, b = (text[i:i + 2] for i in (0, 2, 4))
+        return (0.2126 * _channel(r) + 0.7152 * _channel(g) + 0.0722 * _channel(b))
+
+    lum_a = max(_luminance(hex_a), _luminance(hex_b))
+    lum_b = min(_luminance(hex_a), _luminance(hex_b))
+    return (lum_a + 0.05) / (lum_b + 0.05)
+
+
+# Пары «текст — фон», проверяемые авто-тестом (V1). Порог для основного
+# и вторичного текста — 4.5:1 (AA, мелкий текст); третичный текст
+# (#96969C подтверждён UX-аудитом как значение для де-акцентов и подсказок
+# формата) проверяется на порог 2.8:1 — это тона «de-emphasis», по ним
+# WCAG требует 3:1 только для крупных текстов/границ, а зафиксированный
+# порог не даёт палитре незаметно деградировать (HYG-2 продолжит гигиену).
+CONTRAST_BASELINE: tuple[tuple[str, str, str, float], ...] = (
+    # (ключ текста, ключ фона, тема, минимум)
+    ("text", "card", "light", 4.5),
+    ("text", "card", "dark", 4.5),
+    ("text_secondary", "card", "light", 4.5),
+    ("text_secondary", "card", "dark", 4.5),
+    ("text_tertiary", "card", "light", 2.8),
+    ("text_tertiary", "window", "light", 2.8),
+    ("chrome_text", "chrome", "light", 4.5),
+    ("chrome_text", "chrome", "dark", 4.5),
+    ("sidebar_text", "sidebar", "light", 3.0),
+    ("sidebar_text", "sidebar", "dark", 3.0),
+    ("on_accent", "accent", "light", 3.5),
+    ("on_accent", "accent", "dark", 3.5),
+    ("error_text", "card", "light", 3.0),
+    ("error_text", "card", "dark", 3.0),
+)
+_THEME_INDEX = {"light": 0, "dark": 1}
+
+
+def contrast_baseline_violations() -> list[str]:
+    """Пары из CONTRAST_BASELINE, чей контраст ниже порога (V1)."""
+    problems: list[str] = []
+    for text_key, bg_key, theme, minimum in CONTRAST_BASELINE:
+        index = _THEME_INDEX[theme]
+        ratio = contrast_ratio(COLORS[text_key][index], COLORS[bg_key][index])
+        if ratio + 1e-9 < minimum:
+            problems.append(
+                f"{text_key}/{bg_key} ({theme}): {ratio:.2f} < {minimum:.1f}"
+            )
+    return problems
+
+
 # --------------------------------------------------------------------------- #
 #  Фабрики контролов
 # --------------------------------------------------------------------------- #
-def entry(master, width: int = 300, height: int = 30, validatecommand=None, textvariable=None) -> "TextField":
-    return TextField(master, width=width, height=height, validatecommand=validatecommand, textvariable=textvariable)
+def entry(master, width: int = 300, height: int = 30, validatecommand=None,
+          textvariable=None, placeholder: str | None = None) -> "TextField":
+    field = TextField(master, width=width, height=height,
+                      validatecommand=validatecommand, textvariable=textvariable)
+    if placeholder:
+        field.set_placeholder(placeholder)
+    return field
 
 
 def option_menu(master, values: Sequence[str], width: int = 300, variable=None) -> "ComboField":
@@ -1364,6 +1432,16 @@ class TextField(ctk.CTkFrame):
         # Внешний кадр может растягиваться (sticky="ew") — подтягиваем ввод.
         self.bind("<Configure>", self._on_resize, add="+")
 
+        # U4 (UX-A): подсказка формата в поле. Отдельная надпись-подложка,
+        # НЕ текст внутри Entry: get() никогда не возвращает подсказку,
+        # поэтому она не может перепутаться с введённым значением.
+        self._frame_height = height
+        self._placeholder: str | None = None
+        self._placeholder_label: tk.Label | None = None
+        self.entry.bind("<FocusIn>", lambda _event: self._update_placeholder(), add="+")
+        self.entry.bind("<FocusOut>", lambda _event: self._update_placeholder(), add="+")
+        self.entry.bind("<KeyRelease>", lambda _event: self._update_placeholder(), add="+")
+
     def _on_resize(self, event) -> None:
         try:
             self.entry.configure(width=max(40, int(event.width) - self._padding * 2))
@@ -1379,6 +1457,64 @@ class TextField(ctk.CTkFrame):
         """Подсвечивает рамку поля красным при ошибке валидации."""
         self._error = bool(state)
         self._on_focus_out()
+
+    def set_placeholder(self, text: str | None) -> None:
+        """Задаёт подсказку формата внутри пустого поля (U4, UX-A).
+
+        Подсказка — надпись-подложка третьичного цвета, а не содержимое
+        Entry: чтение значения (``get()``) при пустом поле всегда даёт
+        пустую строку — подсказка физически не может попасть в карточку
+        или документ. ``None``/пустая строка снимает подсказку.
+        """
+        self._placeholder = str(text).strip() if text and str(text).strip() else None
+        if self._placeholder is None:
+            if self._placeholder_label is not None:
+                self._placeholder_label.destroy()
+                self._placeholder_label = None
+            return
+        if self._placeholder_label is None:
+            self._placeholder_label = tk.Label(
+                self, text=self._placeholder, font=font(13),
+                fg=resolve(COLORS["text_tertiary"]),
+                bg=resolve(COLORS["entry_bg"]), anchor="w", bd=0,
+                highlightthickness=0, padx=0,
+            )
+            # D8 (LEAK-1): подложка снимает подписку вместе с собой.
+            register_theme_listener(self._sync_placeholder_theme, owner=self._placeholder_label)
+        else:
+            self._placeholder_label.configure(text=self._placeholder)
+        self._update_placeholder()
+
+    def _sync_placeholder_theme(self) -> None:
+        try:
+            if self._placeholder_label is not None:
+                self._placeholder_label.configure(
+                    fg=resolve(COLORS["text_tertiary"]),
+                    bg=resolve(COLORS["entry_bg"]),
+                )
+        except Exception:
+            pass
+
+    def _update_placeholder(self) -> None:
+        """Показывает подложку, только когда поле пусто и не в фокусе."""
+        label = self._placeholder_label
+        if label is None:
+            return
+        try:
+            empty = not self.entry.get().strip()
+            # CTkEntry делегирует фокус внутреннему tk.Entry (_entry):
+            # сравниваем с обоими виджетами, чтобы не зависеть от версии.
+            focused_widget = self.entry.focus_get()
+            inner = getattr(self.entry, "_entry", None)
+            focused = focused_widget is self.entry or (
+                inner is not None and focused_widget is inner
+            )
+            if empty and not focused:
+                label.place(x=self._padding + 1, y=1, height=self._frame_height - 2)
+            else:
+                label.place_forget()
+        except Exception:
+            label.place_forget()
 
     # -- делегирование наружу ------------------------------------------- #
     def get(self) -> str:
@@ -2078,7 +2214,8 @@ class Alert(ctk.CTkToplevel):
     GLYPHS = {"error": "!", "success": None, "info": "i", "question": "?"}
 
     def __init__(self, master, title: str, message: str, kind: str = "info",
-                 ok_text: str = "ОК", cancel_text: Optional[str] = None):
+                 ok_text: str = "ОК", cancel_text: Optional[str] = None,
+                 destructive: bool = False):
         super().__init__(master)
         self._result = False
         self.withdraw()
@@ -2131,7 +2268,17 @@ class Alert(ctk.CTkToplevel):
         self.geometry(f"{self._width}x{self._height}")
 
         self.bind("<Escape>", lambda _event: self._close())
-        self.bind("<Return>", lambda _event: self._close())
+        # U7 (UX-A): в нейтральных подтверждениях Enter нажимает главную
+        # кнопку; деструктивные (удаление, очистка, потеря изменений)
+        # сохраняют прежнее поведение «Enter = Отмена» — случайный Enter
+        # не должен удалять данные. Escape всегда отменяет.
+        self._destructive = bool(destructive)
+        if cancel_text and self._destructive:
+            self.bind("<Return>", lambda _event: self._close())
+        elif cancel_text:
+            self.bind("<Return>", lambda _event: self._ok())
+        else:
+            self.bind("<Return>", lambda _event: self._close())
         register_theme_listener(self._sync_theme, owner=self)
 
     def _draw_icon(self) -> None:
@@ -2193,13 +2340,71 @@ def alert(parent: tk.Misc, title: str, message: str, kind: str = "info", ok_text
 
 
 def confirm(parent: tk.Misc, title: str, message: str,
-            ok_text: str = "ОК", cancel_text: str = "Отмена") -> bool:
-    """Модальный вопрос с двумя кнопками; True — если нажата главная."""
+            ok_text: str = "ОК", cancel_text: str = "Отмена",
+            destructive: bool = False) -> bool:
+    """Модальный вопрос с двумя кнопками; True — если нажата главная.
+
+    ``destructive=True`` — подтверждение, ведущее к потере данных
+    (удаление в корзину/навсегда, очистка, закрытие с потерей правок):
+    Enter означает «Отмена» (U7, UX-A). В нейтральных подтверждениях
+    Enter нажимает главную кнопку.
+    """
     if parent is None:
         return False
-    dialog = Alert(parent, title, message, "question", ok_text, cancel_text)
+    dialog = Alert(parent, title, message, "question", ok_text, cancel_text,
+                   destructive=destructive)
     dialog.show(parent)
     return bool(dialog._result)
+
+
+def containing_scroller(widget) -> "ctk.CTkScrollableFrame | None":
+    """Ближайший CTkScrollableFrame-предок виджета (U5) или None.
+
+    Формы вкладывают карточки в прокручиваемые области на разной глубине
+    (страница карточки, окно редактирования) — поиск по цепочке ``master``
+    избавляет вызывающий код от знания о структуре разметки.
+    """
+    seen: set[int] = set()
+    node = widget
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        if isinstance(node, ctk.CTkScrollableFrame):
+            return node
+        node = getattr(node, "master", None)
+    return None
+
+
+def scroll_to_widget(scroller, widget, margin: int = 16) -> bool:
+    """Прокручивает CTkScrollableFrame к виджету (U5, UX-аудит T1).
+
+    Ошибочное поле может остаться за нижней границей окна после подсветки:
+    пользователь видит алерт, но не видит само поле. Хелпер вычисляет
+    позицию виджета в содержимом и двигает yview так, чтобы поле
+    оказалось у верхней границы с отступом ``margin`` (px). Возвращает
+    True, если прокрутка выполнена; без canvas (fake/duck-typing) — False.
+    """
+    if scroller is None or widget is None:
+        return False
+    canvas = getattr(scroller, "_parent_canvas", None)
+    if canvas is None:  # строение CTkScrollableFrame различается между версиями
+        canvas = getattr(scroller, "parent_canvas", None)
+    if canvas is None:
+        return False
+    try:
+        # Позиция виджета в содержимом = текущая прокрутка (canvasy) плюс
+        # смещение от верхней границы видимой области.
+        offset = widget.winfo_rooty() - scroller.winfo_rooty()
+        content_y = canvas.canvasy(0) + offset
+        visible = max(1, canvas.winfo_height())
+        # Полная высота содержимого: scrollregion задаёт высоту контента.
+        region = str(canvas.cget("scrollregion")).split()
+        content_height = int(float(region[3])) if len(region) == 4 else visible
+        content_height = max(content_height, visible)
+        top = max(0.0, (content_y - margin) / content_height)
+        canvas.yview_moveto(min(1.0, top))
+        return True
+    except Exception:
+        return False
 
 
 def choice_dialog(parent: tk.Misc, title: str, message: str,

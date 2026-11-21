@@ -1133,8 +1133,8 @@ class DataStore:
         )
         return parties + docs
 
-    def cleanup_trash(self, retention_days: int = TRASH_RETENTION_DAYS) -> int:
-        """Удаляет записи, пролежавшие в корзине дольше срока хранения."""
+    def _trash_expired_records(self, retention_days: int) -> tuple[list[dict], list[dict]]:
+        """Записи в корзине старше срока хранения: (контрагенты, документы)."""
         cutoff = datetime.now() - timedelta(days=max(1, retention_days))
 
         def expired(rec: dict) -> bool:
@@ -1148,13 +1148,31 @@ class DataStore:
 
         parties = [rec for rec in self.counterparties if expired(rec)]
         docs = [rec for rec in self.documents if expired(rec)]
+        return parties, docs
+
+    def count_expired_trash(self, retention_days: int = TRASH_RETENTION_DAYS) -> int:
+        """Сколько записей удалит автоочистка корзины — сводка TRASH-WARN.
+
+        Вызывается ДО cleanup_trash: «будет удалено N записей» показывается
+        пользователю и пишется в журнал до фактического удаления.
+        """
+        parties, docs = self._trash_expired_records(retention_days)
+        return len(parties) + len(docs)
+
+    def cleanup_trash(self, retention_days: int = TRASH_RETENTION_DAYS) -> int:
+        """Удаляет записи, пролежавшие в корзине дольше срока хранения."""
+        parties, docs = self._trash_expired_records(retention_days)
         if not parties and not docs:
             return 0
         expired_party_ids = {rec.get("id") for rec in parties}
-        self.counterparties = [rec for rec in self.counterparties if not expired(rec)]
+        expired_ids = {id(rec) for rec in parties + docs}
+        self.counterparties = [
+            rec for rec in self.counterparties if id(rec) not in expired_ids
+        ]
         self.documents = [
             rec for rec in self.documents
-            if not expired(rec) and rec.get("party_id") not in expired_party_ids
+            if id(rec) not in expired_ids
+            and rec.get("party_id") not in expired_party_ids
         ]
         removed = len(parties) + len(docs)
         if not self.save():

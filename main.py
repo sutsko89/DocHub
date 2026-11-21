@@ -1053,7 +1053,26 @@ class ContractApp:
             self._log.info("Удалено незавершённых .docx.tmp: %d", removed)
 
     def _cleanup_expired_trash(self) -> None:
-        """Физически удаляет записи, пролежавшие в корзине дольше срока хранения."""
+        """Физически удаляет записи, пролежавшие в корзине дольше срока хранения.
+
+        TRASH-WARN (этап 2): корзина не удаляет записи молча. Перед
+        очисткой — сводка «будет удалено N записей» в журнале, после —
+        итог в статусе приложения; при пустой сводке очистка не запускается.
+        """
+        try:
+            planned = self.store.count_expired_trash()
+        except Exception as exc:  # noqa: BLE001 — фоновая задача не должна падать
+            self._log.warning(
+                "Подсчёт корзины перед автоочисткой не удался: %s", type(exc).__name__,
+            )
+            return
+        if not planned:
+            return  # удалять нечего — никаких действий и сообщений
+        # Сводка ДО удаления (критерий карточки TRASH-WARN).
+        self._log.warning(
+            "Автоочистка корзины: будет удалено %d записей, пролежавших "
+            "в корзине дольше %d дн.", planned, storage.TRASH_RETENTION_DAYS,
+        )
         try:
             removed = self.store.cleanup_trash()
         except Exception as exc:  # noqa: BLE001 — фоновая задача не должна падать
@@ -1062,6 +1081,10 @@ class ContractApp:
         if removed:
             self._registry_flow.refresh()
             self._update_status()
+            self._notify(
+                f"Автоочистка корзины: удалено {removed} записей, "
+                f"пролежавших в корзине дольше {storage.TRASH_RETENTION_DAYS} дн."
+            )
 
     # ------------------------------------------------------------------ #
     #  Диалоги с произвольным набором кнопок

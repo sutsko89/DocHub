@@ -42,6 +42,7 @@ import document_context_controller
 import document_save_controller
 import import_controller
 import lifecycle_controller
+import perflog
 import reconcile
 import registry_controller
 import settings_controller
@@ -559,6 +560,9 @@ class ContractApp:
         self._build_titlebar()
         self._build_body()
         self._build_pages()
+        # DIAG-1: dt раскладок канвы реестра в perf-журнал — обработчик
+        # ставится только при включённом EWDOCHUB_PERF_LOG.
+        perflog.bind_canvas_meter(getattr(self, "registry_list", None), "registry.canvas")
         self._doc_context_flow.reset_all_form_baselines()
         self._install_resize_handles()
         self._select_page("contract")
@@ -1663,6 +1667,13 @@ def main():
         return
 
     applog.setup_logging(APP_VERSION)
+    # DIAG-1: perf-журнал производительности — только по явному env-флагу
+    # EWDOCHUB_PERF_LOG=1 (по умолчанию выключен). Флаг кэшируется здесь,
+    # чтобы весь сеанс работал по одному решению.
+    if perflog.enabled():
+        applog.get_logger("perf").info(
+            "Perf-лог включён (EWDOCHUB_PERF_LOG): %s", perflog.perf_path(),
+        )
     # Дамп критических сбоев (2.19.1): хард-падения Tcl/Tk (например,
     # при перетаскивании окна) умирают без Python-traceback — faulthandler
     # пишет C-стек в crash.log, по нему видна точка падения.

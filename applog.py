@@ -20,6 +20,8 @@ import time
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 
+import perflog  # DIAG-1: дублирование timed-точек в perf-журнал (без цикла)
+
 SETTINGS_DIR_NAME = "DogovorGenerator"
 LOGGER_NAME = "ewdochub"
 LOG_FILE_NAME = "app.log"
@@ -138,6 +140,12 @@ def timed(operation: str, threshold_ms: int = 500, logger_name: str = ""):
         raise
     finally:
         elapsed_ms = (time.perf_counter() - started) * 1000
+        # DIAG-1: каждая timed-точка дублируется в perf-журнал (без порога)
+        # при включённом EWDOCHUB_PERF_LOG; app.log не меняется.
+        try:
+            perflog.record(operation, elapsed_ms, kind="duration")
+        except Exception:
+            pass
         log = get_logger(logger_name)
         if error is not None:
             log.warning(

@@ -13,6 +13,8 @@ from typing import Callable, Optional, Sequence
 
 import customtkinter as ctk
 
+import perflog  # DIAG-1: dt тиков пулера в perf-журнал (EWDOCHUB_PERF_LOG)
+
 # --------------------------------------------------------------------------- #
 #  Шрифты
 # --------------------------------------------------------------------------- #
@@ -771,6 +773,9 @@ class PointerPoller:
         self._interval = max(8, int(interval_ms))
         self._after_id: Optional[str] = None
         self._active = False
+        # DIAG-1: dt между тиками пулера в perf-журнал (EWDOCHUB_PERF_LOG);
+        # при выключенном флаге tick() не делает ничего.
+        self._perf = perflog.TickMeter("pointer.poller")
 
     def start(self) -> None:
         if self._active:
@@ -801,6 +806,7 @@ class PointerPoller:
 
     def _tick(self) -> None:
         self._after_id = None
+        self._perf.tick()
         if not self._active:
             return
         try:

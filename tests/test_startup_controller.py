@@ -253,3 +253,64 @@ def test_worker_uses_real_thread_and_queue(fake_app):
         time.sleep(0.005)
     flow.running = False
     assert fake_app._registry_flow.calls  # сверка применена в главном потоке
+
+
+# --------------------------------------------------------------------------- #
+#  E-4 (контрольные замеры этапа 5): перф-каналы старта
+# --------------------------------------------------------------------------- #
+def test_startup_steps_write_perf_records(fake_app, monkeypatch, tmp_path):
+    """EWDOCHUB_PERF_LOG=1: шаги воркера и применения пишут каналы startup.*.
+
+    Воркер — информационные каналы; применения — главнопоточные, они
+    участвуют в критерии E-4 «первые 5 секунд без операций > 100 мс».
+    Имена источников однотоковые латинские: парсер bench_store_1a
+    --report требует ровно 5 токенов в строке perf-журнала. Без флага
+    записи не создаются (контракт DIAG-1 — проверен в test_perflog).
+    """
+    import perflog
+    monkeypatch.setenv(perflog.ENV_FLAG, "1")
+    perflog.reset_for_tests()
+    try:
+        _add_expired_agreement(fake_app.store)
+        (tmp_path / "docs" / "мусор.docx.tmp").write_text("x")
+        flow = sc.StartupFlow(fake_app)
+        result_queue = queue.Queue()
+        flow.worker(result_queue)      # каналы шагов воркера
+        flow.running = True
+        flow._queue = result_queue
+        _drain_all(flow)               # каналы применений (главный поток)
+
+        # Буфер общий для сеанса: кроме startup.* в нём могут быть записи
+        # других timed-каналов (например, «Запись реестра» от хранилища
+        # фикстуры) — фильтруем только стартовые.
+        startup_sources, startup_kinds = set(), set()
+        for line in perflog._buffer:
+            tokens = line.split()
+            if len(tokens) >= 5 and tokens[3].startswith("startup."):
+                assert len(tokens) == 5, "источники startup.* однотоковые"
+                startup_kinds.add(tokens[2])
+                startup_sources.add(tokens[3])
+        assert {"startup.temp", "startup.trash_count", "startup.orphans",
+                "startup.notice", "startup.apply_scan"} <= startup_sources
+        assert startup_kinds == {"duration"}, "события startup.built/ready добавляет ContractApp.run"
+    finally:
+        perflog.reset_for_tests()
+
+
+def test_startup_apply_trash_perf_record(fake_app, monkeypatch):
+    """Мутация корзины (payload > 0) пишет главнопоточный канал apply_trash."""
+    import perflog
+    monkeypatch.setenv(perflog.ENV_FLAG, "1")
+    perflog.reset_for_tests()
+    try:
+        flow = sc.StartupFlow(fake_app)
+        flow.running = True
+        flow._queue = queue.Queue()
+        flow._emit(flow._queue, "trash_plan", 2)
+        flow._emit(flow._queue, "done", None)
+        assert flow._drain() is True
+        assert fake_app.trash_calls == [2]
+        sources = {line.split()[3] for line in perflog._buffer}
+        assert "startup.apply_trash" in sources
+    finally:
+        perflog.reset_for_tests()

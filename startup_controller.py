@@ -16,6 +16,16 @@ args), флаг остановки между шагами и файлами, р
 и любые вызовы UI применяет главный поток; устаревший результат
 отбрасывается вместе с очередью завершившегося запуска.
 
+Контрольные замеры этапа 5 (E-4, протокол docs/protocol-section-e.md):
+каждый шаг воркера и каждое главнопоточное применение обёрнуты в
+``applog.timed`` — при ``EWDOCHUB_PERF_LOG=1`` perf-журнал содержит
+длительности каналов ``startup.*`` (воркер — информационно, применения —
+критерий «главный поток в первые 5 секунд без операций дольше 100 мс»).
+Имена источников — однотоковые латинские: парсер отчёта
+``bench_store_1a.py --report`` требует ровно 5 токенов в строке.
+События ``startup.built``/``startup.ready`` (main.py, ContractApp.run)
+задают границы этого окна.
+
 Автокопия BKUP-1 и сетевая проверка обновлений остаются в прежних
 точках запуска: первая не входит в объём START-1, вторая уже
 глушится env-флагом и ходит в сеть по собственному таймеру.
@@ -91,21 +101,26 @@ class StartupFlow:
         app = self.app
         store = app.store
         try:
-            self._emit(result_queue, "temp", self._cleanup_temp_documents())
+            with applog.timed("startup.temp", 500, "startup"):
+                temp_removed = self._cleanup_temp_documents()
+            self._emit(result_queue, "temp", temp_removed)
             if self._stopped:
                 return
-            try:
-                planned = store.count_expired_trash()
-            except Exception as exc:  # noqa: BLE001 — задача старта не роняет запуск
-                applog.get_logger("storage").warning(
-                    "Подсчёт корзины перед автоочисткой не удался: %s",
-                    type(exc).__name__,
-                )
-                planned = 0
+            with applog.timed("startup.trash_count", 500, "startup"):
+                try:
+                    planned = store.count_expired_trash()
+                except Exception as exc:  # noqa: BLE001 — задача старта не роняет запуск
+                    applog.get_logger("storage").warning(
+                        "Подсчёт корзины перед автоочисткой не удался: %s",
+                        type(exc).__name__,
+                    )
+                    planned = 0
             self._emit(result_queue, "trash_plan", planned)
             if self._stopped:
                 return
-            self._emit(result_queue, "orphans", self._find_orphans())
+            with applog.timed("startup.orphans", 500, "startup"):
+                orphans = self._find_orphans()
+            self._emit(result_queue, "orphans", orphans)
             if self._stopped or not include_notice:
                 if not self._stopped:
                     self._emit(result_queue, "notice", None)
@@ -113,15 +128,16 @@ class StartupFlow:
             # Сбор сроков: снимок списка (не итерация живого хранилища),
             # сроки — из лёгкой карты хранилища (LAZY-1); describe читает
             # имя контрагента из карточки (только чтение).
-            try:
-                text = agreements.notice_text(
-                    store, docs=list(store.active_documents()),
-                )
-            except Exception:  # noqa: BLE001
-                applog.get_logger("agreements").exception(
-                    "Сбор сроков доп. соглашений не удался",
-                )
-                text = None
+            with applog.timed("startup.notice", 500, "startup"):
+                try:
+                    text = agreements.notice_text(
+                        store, docs=list(store.active_documents()),
+                    )
+                except Exception:  # noqa: BLE001
+                    applog.get_logger("agreements").exception(
+                        "Сбор сроков доп. соглашений не удался",
+                    )
+                    text = None
             self._emit(result_queue, "notice", text)
         finally:
             self._emit(result_queue, "done", None)
@@ -206,10 +222,14 @@ class StartupFlow:
         elif kind == "trash_plan":
             if payload:
                 # Мутация реестра — только главный поток (TRASH-WARN: сводка
-                # в журнал, итог в статус, refresh реестра).
-                self.app._cleanup_expired_trash(planned=payload)
+                # в журнал, итог в статус, refresh реестра). E-4: длительность
+                # — запись startup.apply_trash (главный поток).
+                with applog.timed("startup.apply_trash", 500, "startup"):
+                    self.app._cleanup_expired_trash(planned=payload)
         elif kind == "orphans":
             # Применение результата сверки + refresh при открытой странице.
-            self.app._registry_flow.scan_consistency(orphans=payload)
+            with applog.timed("startup.apply_scan", 500, "startup"):
+                self.app._registry_flow.scan_consistency(orphans=payload)
         elif kind == "notice":
-            self.app._apply_expiry_notice(payload)
+            with applog.timed("startup.apply_notice", 500, "startup"):
+                self.app._apply_expiry_notice(payload)

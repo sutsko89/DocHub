@@ -1040,9 +1040,15 @@ class ContractApp:
         write_settings(self._settings)
 
     def _create_startup_backup(self) -> None:
-        """Автокопия реестра при запуске (BKUP-1, карточка в roadmap)."""
+        """Автокопия реестра при запуске (BKUP-1, карточка в roadmap).
+
+        E-4: выполняется на главном потоке по after(400) — длительность
+        попадает в канал ``startup.backup`` perf-журнала и участвует
+        в критерии «главный поток в первые 5 секунд».
+        """
         try:
-            result = storage.create_startup_backup(self.store, APP_VERSION)
+            with applog.timed("startup.backup", 500, "startup"):
+                result = storage.create_startup_backup(self.store, APP_VERSION)
         except Exception as exc:  # noqa: BLE001 — стартовая задача не должна падать
             self._log.warning("Автокопия реестра не удалась: %s", type(exc).__name__)
             return
@@ -1824,6 +1830,18 @@ class ContractApp:
     #  update_limit_words).
 
     def run(self):
+        """Главный цикл. E-4 (контрольные замеры этапа 5): события старта.
+
+        ``startup.built`` фиксирует момент перед входом в mainloop (все
+        страницы построены), ``startup.ready`` — первый проход цикла
+        событий: интервал между ними и первые 5 секунд после — окно
+        критерия «главный поток без операций дольше 100 мс»
+        (docs/protocol-section-e.md, блок E-4). Имена — однотоковые
+        латинские: их парсит ``bench_store_1a.py --report``. Без флага
+        EWDOCHUB_PERF_LOG запись — мгновенный no-op.
+        """
+        perflog.record("startup.built", 0.0, kind="event")
+        self.root.after(0, lambda: perflog.record("startup.ready", 0.0, kind="event"))
         self.root.mainloop()
 
 

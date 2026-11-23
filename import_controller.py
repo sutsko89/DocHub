@@ -359,6 +359,168 @@ class ImportController:
         self.app.root.after(80, self.tick)
 
     # ------------------------------------------------------------------ #
+    #  U9: пакетные решения импорта (сводка вместо серии диалогов)
+    # ------------------------------------------------------------------ #
+    def plan_batch(self, results: list[dict]) -> "dict[int, tuple]":
+        """U9 (UX-B, этап 5): сводка решений перед регистрацией пакета.
+
+        Импорт «старых» файлов без ИНН раньше превращался в серию модальных
+        окон — по одному на каждый файл (UX-аудит U9). Теперь перед
+        регистрацией собираются два контура решений и по каждому показывается
+        ОДИН диалог сводки:
+
+        * файлы без ИНН — «создать карточки по названиям» / «привязать к
+          выбранному контрагенту» / «решить по каждому» / «пропустить все»;
+        * файлы с распознанным ИНН, чьё название совпало с карточкой другого
+          ИНН, — «привязать к найденным» / «создать новые» / «по каждому» /
+          «пропустить».
+
+        Проверка по названию обязательна (карточка U9): «создать по
+        названиям» переиспользует существующую карточку с тем же названием и
+        группирует файлы одного названия в ОДНУ карточку — дубли без ИНН не
+        плодятся. Возвращается карта ``id(result) -> решение``; файлы без
+        решения решаются по-старому (ask_party / подтверждение по файлу).
+        """
+        no_inn: list[dict] = []
+        conflicts: list[tuple[dict, dict]] = []
+        for result in results:
+            if not result.get("ok") or not result.get("party"):
+                continue  # нераспознанные файлы не спрашивают (п. 3.3)
+            party = result["party"]
+            fields = party.get("fields") or {}
+            inn = str(fields.get(F.INN, "")).strip()
+            if result.get("recognized") and inn:
+                if self.app.store.find_by_inn(inn) is None:
+                    same_name = self.app.store.find_by_name(party.get("display"))
+                    if same_name is not None:
+                        conflicts.append((result, same_name))
+            else:
+                no_inn.append(result)
+
+        decisions: "dict[int, tuple]" = {}
+        cache: "dict[str, dict]" = {}
+        if no_inn:
+            choice = self.ask_batch_no_inn(no_inn)
+            if choice == "create_by_name":
+                for result in no_inn:
+                    display = str(
+                        (result.get("party") or {}).get("display") or ""
+                    ).strip()
+                    if display:
+                        decisions[id(result)] = ("create_by_name", cache)
+                    else:
+                        # Название не распознано: создавать «пустую» карточку
+                        # нельзя — файл решается по-старому (ask_party).
+                        pass
+            elif choice == "attach_current":
+                rec = self.current_party()
+                for result in no_inn:
+                    decisions[id(result)] = (
+                        ("attach", rec) if rec is not None else ("skip",)
+                    )
+            elif choice == "skip_all":
+                for result in no_inn:
+                    decisions[id(result)] = ("skip",)
+            # "per_file"/закрытие окна: решений нет — ask_party по каждому.
+
+        if conflicts:
+            choice = self.ask_batch_conflicts(conflicts)
+            if choice == "attach_all":
+                for result, same_name in conflicts:
+                    decisions[id(result)] = ("attach", same_name)
+            elif choice == "create_all":
+                for result, _same in conflicts:
+                    decisions[id(result)] = ("create",)
+            elif choice == "skip_all":
+                for result, _same in conflicts:
+                    decisions[id(result)] = ("skip",)
+            # "per_file": подтверждение «Похожее название уже есть» по файлу.
+        return decisions
+
+    def ask_batch_no_inn(self, results: list[dict]) -> "str | None":
+        """Один диалог сводки для всех файлов без ИНН (критерий U9: 1–2
+        диалога вместо 20+). Возвращает выбор или None (окно закрыто)."""
+        groups: "dict[str, int]" = {}
+        unnamed = 0
+        for result in results:
+            display = str((result.get("party") or {}).get("display") or "").strip()
+            if display:
+                groups[display] = groups.get(display, 0) + 1
+            else:
+                unnamed += 1
+        lines = [f"• {name} — файлов: {count}" for name, count in groups.items()]
+        if unnamed:
+            lines.append(f"• название не распознано — файлов: {unnamed}")
+        message = (
+            f"Импорт: {len(results)} файлов без ИНН.\n\n"
+            + "\n".join(lines)
+            + "\n\nПри создании по названиям существующие карточки с тем же "
+            "названием переиспользуются — дубли не создаются; файлы одного "
+            "названия попадают в одну карточку."
+        )
+        options: "list[tuple[str, str, bool]]" = [
+            ("create_by_name", "Создать карточки по названиям", True),
+        ]
+        current = self.current_party()
+        if current is not None:
+            options.append((
+                "attach_current",
+                f"Привязать все к «{storage.display_name(current)}»", False,
+            ))
+        options.append(("per_file", "Решить по каждому файлу", False))
+        options.append(("skip_all", "Пропустить все", False))
+        return self.app._choice_dialog("Импорт без ИНН", message, options)
+
+    def ask_batch_conflicts(self, conflicts: "list[tuple[dict, dict]]") -> "str | None":
+        """Один диалог для файлов, чьё название занято карточкой с другим ИНН."""
+        lines = [
+            f"• {result.get('name')} — распознано "
+            f"«{str((result.get('party') or {}).get('display') or '')}», "
+            f"в реестре «{storage.display_name(same_name)}»"
+            for result, same_name in conflicts
+        ]
+        message = (
+            f"Импорт: {len(conflicts)} файлов с совпадающим названием.\n\n"
+            + "\n".join(lines)
+            + "\n\nПривязать документы к найденным карточкам или создать новые?"
+        )
+        options: "list[tuple[str, str, bool]]" = [
+            ("attach_all", "Привязать к найденным", True),
+            ("create_all", "Создать новые карточки", False),
+            ("per_file", "Решить по каждому файлу", False),
+            ("skip_all", "Пропустить все", False),
+        ]
+        return self.app._choice_dialog("Совпадение названий", message, options)
+
+    def _apply_decision(self, decision: tuple, party: dict) -> "tuple[dict | None, str]":
+        """Преобразует решение сводки U9 в (запись, действие) регистрации.
+
+        ``create_by_name`` держит кэш названий: два файла одного названия
+        получают одну карточку; совпадение с реестром переиспользуется
+        (проверка по названию — обязательное условие карточки U9).
+        """
+        kind = decision[0]
+        if kind == "attach":
+            return decision[1], "attach"
+        if kind == "skip":
+            return None, "skip"
+        if kind == "create":
+            return None, "create"
+        if kind == "create_by_name":
+            cache = decision[1]
+            display = str(party.get("display") or "").strip()
+            if not display:
+                return None, "skip"
+            if display in cache:
+                return cache[display], "attach"
+            existing = self.app.store.find_by_name(display)
+            if existing is not None:
+                cache[display] = existing
+                return existing, "attach"
+            return None, "create"  # создание — в общей ветке register_result
+        return None, "skip"
+
+    # ------------------------------------------------------------------ #
     #  Регистрация результатов
     # ------------------------------------------------------------------ #
     def finish(self, results: list[dict]) -> None:
@@ -386,10 +548,14 @@ class ImportController:
         entries: list[dict] = []
         store_dirty = False
 
+        # U9: сводка пакетных решений перед регистрацией — один диалог
+        # вместо серии (файлы без ИНН, конфликты названий).
+        decisions = self.plan_batch(results)
+
         for result in results:
             entry = self.new_entry(result)
             entries.append(entry)
-            if self.register_result(result, entry, stats):
+            if self.register_result(result, entry, stats, decisions):
                 store_dirty = True
 
         if store_dirty:
@@ -442,11 +608,13 @@ class ImportController:
             "warning": "",
         }
 
-    def register_result(self, result: dict, entry: dict, stats: dict) -> bool:
+    def register_result(self, result: dict, entry: dict, stats: dict,
+                        decisions: "dict[int, tuple] | None" = None) -> bool:
         """Регистрирует один результат разбора. Возвращает True, если реестр менялся.
 
         Изменения остаются в памяти: сохранение на диск делает вызывающий код
-        одним ``save()`` на весь пакет (п. 5.2).
+        одним ``save()`` на весь пакет (п. 5.2). ``decisions`` — карта решений
+        сводки U9 (plan_batch): файл с решением диалогов по одному не задаёт.
         """
         copied = result.get("copied") or ""
         party = result.get("party") or {}
@@ -461,10 +629,14 @@ class ImportController:
         inn = str(fields.get(F.INN, "")).strip()
         rec = None
         action = ""
+        decision = (decisions or {}).get(id(result))
         if result.get("recognized") and inn:
             rec = self.app.store.find_by_inn(inn)
             if rec is not None:
                 action = "attach"
+            elif decision is not None:
+                # U9: решение сводки вместо подтверждения «Похожее название».
+                rec, action = self._apply_decision(decision, party)
             else:
                 # ИНН новый, но карточка с таким названием уже может быть
                 # (например, заведена вручную без ИНН) — не плодим дубль.
@@ -483,6 +655,9 @@ class ImportController:
                         rec, action = same_name, "attach"
                 if action != "attach":
                     action = "create"
+        elif decision is not None:
+            # U9: файл без ИНН с предрешённым исходом сводки.
+            rec, action = self._apply_decision(decision, party)
         else:
             rec, action = self.ask_party(result)
 
@@ -492,6 +667,14 @@ class ImportController:
             )
             stats["new_parties"] += 1
             entry["detail"] = "создана новая карточка"
+            # U9: свежесозданная карточка попадает в кэш названий сводки —
+            # следующие файлы того же названия привяжутся к ней (одна
+            # карточка на название, дубли без ИНН не плодятся).
+            if decision is not None and decision[0] == "create_by_name":
+                name_cache = decision[1]
+                display = str(party.get("display") or "").strip()
+                if display and display not in name_cache:
+                    name_cache[display] = rec
         elif action == "attach" and rec is not None:
             entry["detail"] = f"привязан к «{storage.display_name(rec)}»"
 

@@ -471,6 +471,7 @@ class ContractApp:
 
         self.pages: dict[str, ctk.CTkFrame] = {}
         self.nav_items: dict[str, ui.NavItem] = {}
+        self._dirty_dots_after = None  # V5: таймер debounce точек «грязных» форм
         self.scrollers: list[ctk.CTkScrollableFrame] = []
         self.current_page = "contract"
         self._zoomed = False
@@ -681,6 +682,12 @@ class ContractApp:
             height=int(50 * self.scale),
         )
         self.lights.pack(side="right")
+
+        # V5: точки «грязных» форм следят за вводом где угодно в окне
+        # (debounce 300 мс); программные подстановки обновляют точки через
+        # _update_status / DaData.
+        self.root.bind_all("<KeyRelease>", self._schedule_dirty_dots, add="+")
+        self.root.bind_all("<ButtonRelease>", self._schedule_dirty_dots, add="+")
 
         # Прилипание (2.20.0): snap_resolver вычисляет зону у краёв
         # рабочей области монитора под курсором (верх — разворачивание,
@@ -1637,6 +1644,12 @@ class ContractApp:
         elif key == "additional":
             self._doc_page_flow.render_additional_preview()
             self._doc_context_flow.update_contract_info("additional")
+        elif key == "contract":
+            # UPD-UI (P-07, волна 3): гард поставлен и на договор — при
+            # переключении его перерисовывает _select_page.
+            self._doc_page_flow.render_contract_preview()
+        # V5: baseline страницы пересчитан при уходе/приходе — точки тоже.
+        self._update_dirty_dots()
         self.root.after(60, self._refresh_scrollbars)
 
     # ------------------------------------------------------------------ #
@@ -1756,6 +1769,55 @@ class ContractApp:
             text=status,
             text_color=ui.resolve(ui.COLORS["text_secondary"]),
         )
+        # V5: точки «грязной» форм обновляются в той же центральной точке —
+        # после сохранений, переключений страниц, импорта, правки контрагента.
+        self._update_dirty_dots()
+
+    # ------------------------------------------------------------------ #
+    #  V5 (UX-B): акцентные точки «грязных» форм в шапке
+    # ------------------------------------------------------------------ #
+    def _update_dirty_dots(self) -> None:
+        """Точка на кнопке раздела = форма страницы отличается от baseline.
+
+        Источник истины — dirty_pages() потока контекста форм (form_signature
+        против baseline, п. 4.2). Дёшево: несколько StringVar.get на страницу.
+        Точки могут меняться и программными подстановками (DaData, импорт),
+        поэтому прямое обновление вызывается из _update_status (центральный
+        хук после всех операций) и после подстановки DaData (U8), а ввод
+        с клавиатуры/мыши — через отложенный _schedule_dirty_dots.
+        """
+        flow = getattr(self, "_doc_context_flow", None)
+        nav_items = getattr(self, "nav_items", None)
+        if flow is None or not nav_items:
+            return
+        try:
+            dirty = set(flow.dirty_pages())
+        except Exception:
+            # Сбой чтения формы не должен ронять статус-строку: точки
+            # просто не обновляются до следующего вызова.
+            return
+        for key, item in nav_items.items():
+            try:
+                item.set_dot(key in dirty)
+            except Exception:
+                pass  # виджет шапки мог быть разрушен при закрытии
+
+    def _schedule_dirty_dots(self, *_args) -> None:
+        """Отложенное обновление точек при вводе (debounce 300 мс).
+
+        Новый ввод отменяет ещё не сработавшее обновление — как у
+        предпросмотров (п. 5.6). Таймер живёт на приложении.
+        """
+        if getattr(self, "_dirty_dots_after", None):
+            try:
+                self.root.after_cancel(self._dirty_dots_after)
+            except Exception:
+                pass
+        self._dirty_dots_after = self.root.after(300, self._apply_dirty_dots)
+
+    def _apply_dirty_dots(self) -> None:
+        self._dirty_dots_after = None
+        self._update_dirty_dots()
 
     #  «Сумма/срок прописью» и формат лимита — методы
     #  DocumentPageController (update_words / format_limit /

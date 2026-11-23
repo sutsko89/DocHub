@@ -520,7 +520,14 @@ def render_spec(rec: dict, store, spec_settings: dict | None = None) -> "Documen
 
 
 def build_record_docx(rec: dict, store) -> "Document":
-    """Собирает .docx записи реестра по её типу (или из сохранённого текста)."""
+    """Собирает .docx записи реестра по её типу (или из сохранённого текста).
+
+    LAZY-1 (R-09): запись из загруженного хранилища может не иметь тела —
+    оно дочитывается единым getter'ом store.document_body(id). Записи с
+    телом в памяти (черновики форм, свежие мутаторы) читаются как раньше.
+    """
+    if not ("text" in rec and "data" in rec and "extra" in rec):
+        rec = {**rec, **store.document_body(rec.get("id"))}
     kind = rec.get("kind")
     extra = rec.get("extra") or {}
     if kind == storage.KIND_CONTRACT:

@@ -716,7 +716,11 @@ class DocumentSaveController:
                 "party_id": party["id"],
                 "number": number,
                 "date": date_text,
-                "data": dict(contract.get("data") or {}),
+                # LAZY-1: тело договора дочитывается единым getter'ом.
+                "data": dict(
+                    (contract if "data" in contract
+                     else {**contract, **self.app.store.document_body(contract.get("id"))}).get("data") or {}
+                ),
                 "extra": extra,
                 "text": "",
             }

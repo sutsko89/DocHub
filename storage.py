@@ -240,6 +240,20 @@ def _connect_db(path: str) -> sqlite3.Connection:
         raise
 
 
+def _valid_until_from_json(extra_json, extra_keys_json) -> "str | None":
+    """Срок «действует до» из JSON-колонок без загрузки тела (LAZY-1)."""
+    for raw in (extra_json, extra_keys_json):
+        try:
+            value = json.loads(raw or "")
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            until = value.get("valid_until_iso") or value.get("valid_until")
+            if until:
+                return str(until)
+    return None
+
+
 def _safe_int(value, default: int = 0) -> int:
     """Безопасно приводит значение к int (null/строка не роняют запуск)."""
     try:
@@ -293,6 +307,13 @@ class DataStore:
         self._dirty_documents: set[int] = set()
         self._deleted_party_ids: set[int] = set()
         self._deleted_document_ids: set[int] = set()
+        # LAZY-1 (R-09): ленивые тела документов. Лёгкий SELECT при загрузке
+        # не читает data/extra/text — тело загружается по требованию единым
+        # getter'ом document_body() и кэшируется в записи. Сроки доп.
+        # соглашений (extra.valid_until) нужны строкам реестра на каждый
+        # refresh — при загрузке они собираются в лёгкую карту сроков и
+        # поддерживаются мутаторами, чтобы рендер реестра не трогал базу.
+        self._expiry_cache: dict[int, str | None] = {}
         # Причина последней неудачной записи: UI обязан проверять её перед
         # сообщением «сохранено».
         self.last_error = ""
@@ -325,9 +346,11 @@ class DataStore:
                     with applog.timed("Чтение реестра", 500, "storage"):
                         conn = _connect_db(path)
                         try:
-                            parties, documents, seq, rev, migrated_ids = self._read_all(conn)
+                            (parties, documents, seq, rev,
+                             migrated_ids, expiry_cache) = self._read_all(conn)
                         finally:
                             conn.close()
+                        self._expiry_cache = expiry_cache
                     break
                 except sqlite3.OperationalError as exc:
                     message = str(exc).lower()
@@ -527,6 +550,152 @@ class DataStore:
         return rec
 
     @classmethod
+    def _document_from_light_row(cls, row) -> dict:
+        """Лёгкая запись документа без тела (LAZY-1, R-09).
+
+        data/extra/text отсутствуют в записи — тело загружается по
+        требованию через document_body() и кэшируется в запись. Записи
+        без тела сериализация _document_row не подлежит: сохранение
+        сначала дочитывает тело (_ensure_body), иначе перезапись стёрла
+        бы колонки пустыми значениями.
+        """
+        rec: dict = {
+            "id": row[0],
+            "kind": row[1] or "",
+            "party_id": row[2],
+            "number": row[3] or "",
+            "date": row[4] or "",
+            "created_at": row[5] or "",
+        }
+        if row[6]:
+            rec["deleted_at"] = row[6]
+        if row[7]:
+            rec["deleted_with_party"] = True
+        return rec
+
+    def document_body(self, doc_id, cache: bool = True) -> dict:
+        """Единый getter тела документа (LAZY-1, R-09).
+
+        Возвращает ``{"text", "data", "extra"}``: из записи, если тело
+        уже в памяти (свежие мутаторы и кэш), иначе точечный SELECT из
+        базы (собственное соединение — безопасно из рабочего потока).
+        При ``cache=True`` тело кэшируется в запись и обновляет карту
+        сроков; рабочий поток должен вызывать с ``cache=False`` — он не
+        владеет состоянием (START-1).
+        """
+        rec = None
+        for item in self.documents:
+            if item.get("id") == doc_id:
+                rec = item
+                break
+        if rec is not None and "text" in rec:
+            if cache:
+                self._update_expiry_cache(rec)
+            return {
+                "text": rec.get("text") or "",
+                "data": dict(rec.get("data") or {}),
+                "extra": dict(rec.get("extra") or {}),
+            }
+        result: dict = {"text": "", "data": {}, "extra": {}}
+        if doc_id is None:
+            return result
+        path = db_path()
+        if not os.path.exists(path):
+            return result
+        conn = _connect_db(path)
+        try:
+            row = conn.execute(
+                "SELECT kind, data, extra, text, extra_keys FROM documents "
+                "WHERE id = ?",
+                (doc_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return result
+        data = self._loads(row[1], None)
+        extra = self._loads(row[2], None)
+        if not isinstance(data, dict) or not isinstance(extra, dict):
+            # Битое тело: запись остаётся в реестре (лёгкая), тело — пустое;
+            # строка на диске не перезаписывается (dirty не ставится).
+            applog.get_logger("storage").warning(
+                "Тело документа id=%s повреждено — возвращено пустое", doc_id,
+            )
+            return result
+        extra_keys = self._loads(row[4], None)
+        if isinstance(extra_keys, dict):
+            extra.update(extra_keys)
+        result = {"text": str(row[3] or ""), "data": data, "extra": extra}
+        if cache and rec is not None:
+            rec["text"] = result["text"]
+            rec["data"] = result["data"]
+            rec["extra"] = result["extra"]
+            if _normalize_field_names(rec):
+                self.mark_dirty(rec)
+            self._update_expiry_cache(rec)
+        return result
+
+    def _ensure_body(self, rec: dict) -> None:
+        """Дочитывает тело ленивой записи перед сериализацией (LAZY-1)."""
+        if "text" in rec and "data" in rec and "extra" in rec:
+            return
+        body = self.document_body(rec.get("id"), cache=True)
+        rec["text"] = body["text"]
+        rec["data"] = body["data"]
+        rec["extra"] = body["extra"]
+
+    def bulk_source_files(self) -> dict[int, str]:
+        """source_file всех активных документов без кэширования тел (LAZY-1).
+
+        Один read-only запрос для сверки папки (reconcile) и рабочего
+        потока старта (START-1): возвращает только значения source_file,
+        тяжёлые тела (items/тексты) в память не попадают.
+        """
+        result: dict[int, str] = {}
+        path = db_path()
+        if not os.path.exists(path):
+            return result
+        conn = _connect_db(path)
+        try:
+            rows = conn.execute(
+                "SELECT id, extra, extra_keys FROM documents "
+                "WHERE deleted_at IS NULL"
+            ).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            doc_id = _safe_int(row[0], 0)
+            if doc_id <= 0:
+                continue
+            extra = self._loads(row[1], None)
+            extra_keys = self._loads(row[2], None)
+            source = ""
+            if isinstance(extra, dict):
+                source = str(extra.get("source_file") or "")
+            if not source and isinstance(extra_keys, dict):
+                source = str(extra_keys.get("source_file") or "")
+            if source:
+                result[doc_id] = source
+        return result
+
+    def expiry_until(self, doc_id) -> "str | None":
+        """Срок «действует до» доп. соглашения из лёгкой карты (LAZY-1)."""
+        return self._expiry_cache.get(_safe_int(doc_id, 0))
+
+    def _update_expiry_cache(self, rec: dict) -> None:
+        """Обновляет карту сроков из записи с загруженным телом."""
+        if rec.get("kind") != KIND_ADDITIONAL:
+            return
+        extra = rec.get("extra")
+        if not isinstance(extra, dict):
+            return  # ленивая запись — срок неизвестен, кэш не трогаем
+        doc_id = _safe_int(rec.get("id"), 0)
+        if doc_id > 0:
+            self._expiry_cache[doc_id] = (
+                extra.get("valid_until_iso") or extra.get("valid_until")
+            )
+
+    @classmethod
     def _document_from_row(cls, row) -> dict | None:
         data = cls._loads(row[5], None)
         extra = cls._loads(row[6], None)
@@ -574,17 +743,28 @@ class DataStore:
                 if _normalize_field_names(rec):
                     migrated_ids.add(_safe_int(rec.get("id"), 0))
                 parties.append(rec)
+        # LAZY-1 (R-09): лёгкие колонки — тела (data/extra/text) читаются
+        # по требованию через document_body(). Нормализация имён полей
+        # (v2.13.0) для документов переносится на момент загрузки тела;
+        # сроки доп. соглашений собираются в лёгкую карту отдельным сканом.
+        expiry_cache: dict[int, str | None] = {}
         for row in conn.execute(
-            "SELECT id, kind, party_id, number, date, data, extra, text, "
-            "created_at, deleted_at, deleted_with_party, extra_keys FROM documents"
+            "SELECT id, kind, party_id, number, date, "
+            "created_at, deleted_at, deleted_with_party FROM documents"
         ):
-            rec = cls._document_from_row(row)
+            rec = cls._document_from_light_row(row)
             if rec is None:
                 dropped += 1
             else:
-                if _normalize_field_names(rec):
-                    migrated_ids.add(_safe_int(rec.get("id"), 0))
                 documents.append(rec)
+        for row in conn.execute(
+            "SELECT id, extra, extra_keys FROM documents "
+            "WHERE kind = ? AND deleted_at IS NULL",
+            (KIND_ADDITIONAL,),
+        ):
+            doc_id = _safe_int(row[0], 0)
+            if doc_id > 0:
+                expiry_cache[doc_id] = _valid_until_from_json(row[1], row[2])
         if dropped:
             applog.get_logger("storage").warning(
                 "При чтении реестра отброшено битых записей: %d", dropped,
@@ -593,7 +773,7 @@ class DataStore:
         seq = _safe_int(seq_row[0], None) if seq_row else None
         rev_row = conn.execute("SELECT value FROM meta WHERE key = 'rev'").fetchone()
         rev = _safe_int(rev_row[0], None) if rev_row else None
-        return parties, documents, seq, rev, migrated_ids
+        return parties, documents, seq, rev, migrated_ids, expiry_cache
 
     # ------------------------ Повреждённая база ------------------------ #
     def _quarantine_corrupt_db(self, path: str, exc: Exception) -> bool:
@@ -788,6 +968,9 @@ class DataStore:
         rec_id = _safe_int(rec.get("id"), 0)
         if rec_id > 0:
             self._dirty_documents.add(rec_id)
+            # LAZY-1: срок доп. соглашения поддерживается мутаторами — карта
+            # сроков не устаревает между загрузкой и записью.
+            self._update_expiry_cache(rec)
 
     def _mark_party_deleted(self, rec_id) -> None:
         rec_id = _safe_int(rec_id, 0)
@@ -843,6 +1026,13 @@ class DataStore:
                     self._dirty_documents.discard(rec_id)
                     self._deleted_document_ids.add(rec_id)
             party_rows = [self._party_row(party_index[rec_id]) for rec_id in self._dirty_parties]
+            # LAZY-1: тела ленивых dirty-записей дочитываются с диска до
+            # сериализации — иначе INSERT OR REPLACE затёр бы data/extra/text
+            # пустыми значениями (например, trash/restore без правки тела).
+            for rec_id in self._dirty_documents:
+                rec = document_index.get(rec_id)
+                if rec is not None:
+                    self._ensure_body(rec)
             document_rows = [
                 self._document_row(document_index[rec_id]) for rec_id in self._dirty_documents
             ]
@@ -983,7 +1173,11 @@ class DataStore:
         log = applog.get_logger("storage")
         self.last_error = ""
         # Сериализация до открытия базы: битые данные не роняют файл.
+        # LAZY-1: тела ленивых записей дочитываются до перезаписи — полный
+        # путь не имеет права терять data/extra/text.
         try:
+            for rec in self.documents:
+                self._ensure_body(rec)
             party_rows = [self._party_row(rec) for rec in self.counterparties]
             document_rows = [self._document_row(rec) for rec in self.documents]
         except (TypeError, ValueError) as exc:

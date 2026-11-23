@@ -324,7 +324,7 @@ def test_reset_filter_clears_query_and_applies(app, flow):
 #  Сверка реестра с папкой документов (п. 2.4)
 # --------------------------------------------------------------------------- #
 def test_scan_consistency_stores_orphans(app, flow, monkeypatch):
-    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store: ["/x/a.docx"])
+    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store, **kwargs: ["/x/a.docx"])
 
     flow.scan_consistency()
 
@@ -334,7 +334,7 @@ def test_scan_consistency_stores_orphans(app, flow, monkeypatch):
 
 def test_scan_consistency_refreshes_when_registry_page_open(app, flow, monkeypatch):
     app.pages = {"registry": object()}
-    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store: [])
+    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store, **kwargs: [])
 
     flow.scan_consistency()
 
@@ -342,7 +342,7 @@ def test_scan_consistency_refreshes_when_registry_page_open(app, flow, monkeypat
 
 
 def test_scan_consistency_swallows_background_errors(app, flow, monkeypatch):
-    def broken(base, store):
+    def broken(base, store, **kwargs):
         raise OSError("папка недоступна")
 
     monkeypatch.setattr(rc.reconcile, "find_orphans", broken)
@@ -356,7 +356,7 @@ def test_scan_consistency_swallows_background_errors(app, flow, monkeypatch):
 #  Диалог разбора файлов вне реестра
 # --------------------------------------------------------------------------- #
 def test_reconcile_dialog_no_orphans_alerts(app, flow, monkeypatch, ui_alerts):
-    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store: [])
+    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store, **kwargs: [])
 
     flow.open_reconcile_dialog()
 
@@ -367,7 +367,7 @@ def test_reconcile_dialog_no_orphans_alerts(app, flow, monkeypatch, ui_alerts):
 
 def test_reconcile_dialog_restore_success(app, flow, monkeypatch, ui_alerts):
     orphans = ["/x/a.docx"]
-    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store: list(orphans))
+    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store, **kwargs: list(orphans))
     added = []
     monkeypatch.setattr(
         rc.reconcile, "restore_orphans",
@@ -382,7 +382,7 @@ def test_reconcile_dialog_restore_success(app, flow, monkeypatch, ui_alerts):
 
 
 def test_reconcile_dialog_restore_store_error(app, flow, monkeypatch, ui_alerts):
-    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store: ["/x/a.docx"])
+    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store, **kwargs: ["/x/a.docx"])
     monkeypatch.setattr(
         rc.reconcile, "restore_orphans",
         lambda store, base, files, sf: setattr(store, "last_error", "ошибка записи") or 0,
@@ -395,7 +395,7 @@ def test_reconcile_dialog_restore_store_error(app, flow, monkeypatch, ui_alerts)
 
 
 def test_reconcile_dialog_trash_choice(app, flow, monkeypatch, ui_alerts):
-    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store: ["/x/a.docx"])
+    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store, **kwargs: ["/x/a.docx"])
     moved = []
     monkeypatch.setattr(
         rc.reconcile, "move_orphans_to_trash",
@@ -411,7 +411,7 @@ def test_reconcile_dialog_trash_choice(app, flow, monkeypatch, ui_alerts):
 
 
 def test_reconcile_dialog_skip_choice_does_nothing(app, flow, monkeypatch):
-    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store: ["/x/a.docx"])
+    monkeypatch.setattr(rc.reconcile, "find_orphans", lambda base, store, **kwargs: ["/x/a.docx"])
     app.choice_result = "skip"
 
     flow.open_reconcile_dialog()

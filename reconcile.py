@@ -63,21 +63,32 @@ def scan_document_files(base_dir: str) -> list[str]:
     return sorted(result, key=lambda value: value.lower())
 
 
-def registered_files(store) -> set[str]:
-    """Нормализованные пути файлов, на которые ссылаются записи реестра."""
+def registered_files(store, source_files: "dict | None" = None) -> set[str]:
+    """Нормализованные пути файлов, на которые ссылаются записи реестра.
+
+    LAZY-1: по умолчанию тела ленивых записей не читаются — вызывающий
+    код передаёт карту ``store.bulk_source_files()`` (один read-only
+    запрос, без загрузки тяжёлых тел). Без карты используется тело из
+    памяти записи (совместимость со старыми вызовами).
+    """
     result: set[str] = set()
-    for rec in store.documents:
-        source = str((rec.get("extra") or {}).get("source_file") or "")
+    if source_files is None:
+        for rec in store.documents:
+            source = str((rec.get("extra") or {}).get("source_file") or "")
+            if source:
+                result.add(_norm(source))
+        return result
+    for source in source_files.values():
         if source:
             result.add(_norm(source))
     return result
 
 
-def find_orphans(base_dir: str, store) -> list[str]:
+def find_orphans(base_dir: str, store, source_files: "dict | None" = None) -> list[str]:
     """Файлы документов, которых нет в реестре."""
     if not base_dir or not os.path.isdir(base_dir):
         return []
-    registered = registered_files(store)
+    registered = registered_files(store, source_files=source_files)
     return [
         path for path in scan_document_files(base_dir)
         if _norm(path) not in registered

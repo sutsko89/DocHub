@@ -135,6 +135,9 @@ class FakeApp:
     def __init__(self, store, tmp_path):
         self.root = FakeRoot()
         self.store = store
+        # UPD-UI (P-07): предпросмотр рендерится только на видимой
+        # странице — фейк представляет контекст открытого «Доп. соглашения».
+        self.current_page = "additional"
         self._log = logging.getLogger("test-document-page-controller")
         self.calls: list = []
         self.scale = 1.0

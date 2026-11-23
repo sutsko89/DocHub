@@ -126,6 +126,9 @@ class FakeApp:
     def __init__(self, store, tmp_path):
         self.root = FakeRoot()
         self.store = store
+        # UPD-UI (P-07): предпросмотры рендерятся только на видимой
+        # странице — фейк представляет контекст открытой «Спецификации».
+        self.current_page = "spec"
         self._log = logging.getLogger("test-document-save-controller")
         self.calls: list = []
         self.opened: list = []

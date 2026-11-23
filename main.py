@@ -88,7 +88,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.28.0"
+APP_VERSION = "2.28.1"
 
 # Уведомление о сроках доп. соглашений (2.18.0): раз в сутки, ключ
 # settings.json — как у автопроверки обновлений (updater.SETTINGS_KEY_TS).

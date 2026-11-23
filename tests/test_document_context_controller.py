@@ -310,6 +310,7 @@ def test_on_party_selected_empty_clears_current(app, flow, store):
 
 
 def test_update_contract_info_additional(app, flow):
+    app.current_page = "additional"  # UPD-UI: информация обновляется на видимой странице
     app.addl_contract_var.set("№ 5 от 10 января")
     flow.update_contract_info("additional")
     assert app.addl_contract_info_var.get() == "Договор-основание: № 5 от 10 января"
@@ -320,6 +321,7 @@ def test_update_contract_info_additional(app, flow):
 
 
 def test_update_contract_info_spec(app, flow):
+    app.current_page = "spec"  # UPD-UI: информация обновляется на видимой странице
     app.spec_contract_var.set("")
     flow.update_contract_info("spec")
     assert "не выбран" in app.spec_contract_info_var.get()

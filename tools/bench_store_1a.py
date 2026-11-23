@@ -187,15 +187,24 @@ def run_report(log_path: Path, kind: str | None, source: str | None) -> int:
         return 1
     stats: dict[tuple[str, str], list[float]] = {}
     total = 0
+    skipped = 0
     for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        tokens = line.split()
-        if len(tokens) != 5:
+        # Формат: <дата> <время> <kind> <источник…> <значение_мс>. Источник
+        # может содержать пробелы («Запись .docx», «Перерисовка реестра»):
+        # первые три поля фиксированы, значение — последний токен.
+        # Раньше парсер требовал ровно 5 токенов и молча пропускал
+        # многословные источники — для E-4/P-08 это недопустимо.
+        head = line.split(None, 3)
+        if len(head) != 4:
+            skipped += 1
             continue
         try:
-            value = float(tokens[4])
+            s, value_text = head[3].rsplit(None, 1)
+            value = float(value_text)
         except ValueError:
+            skipped += 1
             continue
-        k, s = tokens[2], tokens[3]
+        k = head[2]
         if kind and k != kind:
             continue
         if source and not s.startswith(source):
@@ -205,12 +214,16 @@ def run_report(log_path: Path, kind: str | None, source: str | None) -> int:
     if not stats:
         print("Подходящих записей нет (формат строки: дата время kind source значение_мс)")
         return 1
-    print(f"perf.log: {log_path} — {total} записей")
+    print(f"perf.log: {log_path} — {total} записей"
+          + (f" (пропущено неразобранных: {skipped})" if skipped else ""))
     for (k, s), values in sorted(stats.items()):
         print(f"{k:<8} {s:<24} {_fmt(_stats(values))}")
     print("\nСправка: tick — dt между событиями (pointer.poller — пулер жестов, "
-          "registry.canvas — раскладка списка); duration — длительность операции.")
+          "registry.canvas — раскладка списка); duration — длительность операции; "
+          "event — отметка момента (startup.built/startup.ready, значение 0).")
     print("Критерий раздела Е: p95 tick pointer.poller <= 25 мс (PERF-2).")
+    print("Критерий этапа 5 (E-4): в первые 5 с после startup.built — нет "
+          "duration-записей > 100 мс (главный поток).")
     return 0
 
 

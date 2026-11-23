@@ -322,10 +322,11 @@ def test_incrementally_written_db_keeps_schema_form(store):
     assert document_columns == list(DOC_COLUMNS)
 
     # Свежая загрузка читает те же данные без миграций.
+    # LAZY-1: тело ленивое — полный текст возвращается через document_body.
     reloaded = storage.DataStore()
     assert len(reloaded.counterparties) == 1 and len(reloaded.documents) == 1
     assert reloaded.documents[0]["id"] == doc["id"]
-    assert reloaded.documents[0]["text"] == "текст"
+    assert reloaded.document_body(doc["id"])["text"] == "текст"
 
 
 # --------------------------------------------------------------------------- #

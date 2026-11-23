@@ -54,8 +54,8 @@ def test_save_contract_disk_roundtrip(store, tmp_path, ooo_fields):
     # 4) новый DataStore с диска видит ту же запись
     reloaded = storage.DataStore()
     loaded = next(d for d in reloaded.documents if d["number"] == "516")
-    assert loaded["data"][F.INN] == ooo_fields[F.INN]
-    assert loaded["extra"]["is_ip"] is False
+    assert reloaded.document_body(loaded["id"])["data"][F.INN] == ooo_fields[F.INN]
+    assert reloaded.document_body(loaded["id"])["extra"]["is_ip"] is False
     # 5) save() возвращает True
     assert store.save() is True
 
@@ -92,8 +92,8 @@ def test_save_spec_disk_roundtrip(store, tmp_path, ooo_fields):
 
     reloaded = storage.DataStore()
     loaded = next(d for d in reloaded.documents if d["kind"] == storage.KIND_SPEC)
-    assert loaded["extra"]["contract_number"] == "516"
-    assert loaded["extra"]["total"] == pytest.approx(spec_total())
+    assert reloaded.document_body(loaded["id"])["extra"]["contract_number"] == "516"
+    assert reloaded.document_body(loaded["id"])["extra"]["total"] == pytest.approx(spec_total())
 
 
 def test_same_document_name_gets_numbered_suffix(store, tmp_path, ooo_fields):

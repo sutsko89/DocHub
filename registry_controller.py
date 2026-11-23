@@ -641,25 +641,39 @@ class RegistryController:
         text = f"{kind_label} № {number}"
         if date_text:
             text += f" от {date_text}"
-        text += agreements.row_suffix(rec)
+        text += agreements.row_suffix(rec, until=self._doc_until(rec))
         return text
 
+    def _doc_until(self, rec: dict) -> "str | None":
+        """Срок строки документа из лёгкой карты хранилища (LAZY-1).
+
+        Для записей с телом в памяти agreements сам берёт rec["extra"];
+        ленивые записи берут срок из карты, без чтения базы на рендер.
+        """
+        if rec.get("kind") != storage.KIND_ADDITIONAL:
+            return None
+        return self.app.store.expiry_until(rec.get("id"))
+
     @staticmethod
-    def doc_row_values(rec: dict) -> tuple[str, str, str]:
-        """Значения колонок строки документа: документ, дата, срок (U1)."""
+    def doc_row_values(rec: dict, until: "str | None" = None) -> tuple[str, str, str]:
+        """Значения колонок строки документа: документ, дата, срок (U1).
+
+        ``until`` — срок из лёгкой карты хранилища (LAZY-1); без него срок
+        берётся из тела в памяти записи (совместимость со старыми вызовами).
+        """
         kind_label = storage.KIND_LABELS.get(rec.get("kind"), rec.get("kind", ""))
         number = rec.get("number") or "б/н"
         date_text = rec.get("date") or ""
-        suffix = agreements.row_suffix(rec)
+        suffix = agreements.row_suffix(rec, until=until)
         if suffix.startswith("   ·   "):
             suffix = suffix[len("   ·   "):]
         return (f"{kind_label} № {number}", date_text or "—", suffix)
 
     @staticmethod
-    def doc_row_tags(rec: dict) -> tuple[str, ...]:
+    def doc_row_tags(rec: dict, until: "str | None" = None) -> tuple[str, ...]:
         """Теги строки документа по состоянию срока (2.18.0): красный/амберный."""
         if rec.get("kind") == storage.KIND_ADDITIONAL:
-            state = agreements.collect_state(rec)
+            state = agreements.collect_state(rec, until=until)
             if state == "expired":
                 return ("expired",)
             if state == "soon":
@@ -672,7 +686,7 @@ class RegistryController:
         Просроченное доп. соглашение — красный, истекающее в течение
         месяца — амберный, остальное — обычный.
         """
-        tags = self.doc_row_tags(rec)
+        tags = self.doc_row_tags(rec, until=self._doc_until(rec))
         if "expired" in tags:
             return ui.COLORS["error_text"]
         if "soon" in tags:
@@ -747,8 +761,8 @@ class RegistryController:
         rows = [
             RowSpec(
                 iid=f"{IID_DOC}{rec.get('id')}",
-                values=self.doc_row_values(rec),
-                tags=self.doc_row_tags(rec),
+                values=self.doc_row_values(rec, until=self._doc_until(rec)),
+                tags=self.doc_row_tags(rec, until=self._doc_until(rec)),
                 dot=self._doc_dot(rec),
                 data={"kind": "doc", "rec": rec},
             )
@@ -787,7 +801,9 @@ class RegistryController:
             data={"kind": "section"},
         )]
         for rec in docs:
-            source = str((rec.get("extra") or {}).get("source_file") or "")
+            source = str(
+                (app.store.document_body(rec.get("id")).get("extra") or {}).get("source_file") or ""
+            )
             name = os.path.basename(source) if source else "Документ"
             rows.append(RowSpec(
                 iid=f"{IID_UNKNOWN}{rec.get('id')}",
@@ -829,7 +845,7 @@ class RegistryController:
         for rec in trashed_docs:
             kind_label = storage.KIND_LABELS.get(rec.get("kind"), "Документ")
             party_name = app.store.party_name(rec.get("party_id"))
-            doc, date, expiry = self.doc_row_values(rec)
+            doc, date, expiry = self.doc_row_values(rec, until=self._doc_until(rec))
             rows.append(RowSpec(
                 iid=f"{IID_TRASH_DOC}{rec.get('id')}",
                 values=(f"{doc} · {party_name}" if party_name else doc,
@@ -1141,7 +1157,9 @@ class RegistryController:
             if second:
                 app._lifecycle_flow.delete_document(rec)
             else:
-                source = str((rec.get("extra") or {}).get("source_file") or "")
+                source = str(
+                    (app.store.document_body(rec.get("id")).get("extra") or {}).get("source_file") or ""
+                )
                 app._show_in_folder(source)
 
     def _update_header_mode(self):
@@ -1198,15 +1216,25 @@ class RegistryController:
     # ------------------------------------------------------------------ #
     #  Сверка реестра с папкой документов
     # ------------------------------------------------------------------ #
-    def scan_consistency(self) -> None:
-        """Фоновая сверка: ищет файлы документов вне реестра (п. 2.4)."""
+    def scan_consistency(self, orphans: "list[str] | None" = None) -> None:
+        """Сверка «реестр ↔ папка документов»: применяет результат (START-1).
+
+        ``orphans`` — готовый список файлов вне реестра из рабочего потока
+        (START-1); без него сверка выполняется на месте синхронно
+        (ручной вызов и тесты) через bulk-карту source_file (LAZY-1).
+        """
         app = self.app
-        try:
-            base = app._settings_flow.documents_dir(interactive=False)
-            orphans = reconcile.find_orphans(base, app.store)
-        except Exception as exc:  # noqa: BLE001 — фоновая задача не должна падать
-            app._log.warning("Сверка реестра с папкой не удалась: %s", type(exc).__name__)
-            return
+        if orphans is None:
+            try:
+                base = app._settings_flow.documents_dir(interactive=False)
+                orphans = reconcile.find_orphans(
+                    base, app.store, source_files=app.store.bulk_source_files(),
+                )
+            except Exception as exc:  # noqa: BLE001 — фоновая задача не должна падать
+                app._log.warning("Сверка реестра с папкой не удалась: %s", type(exc).__name__)
+                return
+        else:
+            app._log.info("Сверка реестра с папкой выполнена в фоне")
         app._orphans = orphans
         if orphans:
             app._log.info("Файлов вне реестра: %d", len(orphans))
@@ -1217,7 +1245,9 @@ class RegistryController:
         """Диалог разбора файлов вне реестра: восстановить или убрать в _trash."""
         app = self.app
         base = app._settings_flow.documents_dir()
-        orphans = reconcile.find_orphans(base, app.store)
+        orphans = reconcile.find_orphans(
+            base, app.store, source_files=app.store.bulk_source_files(),
+        )
         app._orphans = orphans
         if not orphans:
             ui.alert(
@@ -1268,7 +1298,9 @@ class RegistryController:
                     app.root, "Реестр восстановлен",
                     message, "success",
                 )
-            app._orphans = reconcile.find_orphans(base, app.store)
+            app._orphans = reconcile.find_orphans(
+                base, app.store, source_files=app.store.bulk_source_files(),
+            )
             app._doc_context_flow.refresh_party_combo_values()
             self.refresh()
             app._update_status()
@@ -1280,5 +1312,7 @@ class RegistryController:
                 f"Папка: {os.path.join(base, reconcile.TRASH_DIR_NAME)}",
                 "info",
             )
-            app._orphans = reconcile.find_orphans(base, app.store)
+            app._orphans = reconcile.find_orphans(
+                base, app.store, source_files=app.store.bulk_source_files(),
+            )
             self.refresh()

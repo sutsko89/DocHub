@@ -422,6 +422,9 @@ class DocumentPageController:
                 "Выберите контрагента и договор-основание слева — здесь появится текст документа.",
             )
             return
+        # LAZY-1: тело ленивого договора дочитывается единым getter'ом.
+        if "data" not in contract:
+            contract = {**contract, **app.store.document_body(contract.get("id"))}
         data = dict(contract.get("data") or {})
         is_ip = party.get("type") == "ip"
         try:

@@ -6,20 +6,27 @@ registry_controller.py. Виджетная часть (построение ст
 smoke-тестом под Xvfb; здесь проверяется логика без Tk:
 
   * поиск: подстрока по названию, цифры — по ИНН, пустой запрос — все;
-  * текст строки контрагента: тип, ИНН, ID, усечение адреса, маркер выбора;
+  * сортировка списка (U2): по добавлению / по алфавиту / по ИНН,
+    запоминание в settings.json;
+  * значения колонок строки контрагента/документа (U1), теги сроков;
   * выбор контрагента: переключение, сброс, перенос на страницы документов,
     ленивый рендер при неотрисованной странице (п. 5.1, 9 этапа 5);
-  * отложенный поиск: перенос задачи (after_cancel) при вводе и «Найти»;
+    выделение с клавиатуры (U13) — без toggle;
+  * панель действий (V3): подписи кнопок по типу записи, Delete не
+    касается выделенной записи корзины;
+  * отложенный поиск: перенос задачи (after_cancel) при вводе;
   * фоновая сверка реестра с папкой (п. 2.4): результат на приложении,
     тихая обработка сбоя, обновление реестра только при открытой странице;
   * диалог разбора файлов вне реестра: нет файлов / «Восстановить»
     (успех и ошибка хранилища) / «В корзину» / «Оставить»;
   * фасады ContractApp с прежними именами делегируют контроллеру.
+
+Живой виджет Treeview (популяция, диф, выделение, «Показать ещё», тема)
+покрывается tests/test_registry_tree.py и smoke-тестом.
 """
 from __future__ import annotations
 
 import logging
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +89,17 @@ class FakeApp:
         self._registry_rendered = False
         self._registry_search_after = None
         self._orphans: list = []
+        # Этап 4 (TREE-1/UX-REG): сортировка, фильтр типов, порция,
+        # сигнатура вида, выделение секций, сохранение настроек.
+        self._registry_sort = "added"
+        self._registry_sort_var = FakeVar("По добавлению")
+        self._settings: dict = {}
+        self._docs_type_filter = "all"
+        self._docs_type_var = FakeVar("Все типы")
+        self._registry_shown = rc.registry_tree.DISPLAY_SOFT_LIMIT
+        self._registry_signature = None
+        self._registry_selected_extra = None
+        self.settings_saved: list = []
         self.calls: list = []
         self.choice_calls: list = []
         self.choice_result = "skip"
@@ -106,6 +124,9 @@ class FakeApp:
 
     def _update_status(self):
         self.calls.append("status")
+
+    def save_setting(self, key: str, value) -> None:
+        self.settings_saved.append((key, value))
 
     def _choice_dialog(self, *args):
         self.choice_calls.append(args)
@@ -400,42 +421,204 @@ def test_reconcile_dialog_skip_choice_does_nothing(app, flow, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-#  Взаимодействие 2.19.0: выделение, двойной клик, проваливание, Delete, сроки
+#  Значения колонок, сортировка и панель действий (TREE-1/UX-REG)
 # --------------------------------------------------------------------------- #
-def test_on_party_click_selects_then_double_click_drills(app, flow):
+def test_party_row_values_columns():
     rec = make_party()
 
-    flow.on_party_click(rec)
-    assert app._registry_selected_id == rec["id"], "первый клик — выделение"
-    assert app._registry_drill_party_id is None, "ещё не провалились"
+    values = RegistryController.party_row_values(rec)
 
-    # Второй клик в пределах окна двойного клика — проваливание в документы.
-    flow.on_party_click(rec)
+    assert values[0] == "ООО Ромашка"
+    assert values[1] == "Юр. лицо"
+    assert values[2] == "7701234567"
+    assert values[3] == rec["id"]
+
+
+def test_party_row_values_missing_inn_and_long_address():
+    rec = make_party()
+    rec["fields"][F.INN] = ""
+    rec["fields"][F.LEGAL_ADDRESS] = "г. Владивосток, " + "длинная улица, " * 8
+
+    values = RegistryController.party_row_values(rec)
+
+    assert values[2] == "—"
+    assert values[4].endswith("…"), "длинный адрес усечён"
+
+
+def test_doc_row_values_columns():
+    rec = {"id": 1, "kind": storage.KIND_CONTRACT, "number": "5",
+           "date": "01.10.2026", "extra": {}}
+
+    doc, date, expiry = RegistryController.doc_row_values(rec)
+
+    assert "№ 5" in doc and "Договор" in doc
+    assert date == "01.10.2026"
+    assert expiry == ""
+
+
+def test_doc_row_values_expiry_without_separator():
+    rec = {"id": 1, "kind": storage.KIND_ADDITIONAL, "number": "3",
+           "date": "01.10.2026", "extra": {"valid_until_iso": "2026-01-01"}}
+
+    _doc, _date, expiry = RegistryController.doc_row_values(rec)
+
+    assert expiry == "истекло 01.01.2026", "разделитель уходит — срок в своей колонке"
+
+
+def test_doc_row_tags_marks_expired_and_soon():
+    expired = {"id": 1, "kind": storage.KIND_ADDITIONAL, "number": "1",
+               "extra": {"valid_until_iso": "2026-01-01"}}
+    soon = {"id": 2, "kind": storage.KIND_ADDITIONAL, "number": "2",
+            "extra": {"valid_until_iso": "2026-12-15"}}
+    contract = {"id": 3, "kind": storage.KIND_CONTRACT, "number": "5", "extra": {}}
+
+    assert RegistryController.doc_row_tags(expired) == ("expired",)
+    assert RegistryController.doc_row_tags(soon) == ("soon",)
+    assert RegistryController.doc_row_tags(contract) == ()
+
+
+def test_action_labels_for_kinds():
+    assert rc.action_labels_for("party") == ("Редактировать", "Удалить")
+    assert rc.action_labels_for("doc") == ("Открыть Word", "Удалить")
+    assert rc.action_labels_for("trash_party") == ("Восстановить", "Удалить навсегда")
+    assert rc.action_labels_for("trash_doc") == ("Восстановить", "Удалить навсегда")
+    assert rc.action_labels_for("unknown") == ("Показать в папке", "Удалить")
+    assert rc.action_labels_for("none") is None
+
+
+def test_sorted_parties_by_added_keeps_store_order(store, app, flow):
+    store.add_counterparty("ooo", {"ИНН": "7701234567",
+                                   "Сокращенное название компании": "ООО Ромашка"})
+    store.add_counterparty("ooo", {"ИНН": "7709990000",
+                                   "Сокращенное название компании": "ООО Стрелка"})
+    app._registry_sort = "added"
+
+    names = [storage.display_name(rec) for rec in flow.sorted_parties()]
+
+    assert names == ["ООО Ромашка", "ООО Стрелка"]
+
+
+def test_sorted_parties_by_name(store, app, flow):
+    store.add_counterparty("ooo", {"ИНН": "7701234567",
+                                   "Сокращенное название компании": "ООО Стрелка"})
+    store.add_counterparty("ooo", {"ИНН": "7709990000",
+                                   "Сокращенное название компании": "ООО Ромашка"})
+    app._registry_sort = "name"
+
+    names = [storage.display_name(rec) for rec in flow.sorted_parties()]
+
+    assert names == ["ООО Ромашка", "ООО Стрелка"], "алфавитный порядок не зависит от добавления"
+
+
+def test_sorted_parties_by_inn_empty_last(store, app, flow):
+    store.add_counterparty("ooo", {"ИНН": "7709990000",
+                                   "Сокращенное название компании": "ООО С ИНН"})
+    store.add_counterparty("ooo", {"Сокращенное название компании": "ООО Без ИНН"})
+    app._registry_sort = "inn"
+
+    names = [storage.display_name(rec) for rec in flow.sorted_parties()]
+
+    assert names == ["ООО С ИНН", "ООО Без ИНН"], "пустой ИНН — в конец списка"
+
+
+def test_on_sort_changed_persists_setting(app, flow):
+    app._registry_sort = "added"
+    app._registry_sort_var.set("По ИНН")
+
+    flow.on_sort_changed()
+
+    assert app._registry_sort == "inn"
+    assert ("registry_sort", "inn") in app.settings_saved
+
+
+def test_on_sort_changed_same_value_is_noop(app, flow):
+    app._registry_sort = "added"
+    app._registry_sort_var.set("По добавлению")
+
+    flow.on_sort_changed()
+
+    assert app.settings_saved == [], "перестановка и запись не выполняются"
+
+
+def test_on_docs_type_changed(app, flow):
+    app._docs_type_var.set("Договоры")
+
+    flow.on_docs_type_changed()
+
+    assert app._docs_type_filter == storage.KIND_CONTRACT
+
+
+def test_show_more_extends_portion(app, flow):
+    limit = rc.registry_tree.DISPLAY_SOFT_LIMIT
+    app._registry_shown = limit
+
+    flow.show_more()
+
+    assert app._registry_shown == limit * 2, "следующая порция R-05b"
+
+
+def test_tree_select_sets_and_user_clears(app, flow):
+    rec = make_party()
+    app._registry_rows[rec["id"]] = {"rec": rec, "iid": f"p:{rec['id']}"}
+    app.registry_list = SimpleNamespace(
+        row=lambda iid: SimpleNamespace(data={"kind": "party", "rec": rec}),
+        set_selection=lambda iid: None,
+        focus_tree=lambda: None,
+    )
+
+    flow.on_tree_select(f"p:{rec['id']}")
+    assert app._registry_selected_id == rec["id"], "клик по строке выделяет контрагента"
+
+    flow.on_tree_select(f"p:{rec['id']}")
+    assert app._registry_selected_id == rec["id"], \
+        "событие дерева идемпотентно (SET-семантика), эхо не меняет состояние"
+
+    flow.on_tree_select(None)  # эхо популяции/синхронизации
+    assert app._registry_selected_id == rec["id"], "эхо не снимает запомненный выбор"
+
+    flow.on_tree_select(None, user=True)  # click-toggle пользователя
+    assert app._registry_selected_id is None, "явное действие пользователя снимает выбор"
+
+    flow.on_tree_select(f"p:{rec['id']}")
+    flow.on_tree_activate(f"p:{rec['id']}")
+    assert app._registry_drill_party_id == rec["id"], \
+        "двойной клик/Enter открывает документы контрагента"
+
+
+def test_tree_activate_doc_opens_word(app, flow):
+    doc = {"id": 42, "kind": storage.KIND_CONTRACT, "number": "5",
+           "date": "01.10.2026", "extra": {}}
+    app._docs_rows[42] = {"rec": doc, "iid": "d:42"}
+    app.registry_list = SimpleNamespace(
+        row=lambda iid: SimpleNamespace(data={"kind": "doc", "rec": doc}),
+        set_selection=lambda iid: None,
+        focus_tree=lambda: None,
+    )
+
+    flow.on_tree_activate("d:42")
+
+    assert ("open_word", 42) in app.calls, "двойной клик по документу открывает Word"
+
+
+def test_key_nav_select_does_not_toggle(app, flow):
+    rec = make_party()
+
+    flow._select_party_plain(rec)
     assert app._registry_selected_id == rec["id"]
-    assert app._registry_drill_party_id == rec["id"], "двойной клик открывает документы"
+    assert ("set_party", rec["id"]) in app.calls
+
+    flow._select_party_plain(rec)
+
+    assert app._registry_selected_id == rec["id"], "стрелки не снимают выделение"
 
 
-def test_on_party_click_second_click_on_other_party(app, flow):
-    rec_a = make_party(short="ООО А")
-    rec_b = make_party(short="ООО Б")
-    app._registry_last_click_id = rec_a["id"]
-    app._registry_last_click_ts = time.monotonic()
+def test_delete_selected_ignores_trash_selection(app, flow):
+    app._registry_selected_extra = {"kind": "trash_party", "rec": {"id": "p-1"}}
+    app._registry_selected_id = "p-1"
 
-    flow.on_party_click(rec_b)
-
-    assert app._registry_selected_id == rec_b["id"]
-    assert app._registry_drill_party_id is None, "двойной клик по разным строкам не сработал"
-
-
-def test_on_party_click_after_timeout_is_single_click(app, flow):
-    rec = make_party()
-    flow.on_party_click(rec)
-    # Имитируем медленный клик: время предыдущего клика — давно.
-    app._registry_last_click_ts = time.monotonic() - 10
-
-    flow.on_party_click(rec)
-
-    assert app._registry_selected_id is None, "это снятие выделения, не двойной клик"
+    assert flow.delete_selected() is False, \
+        "Delete не удаляет навсегда запись корзины — только через панель"
+    assert app.calls == []
 
 
 def test_open_party_documents_drills_down_and_back(app, flow):
@@ -459,18 +642,6 @@ def test_select_other_party_does_not_break_drill(app, flow):
 
     assert app._registry_drill_party_id == rec_a["id"], \
         "выделение другого контрагента не меняет текущий вид"
-
-
-def test_on_doc_click_double_click_opens_word(app, flow):
-    doc = {"id": 42, "kind": storage.KIND_CONTRACT, "number": "5",
-           "date": "01.10.2026", "extra": {}}
-
-    flow.on_doc_click(doc)
-    assert app._docs_selected_id == 42, "первый клик — выделение"
-    assert ("open_word", 42) not in app.calls
-
-    flow.on_doc_click(doc)
-    assert ("open_word", 42) in app.calls, "двойной клик открывает документ в Word"
 
 
 def test_on_page_open_resets_drill(app, flow):

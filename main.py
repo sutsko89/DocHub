@@ -87,7 +87,7 @@ from services import (
 from widgets import SpecTable
 
 
-APP_VERSION = "2.24.0"
+APP_VERSION = "2.25.0"
 
 # Уведомление о сроках доп. соглашений (2.18.0): раз в сутки, ключ
 # settings.json — как у автопроверки обновлений (updater.SETTINGS_KEY_TS).
@@ -562,9 +562,12 @@ class ContractApp:
         self._build_titlebar()
         self._build_body()
         self._build_pages()
-        # DIAG-1: dt раскладок канвы реестра в perf-журнал — обработчик
-        # ставится только при включённом EWDOCHUB_PERF_LOG.
-        perflog.bind_canvas_meter(getattr(self, "registry_list", None), "registry.canvas")
+        # DIAG-1/TREE-1: тики раскладки списка реестра (Treeview) в perf-журнал
+        # — обработчик ставится только при включённом EWDOCHUB_PERF_LOG.
+        perflog.bind_canvas_meter(
+            getattr(getattr(self, "registry_list", None), "tree", None),
+            "registry.canvas",
+        )
         self._doc_context_flow.reset_all_form_baselines()
         self._install_resize_handles()
         self._select_page("contract")
@@ -603,6 +606,10 @@ class ContractApp:
         self.root.bind("<Alt-KeyPress-F4>", lambda _event: self.close())
         self.root.bind("<Control-n>", lambda _event: self._select_page("counterparty"))
         self.root.bind("<Control-N>", lambda _event: self._select_page("counterparty"))
+        # Ctrl+F в реестре ставит фокус в поиск (U13, UX-REG); в полях ввода
+        # клавиша работает штатно (проверка фокуса — в обработчике).
+        self.root.bind("<Control-f>", self._on_find_shortcut)
+        self.root.bind("<Control-F>", self._on_find_shortcut)
         ui.refresh_taskbar(self.root)
         # Оркестрация пакетного импорта — в отдельном контроллере (шаг
         # декомпозиции ContractApp, аудит 2.0.1 P2).
@@ -1008,6 +1015,16 @@ class ContractApp:
             self.root.destroy()
         except Exception:
             pass
+
+    def save_setting(self, key: str, value) -> None:
+        """Сохраняет один ключ settings.json (атомарно, как в close()).
+
+        Настройки окна и темы обновляются при закрытии; промежуточная
+        запись держит остальное состояние как есть (тот же паттерн, что
+        у переключателя автообновления).
+        """
+        self._settings = {**self._settings, key: value}
+        write_settings(self._settings)
 
     def _create_startup_backup(self) -> None:
         """Автокопия реестра при запуске (BKUP-1, карточка в roadmap)."""
@@ -1651,6 +1668,35 @@ class ContractApp:
             except Exception:
                 pass
         self._registry_flow.delete_selected()
+
+    def _on_find_shortcut(self, _event=None):
+        """Ctrl+F на странице «Реестр» — фокус в поле поиска (U13, UX-REG).
+
+        Если фокус в поле ввода (Entry/Text/Combobox), клавиша работает
+        штатно и фокус не переносится. На других страницах обработчик
+        молчит.
+        """
+        if self.current_page != "registry":
+            return None
+        focus = None
+        try:
+            focus = self.root.focus_get()
+        except Exception:
+            pass
+        if focus is not None:
+            try:
+                if str(focus.winfo_class()) in ("Entry", "Text", "Spinbox", "Combobox", "TCombobox"):
+                    return None
+            except Exception:
+                pass
+        field = getattr(self, "_registry_search_entry", None)
+        if field is not None:
+            try:
+                field.entry.focus_set()
+                field.entry.select_range(0, "end")
+            except Exception:
+                pass
+        return "break"
 
     def check_agreement_expiry_notice(self) -> None:
         """Стартовое уведомление о сроках доп. соглашений (2.18.0).

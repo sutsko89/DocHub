@@ -1792,46 +1792,40 @@ try:
           "п.9: реестр отрисован при первом открытии страницы")
     check(app.current_page == "registry" and not app.save_button.winfo_manager(),
           "кнопка сохранения скрыта на реестре")
-    texts = []
 
-    def collect(widget):
-        for child in widget.winfo_children():
-            try:
-                value = child.cget("text")
-            except Exception:
-                value = None
-            if isinstance(value, str):
-                texts.append(value)
-            collect(child)
+    def registry_text() -> str:
+        """Текстовое содержимое списка на Treeview + подпись/подстрока."""
+        parts = [str(app._registry_caption.cget("text")),
+                 str(app._registry_subtitle.cget("text"))]
+        for iid in app.registry_list.order():
+            row = app.registry_list.row(iid)
+            if row is not None:
+                parts.append("   ".join(str(value) for value in row.values))
+        return "\n".join(parts)
 
-    collect(app.registry_list)
-    registry_text = "\n".join(texts)
-    check("ООО Ромашка" in registry_text, "реестр: контрагент виден")
+    registry_str = registry_text()
+    check("ООО Ромашка" in registry_str, "реестр: контрагент виден")
 
-    # 2.19.0: один клик — выделение, двойной клик проваливается в документы.
+    # 2.19.0/этап 4: клик — выделение, панель действий; двойной клик
+    # (нативный Treeview) проваливается в документы.
     app._registry_flow.select_party(party_rec)
     app.root.update()
     check(app._registry_selected_id == party_rec["id"],
           "2.18.0: клик по контрагенту выделяет строку")
-    texts = []
-    collect(app.registry_list)
-    registry_text = "\n".join(texts)
-    check("Договор поставки № 5" not in registry_text,
+    registry_str = registry_text()
+    check("Договор поставки № 5" not in registry_str,
           "2.18.0: документы не раскрываются одинарным кликом")
     app._registry_flow.open_party_documents(party_rec)
     app.root.update()
     check(app._registry_drill_party_id == party_rec["id"],
           "2.19.0: двойной клик проваливается в документы контрагента")
-    texts = []
-    collect(app.registry_list)
-    registry_text = "\n".join(texts)
-    check("Договор поставки № 5" in registry_text, "реестр: договор виден")
-    check("Доп. соглашение" in registry_text, "реестр: доп. соглашение видно")
-    check("действует до" in registry_text or "истекает" in registry_text or "истекло" in registry_text,
-          "2.18.0: в строке доп. соглашения виден срок действия")
-    check("ООО Ромашка   ·" in registry_text or "ООО Ромашка ·" in registry_text
-          or "ИП" in registry_text or "Юр. лицо" in registry_text,
-          "2.19.0: в виде документов видна подстрока контрагента")
+    registry_str = registry_text()
+    check("Договор поставки № 5" in registry_str, "реестр: договор виден")
+    check("Доп. соглашение" in registry_str, "реестр: доп. соглашение видно")
+    check("действует до" in registry_str or "истекает" in registry_str or "истекло" in registry_str,
+          "2.18.0: срок доп. соглашения виден в колонке «Срок»")
+    check("Юр. лицо" in registry_str or "ИП" in registry_str,
+          "2.19.0: в drill-виде видна подстрока контрагента")
     _addl_rec = next(d for d in app.store.documents if d["kind"] == storage.KIND_ADDITIONAL)
     app._registry_flow.select_document(_addl_rec)
     app.root.update()
@@ -1845,10 +1839,8 @@ try:
     app.root.update()
     check(app._registry_drill_party_id is None,
           "2.19.0: «Назад» возвращает к списку контрагентов")
-    texts = []
-    collect(app.registry_list)
-    registry_text = "\n".join(texts)
-    check("ООО Ромашка" in registry_text and "Договор поставки № 5" not in registry_text,
+    registry_str = registry_text()
+    check("ООО Ромашка" in registry_str and "Договор поставки № 5" not in registry_str,
           "2.19.0: после возврата видны контрагенты, а не документы")
 
     # Поиск по ИНН в реестре.
@@ -1856,9 +1848,7 @@ try:
     app.registry_search_var.set("7701234567")
     app._registry_flow.apply_filter()
     app.root.update()
-    texts = []
-    collect(app.registry_list)
-    check("ООО Ромашка" in "\n".join(texts), "реестр: поиск по ИНН находит контрагента")
+    check("ООО Ромашка" in registry_text(), "реестр: поиск по ИНН находит контрагента")
     app.registry_search_var.set("")
     app._registry_flow.apply_filter()
 
@@ -1869,31 +1859,44 @@ try:
         "Юридический адрес": "г. Владивосток, ул. Светланская, д. 1",
     }, save=False)
     app._registry_flow.refresh()
-    _frames_before = {pid: entry["frame"] for pid, entry in app._registry_rows.items()}
-    check(len(_frames_before) == 2, "5.1: в реестре два контрагента для проверки")
+    app.root.update()
+    _order_before = app.registry_list.order()
+    check(len(app.registry_list.rows()) >= 2, "5.1: в реестре два контрагента для проверки")
     app._registry_flow.select_party(party_rec)
-    check(all(app._registry_rows[pid]["frame"] is _frames_before[pid]
-              for pid in _frames_before if pid in app._registry_rows),
-          "5.1: выбор контрагента не пересоздаёт строки реестра")
+    check(app.registry_list.order() == _order_before,
+          "5.1: выбор контрагента не пересоздаёт строки реестра (iid сохранены)")
     check(app._registry_selected_id == party_rec["id"], "5.1: выбор контрагента запомнен")
     app._registry_flow.open_party_documents(party_rec)
     app.root.update()
-    texts = []
-    collect(app.registry_list)
-    check(any("Документы" in str(_t) for _t in texts),
+    check("Документы" in str(app._registry_caption.cget("text")),
           "2.19.0: вид документов открыт после частичного обновления списка")
     app._registry_flow.back_to_parties()
     app.root.update()
     app._registry_flow.select_party(party_rec)  # снять выбор
     check(app._registry_selected_id is None, "5.1: повторный клик снимает выбор")
-    # 2.19.0: двойной клик распознаётся по времени между command-вызовами.
-    app._registry_flow.on_party_click(party_rec)
-    app._registry_flow.on_party_click(party_rec)
+    # 2.19.0/этап 4: активация строки (Enter/двойной клик) проваливается.
+    _party_iid = f"p:{party_rec['id']}"
+    app._registry_flow.on_tree_select(_party_iid, key_nav=False)
+    app._registry_flow.on_tree_activate(_party_iid)
+    app.root.update()
     check(app._registry_drill_party_id == party_rec["id"],
-          "2.19.0: два быстрых клика по строке проваливаются в документы")
+          "2.19.0: активация строки проваливается в документы")
     app._registry_flow.back_to_parties()
+    app.root.update()
+    # UX-REG: сортировка «по алфавиту» меняет порядок списка.
+    app._registry_sort_var.set("По алфавиту")
+    app.root.update()
+    _sorted_rows = [app.registry_list.row(iid)
+                    for iid in app.registry_list.order() if iid.startswith("p:")]
+    _sorted_names = [storage.display_name(row.data["rec"])
+                     for row in _sorted_rows if row is not None]
+    check(_sorted_names == sorted(_sorted_names, key=str.casefold),
+          "UX-REG: сортировка по алфавиту упорядочивает список")
+    app._registry_sort_var.set("По добавлению")
+    app.root.update()
     app.store.counterparties.remove(_party_2)
     app._registry_flow.refresh()
+    app.root.update()
 
     check(app.store.delete_document(app.store.documents[0]["id"]),
           "хранилище: окончательное удаление записи документа")

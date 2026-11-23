@@ -205,8 +205,15 @@ class DocumentContextController:
         self.set_current_party(rec, source=key)
 
     def update_contract_info(self, page: str) -> None:
-        """Показывает выбранный договор-основание явно (п. 4.2)."""
+        """Показывает выбранный договор-основание явно (п. 4.2).
+
+        UPD-UI (P-07): на скрытой странице трейс переменных не трогает
+        виджеты — при переключении на страницу информацию обновляет
+        _select_page.
+        """
         app = self.app
+        if getattr(app, "current_page", None) != page:
+            return
         if page == "additional":
             var = getattr(app, "addl_contract_var", None)
             info = getattr(app, "addl_contract_info_var", None)

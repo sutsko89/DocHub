@@ -663,8 +663,16 @@ class ImportController:
         Тело — в ui_macos.import_report_window (примитив слоя оформления,
         перенос по рекомендации аудита 2.0.1); подписи типов документов
         передаются параметром, чтобы слой оформления не зависел от storage.
+        Кнопка «Открыть реестр» (U10) ведёт в обновлённый реестр.
         """
         ui.import_report_window(
             self.app.root, entries, summary, self.app.scale,
             kind_labels=storage.KIND_LABELS,
+            on_open_registry=self.open_registry,
         )
+
+    def open_registry(self) -> None:
+        """U10: «Открыть реестр» из отчёта — обновить реестр и показать его."""
+        self.app._registry_flow.refresh()
+        self.app._update_status()
+        self.app._select_page("registry")

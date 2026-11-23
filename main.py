@@ -1628,6 +1628,15 @@ class ContractApp:
             item.set_selected(nav_key == key)
         if key == "registry":
             self._registry_flow.on_page_open()
+        elif key == "spec":
+            # UPD-UI (P-07): предпросмотр и информация договора обновляются
+            # при переключении на видимую страницу, а не на скрытой.
+            self._doc_save_flow.flush_spec_preview()
+            self._doc_context_flow.update_contract_info("spec")
+            self._doc_save_flow.update_spec_totals()
+        elif key == "additional":
+            self._doc_page_flow.render_additional_preview()
+            self._doc_context_flow.update_contract_info("additional")
         self.root.after(60, self._refresh_scrollbars)
 
     # ------------------------------------------------------------------ #

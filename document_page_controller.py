@@ -412,6 +412,10 @@ class DocumentPageController:
         """Собирает текст предпросмотра доп. соглашения из текущих полей."""
         app = self.app
         app._preview_additional_after = None
+        # UPD-UI (P-07): предпросмотр — только при видимой странице; при
+        # переключении на «Доп. соглашение» его перерисовывает _select_page.
+        if getattr(app, "current_page", None) != "additional":
+            return
         party = app._doc_context_flow.party_from_var(app.addl_party_var)
         contract = (
             app._doc_context_flow.contract_from_var(app.addl_contract_var, party["id"]) if party else None

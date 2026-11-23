@@ -2481,12 +2481,15 @@ def choice_dialog(parent: tk.Misc, title: str, message: str,
 
 def import_report_window(parent: tk.Misc, entries: list[dict], summary: str,
                          scale: float = 1.0,
-                         kind_labels: Optional[dict] = None) -> None:
+                         kind_labels: Optional[dict] = None,
+                         on_open_registry: Optional[Callable[[], None]] = None) -> None:
     """Окно отчёта пакетного импорта (примитив; перенос из контроллера).
 
     По каждому файлу видны тип, результат и причина (п. 3.5 плана).
     Словарь подписей типов документов передаётся вызывающим кодом —
-    слой оформления не зависит от хранилища.
+    слой оформления не зависит от хранилища. ``on_open_registry`` —
+    колбэк кнопки «Открыть реестр» (U10): окно закрывается, реестр
+    открывается и обновляется в главном потоке приложения.
     """
     labels = kind_labels or {}
     win = ctk.CTkToplevel(parent)
@@ -2535,6 +2538,15 @@ def import_report_window(parent: tk.Misc, entries: list[dict], summary: str,
         buttons, "Закрыть", win.destroy,
         width=int(120 * scale), height=int(32 * scale),
     ).pack(side="right")
+    if on_open_registry is not None:
+        def _open_registry():
+            win.destroy()
+            on_open_registry()
+
+        ghost_button(
+            buttons, "Открыть реестр", _open_registry,
+            width=int(150 * scale), height=int(32 * scale),
+        ).pack(side="right", padx=(0, int(10 * scale)))
 
     win.update_idletasks()
     width = int(720 * scale)

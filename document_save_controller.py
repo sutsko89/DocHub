@@ -126,10 +126,21 @@ class DocumentSaveController:
         app.spec_table = SpecTable(right, scale=app.scale, on_notice=app._notify)
         app.spec_table.grid(row=1, column=0, sticky="ew",
                             padx=int(12 * app.scale), pady=(int(4 * app.scale), 0))
+        # U12: строка «Позиций: N · Итого: …» под таблицей позиций. Сумма —
+        # тот же document_builder.spec_total(rows), что пишется в реестр и
+        # печатную форму: расхождение сумм исключено по построению.
+        app._spec_totals_var = tk.StringVar(value="")
+        app._spec_totals_label = ctk.CTkLabel(
+            right, textvariable=app._spec_totals_var, font=ui.font(11),
+            text_color=ui.COLORS["text_secondary"], anchor="w",
+        )
+        app._spec_totals_label.grid(row=2, column=0, sticky="ew",
+                                    padx=int(12 * app.scale), pady=(int(2 * app.scale), 0))
 
-        textbox.grid(row=2, column=0, sticky="nsew",
+        textbox.grid(row=3, column=0, sticky="nsew",
                      padx=int(12 * app.scale), pady=(int(4 * app.scale), int(12 * app.scale)))
         app.spec_table.on_change = self.on_spec_item_changed
+        self.update_spec_totals()
 
         # -- Контрагент -------------------------------------------------- #
         card = ui.Card(left, labels_above=True)
@@ -270,7 +281,27 @@ class DocumentSaveController:
         return spec_total(self.spec_items())
 
     def on_spec_item_changed(self, *_args):
+        self.update_spec_totals()
         self.regenerate_spec()
+
+    def update_spec_totals(self) -> None:
+        """Строка «Позиций: N · Итого: …» под таблицей (U12).
+
+        Один источник суммы — document_builder.spec_total(rows): столько же
+        пишется в реестр (extra.total) и печатную форму, расхождение
+        между строкой под таблицей, статусом и предпросмотром исключено
+        по построению (критерий карточки UX-B).
+        """
+        app = self.app
+        var = getattr(app, "_spec_totals_var", None)
+        if var is None:
+            return
+        rows = app.spec_table.rows
+        total = spec_total(rows)
+        var.set(
+            f"Позиций: {len(rows)} · Итого: {total:.2f}".replace(".", ",")
+            if rows else "Позиции не добавлены"
+        )
 
     def on_spec_party_changed(self, *_args):
         app = self.app
@@ -451,6 +482,10 @@ class DocumentSaveController:
         import main  # поздний импорт: печатные настройки main.get_spec_settings
 
         app._spec_preview_after = None
+        # UPD-UI (P-07): предпросмотр — только при видимой странице; при
+        # переключении на «Спецификацию» его перерисовывает _select_page.
+        if getattr(app, "current_page", None) != "spec":
+            return
         party = app._doc_context_flow.party_from_var(app.spec_party_var)
         if party is None:
             app._set_text(app.spec_text, "Выберите контрагента и договор-основание слева.")

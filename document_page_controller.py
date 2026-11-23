@@ -160,6 +160,12 @@ class DocumentPageController:
         """Собирает текст предпросмотра договора из текущих полей."""
         app = self.app
         app._preview_contract_after = None
+        # UPD-UI (P-07, волна 3): предпросмотр — только при видимой странице;
+        # операции из других страниц (сохранение, корзина, импорт, правка
+        # контрагента) не рендерят скрытый текст — при переключении на
+        # «Договор поставки» его перерисовывает _select_page.
+        if getattr(app, "current_page", None) != "contract":
+            return
         rec = app._doc_context_flow.party_from_var(app.contract_party_var)
         if rec is None:
             app._set_text(

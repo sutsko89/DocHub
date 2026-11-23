@@ -49,6 +49,7 @@ from __future__ import annotations
 import customtkinter as ctk
 import tkinter as tk
 
+import dadata_controller
 import services
 import storage
 import ui_macos as ui
@@ -527,6 +528,17 @@ class CounterpartyController:
         win.transient(app.root)
         win.after(120, win.grab_set)
 
+        # U8-полностью (UX-B, этап 5): «Заполнить по ИНН» в окне правки.
+        # Цель DaData — снимок адресата: поля окна (dict мутируется ниже
+        # add_field — цель видит все поля), фиксированный режим карточки,
+        # собственная строка статуса, диалоги модальны к окну правки.
+        entries: dict[str, tk.Widget] = {}
+        error_vars: dict[str, tk.StringVar] = {}
+        edit_status_var = tk.StringVar(value="")
+        edit_target = dadata_controller.DadataTarget(
+            win, entries, mode, edit_status_var,
+        )
+
         header = ctk.CTkFrame(win, fg_color="transparent")
         header.pack(fill="x", padx=int(24 * app.scale), pady=(int(18 * app.scale), int(6 * app.scale)))
         ctk.CTkLabel(
@@ -540,6 +552,11 @@ class CounterpartyController:
             text="Изменится только карточка в реестре. Ранее созданные документы останутся без изменений.",
             font=ui.font(12), text_color=ui.COLORS["text_secondary"], anchor="w", height=16,
         ).pack(anchor="w", pady=(int(2 * app.scale), 0))
+        # U8: строка статуса DaData окна правки (анимация/результат).
+        ctk.CTkLabel(
+            header, textvariable=edit_status_var,
+            font=ui.font(12), text_color=ui.COLORS["accent"], anchor="w", height=16,
+        ).pack(anchor="w", pady=(int(2 * app.scale), 0))
 
         scroller = ctk.CTkScrollableFrame(
             win, fg_color="transparent", corner_radius=0,
@@ -551,9 +568,6 @@ class CounterpartyController:
 
         card = ui.Card(scroller, compact=True)
         card.pack(fill="x", pady=(0, int(8 * app.scale)))
-
-        entries: dict[str, tk.Widget] = {}
-        error_vars: dict[str, tk.StringVar] = {}
 
         def error_var(key: str) -> tk.StringVar:
             return error_vars.setdefault(key, tk.StringVar(value=""))
@@ -604,6 +618,19 @@ class CounterpartyController:
         add_field(F.INN, F.INN, kind="digits", max_len=12,
                   width=int(180 * app.scale), stretch=False, required=True,
                   placeholder=FORMAT_HINTS[F.INN])
+        # U8-полностью: кнопка рядом с ИНН — как на странице добавления.
+        # Диалоги и статус привязаны к окну правки (edit_target); фабрика
+        # потока — по умолчанию threading.Thread, как на главной странице.
+        fill_btn = ui.ghost_button(
+            card.body, "Заполнить по ИНН",
+            lambda: app._dadata_flow.fill_from_inn(target=edit_target),
+            width=int(152 * app.scale), height=int(28 * app.scale),
+        )
+        card.row(
+            "", fill_btn,
+            hint="Кнопка подтягивает название, адрес, директора и банк "
+                 "из ЕГРЮЛ/ЕГРИП (U8-полностью, этап 5).",
+        )
         if is_ip:
             add_field(F.OGRNIP, F.OGRNIP, kind="digits", max_len=15,
                       width=int(180 * app.scale), stretch=False, required=True,

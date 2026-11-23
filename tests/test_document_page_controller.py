@@ -268,6 +268,7 @@ def test_preview_contract_debounces(app, flow):
 
 
 def test_render_contract_preview_without_party(app, flow):
+    app.current_page = "contract"  # UPD-UI: рендер — на видимой странице
     app.party_for_var = None
     flow.render_contract_preview()
 
@@ -277,6 +278,7 @@ def test_render_contract_preview_without_party(app, flow):
 
 
 def test_render_contract_preview_collects_fields(app, flow, store, ooo_fields):
+    app.current_page = "contract"  # UPD-UI: рендер — на видимой странице
     rec = seed_party(store, ooo_fields)
     app.party_for_var = rec
     app.contract_number_var.set("5")
@@ -299,6 +301,7 @@ def test_render_contract_preview_collects_fields(app, flow, store, ooo_fields):
 
 
 def test_render_contract_preview_ip_type(app, flow, store, ooo_fields):
+    app.current_page = "contract"  # UPD-UI: рендер — на видимой странице
     rec = seed_party(store, ooo_fields)
     rec_ip = dict(rec, type="ip")
     app.party_for_var = rec_ip
@@ -309,6 +312,7 @@ def test_render_contract_preview_ip_type(app, flow, store, ooo_fields):
 
 
 def test_render_contract_preview_error_is_honest(app, flow, store, ooo_fields):
+    app.current_page = "contract"  # UPD-UI: рендер — на видимой странице
     app.party_for_var = seed_party(store, ooo_fields)
 
     def broken(data, is_ip):

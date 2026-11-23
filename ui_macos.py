@@ -1115,6 +1115,7 @@ class TopNavItem(tk.Canvas):
         self._command = command
         self._selected = False
         self._hover = False
+        self._dot = False  # V5: акцентная точка «грязной» формы
         text_width = tkfont.Font(font=font(12)).measure(text)
         width = px(12) + px(18) + px(7) + text_width + px(13)
         super().__init__(
@@ -1132,6 +1133,19 @@ class TopNavItem(tk.Canvas):
             return
         self._selected = selected
         self._draw()
+
+    # V5 (UX-B, этап 5): акцентная точка «грязной» формы — несохранённые
+    # данные видны в шапке ДО попытки уйти со страницы.
+    def set_dot(self, visible: bool) -> None:
+        """Показывает/прячет акцентную точку; перерисовка только при смене."""
+        if self._dot == bool(visible):
+            return
+        self._dot = bool(visible)
+        self._draw()
+
+    def has_dot(self) -> bool:
+        """Точка установлена (для тестов и отладки)."""
+        return self._dot
 
     def _on_enter(self, _event) -> None:
         self._hover = True
@@ -1169,6 +1183,12 @@ class TopNavItem(tk.Canvas):
             fill=resolve(COLORS["chrome_text"]),
             font=font(12, "bold" if self._selected else "normal"),
         )
+        if self._dot:
+            # V5: точка в правом верхнем углу кнопки — цвет акцента.
+            self.create_oval(
+                width - px(11), px(4), width - px(3), px(12),
+                fill=resolve(COLORS["accent"]), outline="",
+            )
 
 
 # --------------------------------------------------------------------------- #

@@ -1236,13 +1236,20 @@ try:
 
     # Регистрация импорта: документ без ИНН привязывается к подтверждённому
     # контрагенту, а не создаёт новую карточку (п. 3.3).
+    # U9 (2.28.0): пакетная сводка без ИНН — диалог по пакету; в smoke
+    # решаем «по каждому», чтобы файл дошёл до подменённого ask_party
+    # (модальное окно сводки в безграфовом прогоне некому закрыть).
     _tmp_copied = os.path.join(tempfile.gettempdir(), "smoke_import_copy.docx")
     with open(_tmp_copied, "wb") as _fh:
         _fh.write(b"stub")
     _orig_report = app._import_flow.show_report
     _orig_ask = app._import_flow.ask_party
+    _orig_batch_no_inn = app._import_flow.ask_batch_no_inn
+    _orig_batch_conflicts = app._import_flow.ask_batch_conflicts
     app._import_flow.show_report = lambda entries, summary: None
     app._import_flow.ask_party = lambda result: (party_rec, "attach")
+    app._import_flow.ask_batch_no_inn = lambda results: "per_file"
+    app._import_flow.ask_batch_conflicts = lambda conflicts: "per_file"
     try:
         _parties_before = len(app.store.counterparties)
         app._import_flow.finish([{
@@ -1270,6 +1277,8 @@ try:
     finally:
         app._import_flow.show_report = _orig_report
         app._import_flow.ask_party = _orig_ask
+        app._import_flow.ask_batch_no_inn = _orig_batch_no_inn
+        app._import_flow.ask_batch_conflicts = _orig_batch_conflicts
         try:
             os.remove(_tmp_copied)
         except OSError:
@@ -1465,7 +1474,14 @@ try:
         "copied": _dup_copy, "error": "", "warning": "",
     }
     _orig_report = app._import_flow.show_report
+    _orig_batch_no_inn2 = app._import_flow.ask_batch_no_inn
+    _orig_batch_conflicts2 = app._import_flow.ask_batch_conflicts
     app._import_flow.show_report = lambda entries, summary: None
+    # U9: пакетные диалоги сводки здесь не задействованы (проверка 3.3 по
+    # ИНН); подмена защищает от модального ожидания при будущих правках
+    # данных — совпадение названий открыло бы диалог конфликта.
+    app._import_flow.ask_batch_no_inn = lambda results: "per_file"
+    app._import_flow.ask_batch_conflicts = lambda conflicts: "per_file"
     try:
         app._import_flow.finish([dict(_dup_result)])
         _dup_card = app.store.find_by_inn("2540123456")
@@ -1479,6 +1495,8 @@ try:
         app.store.purge_counterparty(_dup_card["id"])
     finally:
         app._import_flow.show_report = _orig_report
+        app._import_flow.ask_batch_no_inn = _orig_batch_no_inn2
+        app._import_flow.ask_batch_conflicts = _orig_batch_conflicts2
         try:
             os.remove(_dup_copy)
         except OSError:
@@ -1510,7 +1528,12 @@ try:
 
     app.store.save = _counting_save
     _orig_report2 = app._import_flow.show_report
+    _orig_batch_no_inn3 = app._import_flow.ask_batch_no_inn
+    _orig_batch_conflicts3 = app._import_flow.ask_batch_conflicts
     app._import_flow.show_report = lambda entries, summary: None
+    # U9: та же защита от модального ожидания пакетных диалогов.
+    app._import_flow.ask_batch_no_inn = lambda results: "per_file"
+    app._import_flow.ask_batch_conflicts = lambda conflicts: "per_file"
     try:
         _docs_before = len(app.store.documents)
         app._import_flow.finish(_batch_results)
@@ -1530,6 +1553,8 @@ try:
     finally:
         app.store.save = _orig_store_save
         app._import_flow.show_report = _orig_report2
+        app._import_flow.ask_batch_no_inn = _orig_batch_no_inn3
+        app._import_flow.ask_batch_conflicts = _orig_batch_conflicts3
         _batch_party_rec = app.store.find_by_inn("2540999887")
         if _batch_party_rec is not None:
             app.store.purge_counterparty(_batch_party_rec["id"])

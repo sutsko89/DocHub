@@ -47,6 +47,7 @@ import reconcile
 import registry_controller
 import settings_controller
 import single_instance
+import startup_controller
 import storage
 import updater
 import updater_controller
@@ -515,6 +516,10 @@ class ContractApp:
         # (v2.4.0). Создаётся ДО построения страниц: build_page вызывается
         # напрямую у контроллера.
         self._registry_flow = registry_controller.RegistryController(self)
+        # START-1 (R-07): владелец стартовых дисковых задач — отдельный
+        # контроллер по шаблону import_controller (фоновый воркер, очередь,
+        # применение результатов в главном потоке).
+        self._startup_flow = startup_controller.StartupFlow(self)
         # Спецификация и сохранение документов — DocumentSaveController
         # (v2.5.0). Создаётся ДО построения страниц: build_spec_page
         # вызывается напрямую у контроллера.
@@ -578,17 +583,15 @@ class ContractApp:
         # Автокопия реестра при запуске (BKUP-1): до 7 копий, только при
         # изменениях с последней копии; отказ копирования старт не блокирует.
         self.root.after(400, self._create_startup_backup)
-        self.root.after(600, self._cleanup_temp_documents)
-        # Автоочистка старой корзины и сверка «реестр ↔ папка документов».
-        self.root.after(900, self._cleanup_expired_trash)
-        self.root.after(1500, self._registry_flow.scan_consistency)
+        # START-1 (R-07 / P-04): сверка папки, очистки и сбор сроков —
+        # в рабочем потоке по шаблону import_controller; результаты
+        # применяются в главном потоке (очередь + tick). Суточный гейт
+        # уведомления о сроках читается здесь, до запуска воркера.
+        self._startup_flow.run(include_notice=self._expiry_notice_due())
         # Тихая автопроверка обновлений (2.15.0): после всех стартовых задач,
         # не чаще раза в сутки, выключается пользователем и env-глушкой
         # EWDOCHUB_NO_UPDATE_CHECK (тесты/smoke не ходят в сеть).
         self.root.after(2200, self._update_flow.maybe_auto_check)
-        # Уведомление о сроках доп. соглашений (2.18.0): просроченные и
-        # истекающие в течение месяца; раз в сутки, без сети.
-        self.root.after(1900, self.check_agreement_expiry_notice)
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Escape>", self._on_escape)
@@ -990,6 +993,9 @@ class ContractApp:
         return {"width": width, "height": height, "x": x, "y": y, "maximized": bool(self._zoomed)}
 
     def close(self):
+        # START-1: работник стартовых задач останавливается по флагу между
+        # шагами и файлами — не пишет в очередь после закрытия окна.
+        self._startup_flow.stop()
         dirty = [self._doc_context_flow.form_label(key) for key in self._doc_context_flow.dirty_pages()]
         if dirty and not ui.confirm(
             self.root, "Несохранённые данные",
@@ -1043,47 +1049,27 @@ class ContractApp:
                 else storage.backup_status_text()
             )
 
-    def _cleanup_temp_documents(self) -> None:
-        """Удаляет *.docx.tmp, оставшиеся после аварийного завершения записи."""
-        try:
-            base = self._settings_flow.documents_dir(interactive=False)
-            directories = [base]
-            with os.scandir(base) as entries:
-                directories.extend(
-                    entry.path for entry in entries if entry.is_dir()
-                )
-        except OSError:
-            return
-        removed = 0
-        for directory in directories:
-            try:
-                with os.scandir(directory) as entries:
-                    for entry in entries:
-                        if entry.is_file() and entry.name.endswith(".docx.tmp"):
-                            try:
-                                os.remove(entry.path)
-                                removed += 1
-                            except OSError:
-                                pass
-            except OSError:
-                continue
-        if removed:
-            self._log.info("Удалено незавершённых .docx.tmp: %d", removed)
+    # START-1: очистка .docx.tmp переехала в рабочий поток
+    # (startup_controller.StartupFlow._cleanup_temp_documents).
 
-    def _cleanup_expired_trash(self) -> None:
-        """Физически удаляет записи, пролежавшие в корзине дольше срока хранения.
+    def _cleanup_expired_trash(self, planned: "int | None" = None) -> None:
+        """Физически удаляет записи, пролежавшие в корзине дольше срока.
 
         TRASH-WARN (этап 2): корзина не удаляет записи молча. Перед
         очисткой — сводка «будет удалено N записей» в журнале, после —
         итог в статусе приложения; при пустой сводке очистка не запускается.
+        START-1: план подсчитан в рабочем потоке и приходит параметром
+        (мутация реестра — только главный поток); без параметра план
+        считается на месте (ручные вызовы и тесты).
         """
-        try:
-            planned = self.store.count_expired_trash()
-        except Exception as exc:  # noqa: BLE001 — фоновая задача не должна падать
-            self._log.warning(
-                "Подсчёт корзины перед автоочисткой не удался: %s", type(exc).__name__,
-            )
-            return
+        if planned is None:
+            try:
+                planned = self.store.count_expired_trash()
+            except Exception as exc:  # noqa: BLE001 — фоновая задача не должна падать
+                self._log.warning(
+                    "Подсчёт корзины перед автоочисткой не удался: %s", type(exc).__name__,
+                )
+                return
         if not planned:
             return  # удалять нечего — никаких действий и сообщений
         # Сводка ДО удаления (критерий карточки TRASH-WARN).
@@ -1698,28 +1684,24 @@ class ContractApp:
                 pass
         return "break"
 
-    def check_agreement_expiry_notice(self) -> None:
-        """Стартовое уведомление о сроках доп. соглашений (2.18.0).
-
-        Просроченные и истекающие в течение месяца соглашения показываются
-        одним диалогом с переходом в реестр; не чаще раза в сутки (ключ
-        ``last_expiry_notice`` в settings.json), без сети — работает и
-        офлайн. Тишина, когда тревожить не о чем.
-        """
-        import agreements  # поздний импорт: модуль без Tk
-
-        now = time.time()
+    def _expiry_notice_due(self) -> bool:
+        """Суточный гейт уведомления о сроках: пора ли напоминать (START-1)."""
         last = self._settings.get(EXPIRY_NOTICE_SETTINGS_KEY)
-        if isinstance(last, (int, float)) and (now - float(last)) < EXPIRY_NOTICE_INTERVAL:
-            return
-        try:
-            text = agreements.notice_text(self.store)
-        except Exception:
-            self._log.exception("Сбор сроков доп. соглашений не удался")
-            return
+        return not (
+            isinstance(last, (int, float))
+            and (time.time() - float(last)) < EXPIRY_NOTICE_INTERVAL
+        )
+
+    def _apply_expiry_notice(self, text: "str | None") -> None:
+        """Применяет результат фонового сбора сроков (START-1, 2.18.0).
+
+        Просроченные и истекающие соглашения показываются одним диалогом
+        с переходом в реестр; отметка «показано» пишется только когда
+        диалог действительно показывается. Тишина, когда тревожить не о чем.
+        """
         if not text:
             return
-        self._settings[EXPIRY_NOTICE_SETTINGS_KEY] = now
+        self._settings[EXPIRY_NOTICE_SETTINGS_KEY] = time.time()
         self._persist_settings()
         choice = self._choice_dialog(
             "Сроки действия доп. соглашений",

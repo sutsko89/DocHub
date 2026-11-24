@@ -7,6 +7,7 @@
 -r requirements.txt
 pytest>=8.0.0             # тестовый набор tests/
 pytest-cov>=5.0.0         # покрытие: storage/importer/services/document_builder
+pytest-qt>=4.2.0          # каркасные Qt-тесты (M2+): fixture qapp/qtbot, offscreen-платформа
 # Сборка дистрибутива (README: pyinstaller EWDochub.spec). Аудит 2.0.1:
 # раньше pyinstaller отсутствовал в dev-зависимостях и команда из README
 # падала на чистой машине. Нужен только на Windows — там собирается exe.

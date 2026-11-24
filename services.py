@@ -16,6 +16,7 @@ import sys
 import zipfile
 
 import applog
+import party_form_core
 import storage
 from docx import Document
 from document_builder import (
@@ -94,7 +95,7 @@ def validate_email(email):
         return False
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     return re.match(pattern, email) is not None
-_PHONE_ALLOWED_RE = re.compile(r"^[\d\+\-\(\)\s\/\.]*$")
+_PHONE_ALLOWED_RE = re.compile(party_form_core.PHONE_ALLOWED_PATTERN)
 def validate_phone(phone):
     """Проверка телефона: только цифры и знаки + - ( ) / . и пробелы."""
     return bool(phone) and _PHONE_ALLOWED_RE.match(phone) is not None

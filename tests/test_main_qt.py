@@ -100,13 +100,14 @@ def test_default_page_is_spec(controller):
 def test_placeholder_pages_announce_stage(controller):
     """Страницы, ещё не ставшие живыми, сообщают «в разработке» и этап.
 
-    Этап M3: «Спецификация» — живая страница CP1 (SpecPageController
-    заменяет плейсхолдер), поэтому проверяются только будущие разделы.
-    Живость spec закреплена в test_spec_page_qt.
+    Этап M4: «Спецификация» — живая страница CP1 (M3), «Добавить
+    контрагента» — живая страница M4 (CounterpartyPageController);
+    проверяются только будущие разделы. Живость spec закреплена в
+    test_spec_page_qt, карточки — в test_counterparty_page_qt.
     """
     placeholder_stages = (
         (key, title, stage) for key, title, stage in main_qt.NAV_PAGES
-        if key != "spec"  # живая страница CP1 (M3)
+        if key not in ("spec", "counterparty")  # живые страницы M3 и M4
     )
     for key, title, stage in placeholder_stages:
         page = controller.pages[key]

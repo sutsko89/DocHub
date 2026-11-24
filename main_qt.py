@@ -54,6 +54,8 @@ from PySide6.QtWidgets import (
 
 import app_common
 import applog
+import counterparty_page_qt
+import dadata_qt
 import perflog
 import qt_dialogs
 import qt_theme
@@ -150,6 +152,11 @@ class AppController:
         # Живая страница CP1 (M3): SpecPageController заменяет плейсхолдер
         # «Спецификации» и владеет её состоянием (раздел Д плана).
         self.spec_flow = spec_page_qt.SpecPageController(self)
+
+        # Живая страница M4: «Добавить контрагента» + окно правки карточки;
+        # поток «Заполнить по ИНН» — один на приложение (как Tk _dadata_flow).
+        self.counterparty_flow = counterparty_page_qt.CounterpartyPageController(self)
+        self.dadata_flow = dadata_qt.DadataFlowQt(self)
 
         # Ctrl+S — сохранение формы текущей страницы (п. 4.4, Tk-контракт).
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self.window)
@@ -291,12 +298,20 @@ class AppController:
     def is_current_page_dirty(self) -> bool:
         """Есть ли несохранённые данные на текущей странице (п. 4.4).
 
-        Пока жива только «Спецификация» (CP1); M4+ расширяет словарь.
-        Сбой чтения подписи контроллер считает «грязной» страницей.
+        Живые страницы: «Спецификация» (CP1) и «Добавить контрагента»
+        (M4); M5+ расширяет словарь. Сбой чтения подписи контроллер
+        считает «грязной» страницей.
         """
         if self.current_page == "spec" and getattr(self, "spec_flow", None):
             try:
                 return self.spec_flow.is_form_dirty()
+            except Exception:
+                return True
+        if self.current_page == "counterparty" and getattr(
+            self, "counterparty_flow", None,
+        ):
+            try:
+                return self.counterparty_flow.is_form_dirty()
             except Exception:
                 return True
         return False
@@ -311,7 +326,11 @@ class AppController:
         if not self.is_current_page_dirty():
             return True
         key = self.current_page
-        label = "Спецификация" if key == "spec" else key
+        label = {
+            "spec": "Спецификация",
+            # Tk-подпись document_context_controller.form_label (п. 4.4).
+            "counterparty": "Карточка контрагента",
+        }.get(key, key)
         return self.confirm(
             self.window, "Несохранённые изменения",
             f"На странице «{label}» есть несохранённые данные.\n\n"
@@ -324,6 +343,38 @@ class AppController:
         """Ctrl+S: сохранение формы текущей страницы (п. 4.4)."""
         if self.current_page == "spec" and getattr(self, "spec_flow", None):
             self.spec_flow.save()
+        if self.current_page == "counterparty" and getattr(
+            self, "counterparty_flow", None,
+        ):
+            self.counterparty_flow.save()
+
+    # ------------------------------------------------------------------ #
+    #  Единый текущий контрагент (п. 4.2; Tk set_current_party)
+    # ------------------------------------------------------------------ #
+    def set_current_party(self, rec: dict) -> None:
+        """Единый текущий контрагент для всех страниц (Tk _current_party_id).
+
+        Делегирует странице «Спецификация» (список и панель «Документ
+        для»); M5 реестр и M6 договор присоединятся к тому же контракту.
+        Список контрагентов освежается до выбора: карточка, добавленная
+        или выбранная по дубликату ИНН (п. 4.1), обязана быть в комбо —
+        иначе контекстный выбор честно очистится (п. 4.2) — как в Tk
+        refresh_party_combo_values внутри set_current_party.
+        """
+        if getattr(self, "spec_flow", None):
+            self.spec_flow.refresh_parties()
+            self.spec_flow.set_current_party(rec)
+        else:
+            self.current_party_id = rec.get("id")
+
+    def refresh_after_party_change(self) -> None:
+        """Обновление зависимых списков после добавления/правки карточки.
+
+        Tk: refresh_party_combo_values + _update_status + реестр (M5).
+        """
+        if getattr(self, "spec_flow", None):
+            self.spec_flow.refresh_parties()
+        self.refresh_status()
 
     def _on_save_shortcut(self) -> None:
         self.save_current_page()
@@ -573,6 +624,10 @@ class AppController:
         self._stop_timers()
         if self.spec_flow.preview_timer is not None:
             self.spec_flow.preview_timer.stop()
+        # Активный запрос DaData: сброс цели/очереди — результат в полёте
+        # не должен применяться к уничтоженным полям (тихий отказ U8).
+        if getattr(self, "dadata_flow", None) is not None:
+            self.dadata_flow.abort()
         if self._toast_timer is not None:
             self._toast_timer.stop()
         self.log.info("Каркас Qt закрыт")

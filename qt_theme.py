@@ -185,6 +185,10 @@ QLabel#specTotals {{
     color: {c["text_secondary"]};
     font-size: 12px;
 }}
+QLabel#dadataStatus {{
+    color: {c["accent"]};
+    font-size: 12px;
+}}
 QLabel#previewTitle {{
     color: {c["text_secondary"]};
     font-size: 12px;
@@ -208,6 +212,9 @@ QLineEdit, QComboBox {{
 }}
 QLineEdit:focus, QComboBox:focus {{
     border: 1px solid {c["accent"]};
+}}
+QLineEdit[errorState="true"], QComboBox[errorState="true"] {{
+    border: 1px solid #D03050;
 }}
 QPlainTextEdit#previewText {{
     background: {c["card"]};
@@ -272,6 +279,17 @@ QPushButton[variant="primary"] {{
 }}
 QPushButton[variant="primary"]:hover {{
     background: {c["accent_hover"]};
+}}
+QPushButton[variant="segment"] {{
+    padding: 5px 18px;
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    margin-right: -1px;
+}}
+QPushButton[variant="segment"]:checked {{
+    background: {c["sidebar_active"]};
+    color: {c["sidebar_text_active"]};
+    font-weight: bold;
 }}
 QPushButton:disabled {{
     color: {c["text_tertiary"]};

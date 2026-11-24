@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 import app_common
+import counterparty_page_qt
 import services
 import shell_open
 import storage
@@ -134,6 +135,11 @@ class SpecPageController:
         )
         self.current_party_label.setObjectName("currentPartyLabel")
         party_layout.addWidget(self.current_party_label, 1)
+        # M4: временная точка входа в окно правки карточки — Tk открывает
+        # окно из реестра (панель действий), реестр станет живым в M5.
+        self.edit_party_button = QPushButton("Редактировать карточку", party_bar)
+        self.edit_party_button.clicked.connect(self.edit_current_party)
+        party_layout.addWidget(self.edit_party_button)
         outer.addWidget(party_bar)
 
         body = QHBoxLayout()
@@ -411,6 +417,27 @@ class SpecPageController:
             else:
                 text = f"Документ для: {self.party_display(rec, self.party_duplicates())}"
         self.current_party_label.setText(text)
+
+    def edit_current_party(self) -> None:
+        """Открывает окно правки текущего контрагента (M4, до M5 — реестр).
+
+        Tk-точка входа — панель действий реестра; в Qt-сборке реестр
+        станет живым в M5, поэтому окно правки карточки доступно отсюда.
+        После M5 точка остаётся или уходит — решение этапа M5.
+        """
+        party_id = getattr(self.app, "current_party_id", None)
+        rec = (
+            self.app.store.get_counterparty(party_id)
+            if party_id is not None else None
+        )
+        if rec is None:
+            self.app.alert(
+                self.app.window, "Контрагент не выбран",
+                "Выберите контрагента в списке слева — редактировать "
+                "будем его карточку.", "error",
+            )
+            return
+        counterparty_page_qt.open_edit_dialog(self.app, rec)
 
     def find_party_by_inn(self) -> None:
         """Ищет контрагента по ИНН в реестре и подставляет его (U3).

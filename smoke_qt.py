@@ -1,10 +1,12 @@
-"""Smoke Qt-сборки EW.DocHub (этапы M2–M3 миграции Tk → PySide6).
+"""Smoke Qt-сборки EW.DocHub (этапы M2–M4 миграции Tk → PySide6).
 
 Проверяет критерии этапов M2 (каркас: старт → построение окна и разделов →
-журналы → perf-события старта → тема → выход) и M3 (контрольная точка CP1:
+журналы → perf-события старта → тема → выход), M3 (контрольная точка CP1:
 страница «Спецификация» — вставка блока из Excel с лимитом 500, итог,
 предпросмотр из шаблона без записи на диск, сохранение через
-services.save_document, защита несохранённых при закрытии). Запуск:
+services.save_document, защита несохранённых при закрытии) и M4 (карточка
+контрагента: состав полей ООО/ИП, валидация с подсветкой, «Заполнить по
+ИНН» без ключа, окно правки карточки, Ctrl+S, защита страницы). Запуск:
 
     python smoke_qt.py            # Windows — нативная рамка
     xvfb-run -a python smoke_qt.py  # Linux — Xvfb (или offscreen автоматически)
@@ -42,8 +44,9 @@ import perflog
 import qt_theme
 import single_instance
 import storage
+from document_builder import F
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog
 
 FAILURES: list[str] = []
 _TOTAL_CHECKS = 0
@@ -306,6 +309,90 @@ check(any("Несохранённые изменения" == str(a[1]) for a in 
       "CP1/п. 4.4: закрытие с «грязной» формой — подтверждение")
 check(not ctrl2.window.isVisible(),
       "CP1/п. 4.4: окно закрыто после подтверждения")
+
+# ---------- 13. Карточка контрагента M4 ----------
+# Страница «Добавить контрагента» живая; диалоги подменены выше.
+check(ctrl.pages["counterparty"] is ctrl.counterparty_flow.page,
+      "M4: страница «Добавить контрагента» живая (плейсхолдер заменён)")
+check(ctrl.counterparty_flow.current_mode() == "ooo"
+      and "ОГРНИП" not in ctrl.counterparty_flow.entries["ooo"],
+      "M4: состав полей ООО — Tk-паритет (без ОГРНИП)")
+ctrl.counterparty_flow.on_type_change("ИП")
+check(ctrl.counterparty_flow.current_mode() == "ip"
+      and ctrl.counterparty_flow.stack.currentIndex() == 1,
+      "M4: переключение типа карточки ООО/ИП")
+check(F.FACT_ADDRESS not in ctrl.counterparty_flow.entries["ip"],
+      "M4: у ИП фактический адрес повторяет юридический (отдельного поля нет)")
+ctrl.counterparty_flow.on_type_change("Юр. лицо")
+
+# Валидация: пустая карточка — подсветка + алерт, запись не создаётся.
+ctrl.counterparty_flow.save_card()
+check(any("Ошибки в данных" == str(a[1]) for a in ALERTS),
+      "M4: сохранение пустой карточки — алерт «Ошибки в данных»")
+check(ctrl.counterparty_flow.error_labels["ooo"][F.INN].text() == "Заполните поле",
+      "M4: подсветка обязательного поля «Заполните поле»")
+
+# U8 без ключа: запрос не стартует, сообщение понятное.
+ctrl.counterparty_flow.entries["ooo"]["ИНН"].set_text("7701234567")
+ctrl.dadata_flow.fill_from_inn()
+check(any("Нет API-ключа" == str(a[1]) for a in ALERTS),
+      "M4/U8: без ключа DaData — понятная ошибка, запрос не стартует")
+check(ctrl.dadata_flow.busy is False, "M4/U8: busy сброшен после отказа ключа")
+
+# Успешное сохранение карточки (реквизиты с валидными контрольными цифрами).
+_m4_card = {
+    "ИНН": "2540123459", "КПП": "254001001", "ОГРН": "1035001234564",
+    "Полное название компании (Покупатель)": "ООО «Ландыш» (smoke_qt)",
+    "Сокращенное название компании": "ООО «Ландыш»",
+    "ФИО директора": "Смирнов Смирн Смирнович", "Основание действий": "Устав",
+    "Юридический адрес": "690000, г. Владивосток, ул. Светланская, д. 3",
+    "Фактический адрес": "690000, г. Владивосток, ул. Светланская, д. 3",
+    "Email": "landysh@example.ru", "Телефон": "+7 (912) 345-67-89",
+    "Расчётный счёт": "40702810123456789012",
+    "Корреспондентский счёт": "30101810100000000225",
+    "Название банка": "ПАО Сбербанк", "БИК": "044525225",
+}
+for _key, _value in _m4_card.items():
+    _adapter = ctrl.counterparty_flow.entries["ooo"].get(_key)
+    if _adapter is not None:
+        _adapter.set_text(_value)
+ctrl.counterparty_flow.save_card()
+_m4_parties = ctrl.store.active_counterparties()
+check(len(_m4_parties) == 2, "M4: карточка сохранена в реестр (2 контрагента)")
+check(ctrl.current_party_id == _m4_parties[-1]["id"]
+      and ctrl.current_page == "spec",
+      "M4: после сохранения — контрагент текущий, раздел «Спецификация»")
+check("добавлен в реестр" in ctrl.toast_label.text(),
+      "M4: честное сообщение добавления")
+check(ctrl.counterparty_flow.is_form_dirty() is False,
+      "M4: после сохранения карточка «чистая» (baseline пересчитан)")
+
+# Окно правки через кнопку на панели «Документ для» (M4-точка до M5).
+ctrl.spec_flow.edit_current_party()
+_edit_dialogs = ctrl.window.findChildren(QDialog)
+check(len(_edit_dialogs) == 1, "M4: кнопка «Редактировать карточку» открывает окно")
+_edit_dialogs[0].entries[F.DIRECTOR].set_text("Кузнецов Кузьма Кузьмич")
+_edit_dialogs[0].save()
+check(ctrl.store.get_counterparty(_m4_parties[-1]["id"])["fields"][F.DIRECTOR]
+      == "Кузнецов Кузьма Кузьмич", "M4: правка карточки — реквизит обновлён")
+check("обновлена" in ctrl.toast_label.text(),
+      "M4: честное сообщение правки (документы не изменялись)")
+_edit_dialogs[0].deleteLater()
+
+# Защита страницы п. 4.4: Ctrl+S на «грязной» карточке (новый ИНН — без
+# диалога дубликата, п. 4.1).
+ctrl.select_page("counterparty")
+ctrl.counterparty_flow.entries["ooo"][F.DIRECTOR].set_text("Одинцов Один Одинович")
+ctrl.counterparty_flow.entries["ooo"][F.INN].set_text("7701234560")
+ctrl.counterparty_flow.entries["ooo"][F.SHORT_NAME].set_text("ООО «Незабудка» (smoke_qt)")
+check(ctrl.counterparty_flow.is_form_dirty() is True,
+      "M4: правка карточки — страница «грязная»")
+ctrl.save_current_page()
+check(len(ctrl.store.active_counterparties()) == 3,
+      "M4/Ctrl+S: сохранение карточки по Ctrl+S")
+check(ctrl.counterparty_flow.is_form_dirty() is False,
+      "M4/Ctrl+S: после сохранения страница «чистая»")
+
 
 # ---------- Сводка ----------
 try:

@@ -45,6 +45,10 @@ COLORS: dict[str, tuple[str, str]] = {
     "accent": ("#007AFF", "#0A84FF"),
     "accent_hover": ("#2E93FF", "#3B9BFF"),
     "on_accent": ("#FFFFFF", "#FFFFFF"),
+    # Теги сроков реестра (M5, паритет ui_macos.COLORS): просрочено —
+    # красный, истекает в течение месяца — амберный.
+    "error_text": ("#C92A2A", "#FF8787"),
+    "warning_text": ("#B45309", "#FFB454"),
 }
 
 _current_mode: str = DEFAULT_THEME
@@ -222,10 +226,11 @@ QPlainTextEdit#previewText {{
     border: 1px solid {c["card_border"]};
     border-radius: 8px;
 }}
-QTableWidget {{
+QTableWidget, QTableView {{
     background: {c["card"]};
     color: {c["text"]};
     border: 1px solid {c["card_border"]};
+    border-radius: 8px;
     gridline-color: {c["hairline"]};
     selection-background-color: {c["sidebar_active"]};
     selection-color: {c["text"]};

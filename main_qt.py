@@ -56,9 +56,11 @@ import app_common
 import applog
 import counterparty_page_qt
 import dadata_qt
+import lifecycle_qt
 import perflog
 import qt_dialogs
 import qt_theme
+import registry_page_qt
 import shell_open
 import single_instance
 import storage
@@ -157,6 +159,11 @@ class AppController:
         # поток «Заполнить по ИНН» — один на приложение (как Tk _dadata_flow).
         self.counterparty_flow = counterparty_page_qt.CounterpartyPageController(self)
         self.dadata_flow = dadata_qt.DadataFlowQt(self)
+
+        # Живые страницы M5: реестр (TREE-1) и поток жизненного цикла записей
+        # (экспорт Word, корзина) — Qt-аналог Tk _lifecycle_flow.
+        self.lifecycle_flow = lifecycle_qt.LifecycleFlowQt(self)
+        self.registry_flow = registry_page_qt.RegistryPageController(self)
 
         # Ctrl+S — сохранение формы текущей страницы (п. 4.4, Tk-контракт).
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self.window)
@@ -269,6 +276,10 @@ class AppController:
             # UPD-UI (P-07): предпросмотр и итоги пересобираются при
             # переключении на видимую страницу.
             self.spec_flow.on_page_open()
+        if key == "registry" and getattr(self, "registry_flow", None):
+            # 2.19.0: провал в документы не переживает уход со страницы;
+            # ленивый рендер реестра — при первом открытии.
+            self.registry_flow.on_page_open()
 
     def select_page(self, key: str) -> None:
         """Переключение раздела по ключу (для клавиатуры и тестов).
@@ -291,6 +302,8 @@ class AppController:
                 break
         if key == "spec" and getattr(self, "spec_flow", None):
             self.spec_flow.on_page_open()
+        if key == "registry" and getattr(self, "registry_flow", None):
+            self.registry_flow.on_page_open()
 
     # Синоним с именем Tk-каркаса (привычные имена для будущих страниц).
     _select_page = select_page
@@ -370,11 +383,29 @@ class AppController:
     def refresh_after_party_change(self) -> None:
         """Обновление зависимых списков после добавления/правки карточки.
 
-        Tk: refresh_party_combo_values + _update_status + реестр (M5).
+        Tk: refresh_party_combo_values + _update_status + реестр (M5):
+        с M5 реестр живой и обновляется вместе с комбо страниц документов.
         """
         if getattr(self, "spec_flow", None):
             self.spec_flow.refresh_parties()
+        if getattr(self, "registry_flow", None):
+            self.registry_flow.refresh()
         self.refresh_status()
+
+    def save_setting(self, key: str, value) -> None:
+        """Сохранение настройки профиля (Tk ContractApp.save_setting).
+
+        Атомарная запись settings.json (app_common.write_settings) — тот
+        же файл, что у Tk-сборки; отказ записи сообщается алертом,
+        значение в сеансе остаётся применённым.
+        """
+        self._settings[key] = value
+        if not app_common.write_settings(self._settings):
+            self.alert(
+                self.window, "Настройка не сохранена",
+                f"Не удалось записать файл:\n{app_common.settings_path()}",
+                "error",
+            )
 
     def _on_save_shortcut(self) -> None:
         self.save_current_page()
@@ -635,12 +666,20 @@ class AppController:
         event.accept()
 
     def _confirm_close_dirty(self) -> bool:
-        """Подтверждение закрытия с несохранёнными данными (п. 4.4)."""
+        """Подтверждение закрытия с несохранёнными данными (п. 4.4).
+
+        Подпись страницы — по разделу (исправление M4-хвоста: у закрытия
+        с «грязной» карточкой текст говорил о «Спецификации»).
+        """
         if not self.is_current_page_dirty():
             return True
+        label = {
+            "spec": "Спецификация",
+            "counterparty": "Карточка контрагента",
+        }.get(self.current_page, "текущей странице")
         return self.confirm(
             self.window, "Несохранённые изменения",
-            "На странице «Спецификация» есть несохранённые данные.\n\n"
+            f"На странице «{label}» есть несохранённые данные.\n\n"
             "Закрыть окно и потерять изменения?",
             ok_text="Закрыть", cancel_text="Остаться",
             destructive=True,

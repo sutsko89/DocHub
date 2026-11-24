@@ -1,12 +1,14 @@
-"""Smoke Qt-сборки EW.DocHub (этапы M2–M4 миграции Tk → PySide6).
+"""Smoke Qt-сборки EW.DocHub (этапы M2–M5 миграции Tk → PySide6).
 
 Проверяет критерии этапов M2 (каркас: старт → построение окна и разделов →
 журналы → perf-события старта → тема → выход), M3 (контрольная точка CP1:
 страница «Спецификация» — вставка блока из Excel с лимитом 500, итог,
 предпросмотр из шаблона без записи на диск, сохранение через
-services.save_document, защита несохранённых при закрытии) и M4 (карточка
+services.save_document, защита несохранённых при закрытии), M4 (карточка
 контрагента: состав полей ООО/ИП, валидация с подсветкой, «Заполнить по
-ИНН» без ключа, окно правки карточки, Ctrl+S, защита страницы). Запуск:
+ИНН» без ключа, окно правки карточки, Ctrl+S, защита страницы) и M5
+(реестр TREE-1: модель строк = данным, поиск по ИНН на лету, панель
+действий, корзина с восстановлением, drill «Документы — <имя>»). Запуск:
 
     python smoke_qt.py            # Windows — нативная рамка
     xvfb-run -a python smoke_qt.py  # Linux — Xvfb (или offscreen автоматически)
@@ -45,7 +47,7 @@ import qt_theme
 import single_instance
 import storage
 from document_builder import F
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QTimer
 from PySide6.QtWidgets import QApplication, QDialog
 
 FAILURES: list[str] = []
@@ -392,6 +394,81 @@ check(len(ctrl.store.active_counterparties()) == 3,
       "M4/Ctrl+S: сохранение карточки по Ctrl+S")
 check(ctrl.counterparty_flow.is_form_dirty() is False,
       "M4/Ctrl+S: после сохранения страница «чистая»")
+
+
+# ---------- 14. Реестр M5 (TREE-1) ----------
+# Синхронная замена DeferredDelete: диалог M4 ещё не уничтожен к этому месту.
+QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+qapp.processEvents()
+check(ctrl.pages["registry"] is ctrl.registry_flow.page,
+      "M5: страница «Реестр» живая (плейсхолдер заменён)")
+ctrl.select_page("registry")
+check(ctrl.registry_flow._registry_rendered is True,
+      "M5: ленивый рендер — список построен при открытии страницы")
+_model = ctrl.registry_flow.table.model
+_m5_ids = [rec["id"] for rec in ctrl.store.active_counterparties()]
+check(_model.order() == tuple(f"p:{i}" for i in _m5_ids),
+      "M5: модель строк = данным (3 контрагента, iid «p:<id>»)")
+check(ctrl.registry_flow._registry_caption.text() == f"Контрагенты ({len(_m5_ids)})",
+      "M5: подпись списка «Контрагенты (N)»")
+
+# Поиск по ИНН (цифры запроса — подстрока ИНН, Tk-контракт).
+ctrl.registry_flow.search_edit.setText("234560")
+ctrl.registry_flow.apply_filter()
+check(len(_model.order()) == 1,
+      "M5/U11: поиск по ИНН фильтрует на лету (placeholder, Enter — сразу)")
+ctrl.registry_flow.search_edit.clear()
+ctrl.registry_flow.apply_filter()
+
+# Выделение и панель действий (V3).
+ctrl.registry_flow.on_tree_select(f"p:{_m5_ids[0]}")
+check(ctrl.registry_flow._registry_action_btn1.text() == "Редактировать"
+      and ctrl.registry_flow._registry_action_btn2.text() == "Удалить",
+      "M5/V3: панель действий контрагента — «Редактировать»/«Удалить»")
+
+# «Редактировать» — окно правки M4 из реестра.
+ctrl.registry_flow.run_action("party", ctrl.store.get_counterparty(_m5_ids[0]))
+_m5_dialogs = ctrl.window.findChildren(QDialog)
+check(len(_m5_dialogs) == 1, "M5: «Редактировать» открывает окно правки карточки")
+_m5_dialogs[0].request_close()  # без изменений — закрывается сразу (DEF-1)
+_m5_dialogs[0].deleteLater()
+QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+check(len(ctrl.window.findChildren(QDialog)) == 0,
+      "M5/DEF-1: окно правки без изменений закрывается без подтверждения")
+
+# Delete через панель: подтверждение подменено (True) — мягкое удаление.
+_m5_del = ctrl.store.get_counterparty(_m5_ids[1])
+ctrl.registry_flow.run_action("party", _m5_del, second=True)
+check("sec:trash" in _model.order() and f"tp:{_m5_ids[1]}" in _model.order(),
+      "M5: «добавить 3, удалить 1» — секция «Корзина» совпадает с данными")
+check(ctrl.registry_flow._registry_empty_trash_btn.isHidden() is False,
+      "M5: кнопка «Очистить корзину» видна, когда корзина непуста")
+
+# Восстановление из секции корзины.
+_trashed = ctrl.store.trashed_counterparties()[0]
+ctrl.registry_flow.on_tree_select(f"tp:{_trashed['id']}")
+check(ctrl.registry_flow._registry_action_btn1.text() == "Восстановить",
+      "M5/V3: панель записи корзины — «Восстановить»/«Удалить навсегда»")
+ctrl.registry_flow.run_action("trash_party", _trashed)
+check(_model.order() == tuple(f"p:{i}" for i in _m5_ids),
+      "M5: «восстановить 1» — отображение совпадает с данными")
+
+# Drill «Документы — <имя>» и возврат кнопкой «← Назад» (Escape — U13).
+ctrl.registry_flow.on_tree_activate(f"p:{_m5_ids[0]}")
+check(ctrl.registry_flow._registry_title_label.text() == "Документы — ООО Ромашка",
+      "M5/2.19.0: drill — заголовок «Документы — <имя>»")
+check([col[1] for col in _model.columns] == ["Документ", "Дата", "Срок"],
+      "M5/2.19.0: drill меняет набор колонок")
+ctrl.registry_flow._registry_back_btn.click()
+check(ctrl.registry_flow._registry_title_label.text() == "Реестр",
+      "M5/2.19.0: «← Назад» возвращает к списку контрагентов")
+
+# Кросс-база: операции реестра видны Tk-пути DataStore (обязательный тест M3+).
+import sqlite3 as _sq
+with _sq.connect(storage.db_path()) as _conn:
+    _meta5 = dict(_conn.execute("SELECT key, value FROM meta"))
+check(int(_meta5.get("schema_version", "0")) == storage.SQLITE_SCHEMA_VERSION,
+      "M5: schema_version не изменён операциями реестра (запрет З.1)")
 
 
 # ---------- Сводка ----------

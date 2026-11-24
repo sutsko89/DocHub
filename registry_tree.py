@@ -24,102 +24,25 @@ insert/delete/item по дифу модели строк (R-04).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 import tkinter as tk
 from tkinter import ttk
 
 import ui_macos as ui
-
-
-#: Мягкий лимит отображения (R-05b): порция «Показать ещё». Значение из
-#: прототип-замера (tools/bench_tree_prototype.py): популяция 10k — 86 мс
-#: при пороге раздела Е 300 мс; 50k — 470 мс, поэтому объёмы до 10k
-#: показываются целиком, большие — порциями по 10k с «Показать ещё».
-DISPLAY_SOFT_LIMIT = 10_000
-
-#: iid служебной строки «Показать ещё».
-SHOW_MORE_IID = "show-more"
+# GUI-free ядро реестра (этап M5): модель строк и план дифа — один
+# источник для обеих сборок; Tk-виджет только исполняет план.
+from registry_core import (  # noqa: F401 — реэкспорт для совместимости
+    DISPLAY_SOFT_LIMIT,
+    SHOW_MORE_IID,
+    DiffPlan,
+    RowSpec,
+    plan_diff,
+    plan_display_count,
+)
 
 #: Вертикальный отступ строки (логические пиксели).
 ROW_HEIGHT = 30
-
-
-@dataclass
-class RowSpec:
-    """Строка модели реестра: iid, значения колонок, теги, точка типа."""
-
-    iid: str
-    values: tuple[str, ...]
-    tags: tuple[str, ...] = ()
-    dot: str | None = None  # цвет точки типа (V4); None — точки нет
-    data: dict = field(default_factory=dict, repr=False)
-
-
-@dataclass
-class DiffPlan:
-    """План диф-обновления (чистая функция plan_diff)."""
-
-    to_delete: list[str]
-    ops: list[tuple[int, str, str]]  # (позиция, iid, "insert"|"move")
-    updates: list[RowSpec]
-
-
-def plan_display_count(total: int, shown: int) -> tuple[int, bool]:
-    """Сколько строк показывать и есть ли ещё (R-05b).
-
-    ``shown`` — сколько строк уже разрешено показывать (копится
-    кнопкой «Показать ещё»). Возвращает (количество строк, есть_ли_скрытые).
-    Чистая функция — тестируется без Tk.
-    """
-    shown = max(shown, DISPLAY_SOFT_LIMIT)
-    shown = min(shown, total) if total else 0
-    return shown, total > shown
-
-
-def plan_diff(current: Iterable[str], desired: list[RowSpec]) -> DiffPlan:
-    """Диф модели строк без Tk: (удалить, операции, обновить).
-
-    ``current`` — iid видимых строк в порядке отображения. Алгоритм:
-    префикс, совпадающий с желаемой моделью, не трогается вовсе (критерий
-    5.1 — «выбор/изменение не пересоздаёт строки»); правится только
-    суффикс после первой расходимости — вставки и перемещения применяются
-    в порядке возрастания позиции, поэтому каждая операция видит все
-    строки до неё уже стоящими правильно.
-    """
-    current = list(current)
-    # ВАЖНО: множество желаемых iid строится ОДИН раз. Внутри comprehension
-    # оно пересобиралось бы на каждой итерации — O(n²) (на 10k это 5,8 с
-    # вместо 2 мс, найдено профилированием прототипа).
-    desired_iids = {row.iid for row in desired}
-    to_delete = [iid for iid in current if iid not in desired_iids]
-    deleted = set(to_delete)
-    sim = [iid for iid in current if iid not in deleted]
-    pos_of = {iid: idx for idx, iid in enumerate(sim)}
-
-    ops: list[tuple[int, str, str]] = []  # (позиция, iid, "insert"|"move")
-    k = 0
-    while (k < len(sim) and k < len(desired)
-           and sim[k] == desired[k].iid):
-        k += 1
-    for pos in range(k, len(desired)):
-        iid = desired[pos].iid
-        if iid in pos_of:
-            if pos_of[iid] != pos:
-                # Сдвиг в симуляции: как у tree.move — снять и вставить.
-                sim.pop(pos_of[iid])
-                sim.insert(pos, iid)
-                lo, hi = min(pos_of[iid], pos), max(pos_of[iid], pos)
-                for shift in range(lo, hi + 1):
-                    pos_of[sim[shift]] = shift
-                ops.append((pos, iid, "move"))
-        else:
-            sim.insert(pos, iid)
-            for shift in range(pos, len(sim)):
-                pos_of[sim[shift]] = shift
-            ops.append((pos, iid, "insert"))
-    return DiffPlan(to_delete=to_delete, ops=ops, updates=list(desired))
 
 
 class RegistryTree(ttk.Frame):

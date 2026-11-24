@@ -64,78 +64,38 @@ import registry_tree
 import storage
 import ui_macos as ui
 from document_builder import F, digits_only
-from registry_tree import (
+# GUI-free ядро реестра (этап M5): модель строк, константы и чистые
+# построители значений — один источник с Qt-сборкой (registry_page_qt).
+from registry_core import (
     DISPLAY_SOFT_LIMIT,
+    DOC_COLUMNS,
+    DOCS_TYPE_LABEL_BY_VALUE,
+    DOCS_TYPE_VALUE_BY_LABEL,
+    DOT_ADDITIONAL,
+    DOT_CONTRACT,
+    DOT_SPEC,
+    DOT_UNKNOWN,
+    IID_DOC,
+    IID_PARTY,
+    IID_SEC_TRASH,
+    IID_SEC_UNKNOWN,
+    IID_TRASH_DOC,
+    IID_TRASH_PARTY,
+    IID_UNKNOWN,
+    PARTY_COLUMNS,
     SHOW_MORE_IID,
+    SORT_LABEL_BY_VALUE,
+    SORT_VALUE_BY_LABEL,
     RowSpec,
+    action_labels_for,
+    doc_row_tags,
+    doc_row_values,
+    party_row_dot,
+    party_row_values,
+    party_subtitle,
     plan_display_count,
 )
 from services import safe_filename
-
-
-#: Колонки списка контрагентов (U1): ключ, заголовок, ширина, якорь, тянуть.
-PARTY_COLUMNS = (
-    ("name", "Контрагент", 340, "w", True),
-    ("kind", "Тип", 92, "w", False),
-    ("inn", "ИНН", 128, "w", False),
-    ("id", "ID", 104, "w", False),
-    ("address", "Адрес", 360, "w", True),
-)
-
-#: Колонки вида «Документы контрагента».
-DOC_COLUMNS = (
-    ("doc", "Документ", 330, "w", True),
-    ("date", "Дата", 116, "w", False),
-    ("expiry", "Срок", 350, "w", True),
-)
-
-#: Сортировка списка контрагентов (U2): подпись меню -> значение settings.
-SORT_VALUE_BY_LABEL = {
-    "По добавлению": "added",
-    "По алфавиту": "name",
-    "По ИНН": "inn",
-}
-SORT_LABEL_BY_VALUE = {value: label for label, value in SORT_VALUE_BY_LABEL.items()}
-
-#: Фильтр типов в виде документов контрагента (UX-REG).
-DOCS_TYPE_VALUE_BY_LABEL = {
-    "Все типы": "all",
-    "Договоры": storage.KIND_CONTRACT,
-    "Доп. соглашения": storage.KIND_ADDITIONAL,
-    "Спецификации": storage.KIND_SPEC,
-}
-DOCS_TYPE_LABEL_BY_VALUE = {value: label for label, value in DOCS_TYPE_VALUE_BY_LABEL.items()}
-
-#: Цвета точек типов (V4-пилот): точка в колонке #0 — PhotoImage.
-DOT_IP = "#28C840"
-DOT_OOO = "#007AFF"
-DOT_CONTRACT = "#007AFF"
-DOT_ADDITIONAL = "#FEBC2E"
-DOT_SPEC = "#28C840"
-DOT_UNKNOWN = "#96969C"
-
-#: Префиксы iid по типу записи (party/doc ids не пересекаются).
-IID_PARTY = "p:"
-IID_DOC = "d:"
-IID_TRASH_PARTY = "tp:"
-IID_TRASH_DOC = "td:"
-IID_UNKNOWN = "u:"
-IID_SEC_UNKNOWN = "sec:unknown"
-IID_SEC_TRASH = "sec:trash"
-
-#: Кнопки панели действий по типу выделенной записи (V3).
-ACTION_LABELS = {
-    "party": ("Редактировать", "Удалить"),
-    "doc": ("Открыть Word", "Удалить"),
-    "trash_party": ("Восстановить", "Удалить навсегда"),
-    "trash_doc": ("Восстановить", "Удалить навсегда"),
-    "unknown": ("Показать в папке", "Удалить"),
-}
-
-
-def action_labels_for(kind: str | None) -> tuple[str, str] | None:
-    """Подписи кнопок панели действий для типа записи (чистая функция)."""
-    return ACTION_LABELS.get(kind or "")
 
 
 class RegistryController:
@@ -617,21 +577,13 @@ class RegistryController:
 
     @staticmethod
     def party_row_values(rec: dict) -> tuple[str, str, str, str, str]:
-        """Значения колонок строки контрагента (U1: name, тип, ИНН, ID, адрес)."""
-        fields = rec.get("fields") or {}
-        kind = "ИП" if rec.get("type") == "ip" else "Юр. лицо"
-        inn = str(fields.get(F.INN, "")).strip() or "—"
-        address = str(fields.get(F.LEGAL_ADDRESS, "")).strip()
-        if len(address) > 48:
-            address = address[:47].rstrip() + "…"
-        return (
-            storage.display_name(rec), kind, inn, str(rec.get("id")), address,
-        )
+        """Значения колонок строки контрагента — GUI-free ядро (M5)."""
+        return party_row_values(rec)
 
     @staticmethod
     def party_row_dot(rec: dict) -> str:
-        """Цвет точки типа контрагента (V4-пилот)."""
-        return DOT_IP if rec.get("type") == "ip" else DOT_OOO
+        """Цвет точки типа контрагента — GUI-free ядро (M5)."""
+        return party_row_dot(rec)
 
     def doc_row_text(self, rec: dict) -> str:
         """Текстовая форма строки документа (совместимость тестов)."""
@@ -656,29 +608,13 @@ class RegistryController:
 
     @staticmethod
     def doc_row_values(rec: dict, until: "str | None" = None) -> tuple[str, str, str]:
-        """Значения колонок строки документа: документ, дата, срок (U1).
-
-        ``until`` — срок из лёгкой карты хранилища (LAZY-1); без него срок
-        берётся из тела в памяти записи (совместимость со старыми вызовами).
-        """
-        kind_label = storage.KIND_LABELS.get(rec.get("kind"), rec.get("kind", ""))
-        number = rec.get("number") or "б/н"
-        date_text = rec.get("date") or ""
-        suffix = agreements.row_suffix(rec, until=until)
-        if suffix.startswith("   ·   "):
-            suffix = suffix[len("   ·   "):]
-        return (f"{kind_label} № {number}", date_text or "—", suffix)
+        """Значения колонок строки документа — GUI-free ядро (M5)."""
+        return doc_row_values(rec, until=until)
 
     @staticmethod
     def doc_row_tags(rec: dict, until: "str | None" = None) -> tuple[str, ...]:
-        """Теги строки документа по состоянию срока (2.18.0): красный/амберный."""
-        if rec.get("kind") == storage.KIND_ADDITIONAL:
-            state = agreements.collect_state(rec, until=until)
-            if state == "expired":
-                return ("expired",)
-            if state == "soon":
-                return ("soon",)
-        return ()
+        """Теги строки документа по состоянию срока — GUI-free ядро (M5)."""
+        return doc_row_tags(rec, until=until)
 
     def doc_row_color(self, rec: dict) -> tuple:
         """Цвет текста строки документа по состоянию срока (2.18.0).
@@ -695,10 +631,8 @@ class RegistryController:
 
     @staticmethod
     def party_subtitle(rec: dict) -> str:
-        """Подстрока контрагента в виде документов: тип, ИНН, ID (2.19.0)."""
-        kind = "ИП" if rec.get("type") == "ip" else "Юр. лицо"
-        inn = str(rec.get("fields", {}).get(F.INN, "")).strip() or "—"
-        return f"{kind}   ·   ИНН {inn}   ·   ID {rec.get('id')}"
+        """Подстрока контрагента в виде документов — GUI-free ядро (M5)."""
+        return party_subtitle(rec)
 
     # ------------------------------------------------------------------ #
     #  Модель строк реестра (TREE-1: R-03/R-04, R-05b)

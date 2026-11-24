@@ -1,16 +1,21 @@
-"""Точка входа и каркас Qt-приложения EW.DocHub (этап M2 миграции Tk → PySide6).
+"""Точка входа и каркас Qt-приложения EW.DocHub (этапы M2–M3 миграции Tk → PySide6).
 
-Каркас по плану миграции (этап M2): QApplication, главное окно со
+Каркас по плану миграции (M2): QApplication, главное окно со
 стандартной системной рамкой (нативные заголовок, «свернуть/развернуть/
 закрыть», перенос, растягивание, прилипание и унос на второй монитор —
-средствами Windows), панель разделов, страницы-плейсхолдеры «в
-разработке», футер со строкой статуса, немодальный тост, модальные
-диалоги (qt_dialogs), темы light/dark (qt_theme), журналы app.log и
-crash.log (faulthandler), защита от второго экземпляра (single_instance,
-те же мьютексы, что у Tk-сборки), загрузка settings.json (прежний ключ
-``theme`` — профиль совместим с Tk-сборкой), владелец DataStore,
-QTimer-инфраструктура опроса очередей и perf-каналы ``startup.built`` /
-``startup.ready``.
+средствами Windows), панель разделов, футер со строкой статуса,
+немодальный тост, модальные диалоги (qt_dialogs), темы light/dark
+(qt_theme), журналы app.log и crash.log (faulthandler), защита от
+второго экземпляра (single_instance, те же мьютексы, что у Tk-сборки),
+загрузка settings.json (прежний ключ ``theme`` — профиль совместим с
+Tk-сборкой), владелец DataStore, QTimer-инфраструктура опроса очередей
+и perf-каналы ``startup.built`` / ``startup.ready``.
+
+Этап M3 (контрольная точка CP1): живая страница «Спецификация»
+(spec_page_qt.SpecPageController — заменяет плейсхолдер), Ctrl+S,
+защита несохранённых данных при уходе со страницы и закрытии окна
+(подтверждение, сбой чтения подписи = «грязная», п. 4.4), shell-хелперы
+через GUI-free shell_open (точка M3 из докстринга M2).
 
 Контракты из раздела Д плана, переносимые без изменений:
 
@@ -19,11 +24,11 @@ QTimer-инфраструктура опроса очередей и perf-кан
   ``queue.Queue``, опрос — QTimer, не QThread («переписать заодно»
   запрещено планом, риск 6);
 * владелец общего состояния — этот каркас (роль ``ContractApp`` в
-  Tk-сборке); один ``DataStore`` на приложение, вызовы store — только
-  из GUI-потока (STORE-1A);
-* до CP1 реестр, карточка, импорт и настройки в Qt-сборке отсутствуют —
-  разделы видны в панели, но сообщают «в разработке» (навигационная
-  модель не теряется).
+  Tk-сборке): навигация, защита несохранённых, текущий контрагент;
+  данные страниц — у их контроллеров; один ``DataStore`` на приложение,
+  вызовы store — только из GUI-потока (STORE-1A);
+* после CP1 реестр, карточка, импорт и настройки в Qt-сборке по-прежнему
+  отсутствуют — разделы видны в панели, но сообщают «в разработке».
 
 На Linux без X-сервера до импорта PySide6 выставляется платформа
 ``offscreen`` — каркасные тесты и smoke идут без дисплея, новые skip
@@ -33,8 +38,6 @@ QTimer-инфраструктура опроса очередей и perf-кан
 from __future__ import annotations
 
 import os
-import platform
-import subprocess
 import sys
 
 # Linux/macOS без дисплея: платформа offscreen до создания QApplication.
@@ -43,7 +46,7 @@ if sys.platform != "win32" and not os.environ.get("DISPLAY"):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QMainWindow, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
@@ -54,9 +57,11 @@ import applog
 import perflog
 import qt_dialogs
 import qt_theme
+import shell_open
 import single_instance
 import storage
 from services import resource_path
+import spec_page_qt
 
 # Признак интерфейса этой сборки (план И.2): app_common.APP_UI_FLAVOR остаётся
 # "tk" для Tk-сборки; Qt-сборка объявляет себя здесь. Отображение версии —
@@ -71,7 +76,7 @@ BASE_HEIGHT = 740
 MIN_WINDOW_WIDTH = 1120
 MIN_WINDOW_HEIGHT = 620
 
-DEFAULT_PAGE = "spec"  # первый живой раздел будет построен на CP1 (M3)
+DEFAULT_PAGE = "spec"  # живая страница CP1 (M3); остальные — плейсхолдеры
 
 # Разделы панели: те же ключи, что у Tk NAV_PAGES (main.py), плюс этап
 # миграции, на котором раздел станет живым. Подписи — из Tk-версии.
@@ -113,6 +118,9 @@ class AppController:
         self.log = applog.get_logger("main_qt")
         self._settings = app_common.load_settings()
         self._theme_listeners: list = []
+        # Единый текущий контрагент (п. 4.2; Tk: _current_party_id) —
+        # общий контекст будущих страниц документов (M4+).
+        self.current_party_id = None
 
         qt_theme.apply_theme(app, self._settings.get("theme", qt_theme.DEFAULT_THEME))
 
@@ -139,7 +147,20 @@ class AppController:
 
         self._build_body()
 
+        # Живая страница CP1 (M3): SpecPageController заменяет плейсхолдер
+        # «Спецификации» и владеет её состоянием (раздел Д плана).
+        self.spec_flow = spec_page_qt.SpecPageController(self)
+
+        # Ctrl+S — сохранение формы текущей страницы (п. 4.4, Tk-контракт).
+        save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self.window)
+        save_shortcut.activated.connect(self._on_save_shortcut)
+
         self.log.info("Каркас Qt построен (%s-%s)", app_common.APP_VERSION, UI_FLAVOR)
+
+    @property
+    def settings(self) -> dict:
+        """Настройки профиля (settings.json) — чтение для страниц."""
+        return self._settings
 
     # ------------------------------------------------------------------ #
     #  Построение каркаса: сайдбар, страницы-плейсхолдеры, футер, тост
@@ -219,19 +240,38 @@ class AppController:
         return page
 
     # ------------------------------------------------------------------ #
-    #  Навигация
+    #  Навигация и защита несохранённых данных (п. 4.4, M3)
     # ------------------------------------------------------------------ #
-    def _on_nav_changed(self, current: QListWidgetItem, _previous) -> None:
+    def _on_nav_changed(self, current: QListWidgetItem, previous) -> None:
         if current is None:
             return
         key = current.data(Qt.ItemDataRole.UserRole)
-        if key in self.pages:
-            self.current_page = key
-            self.stack.setCurrentWidget(self.pages[key])
+        if key not in self.pages:
+            return
+        if not self.confirm_leave_page():
+            # Отказ — остаёмся на прежнем разделе: выделение откатывается
+            # без повторного срабатывания guard'а.
+            if previous is not None:
+                self.nav.blockSignals(True)
+                self.nav.setCurrentItem(previous)
+                self.nav.blockSignals(False)
+            return
+        self.current_page = key
+        self.stack.setCurrentWidget(self.pages[key])
+        if key == "spec" and getattr(self, "spec_flow", None):
+            # UPD-UI (P-07): предпросмотр и итоги пересобираются при
+            # переключении на видимую страницу.
+            self.spec_flow.on_page_open()
 
     def select_page(self, key: str) -> None:
-        """Переключение раздела по ключу (для клавиатуры и тестов)."""
+        """Переключение раздела по ключу (для клавиатуры и тестов).
+
+        Уход со страницы с несохранёнными данными — через подтверждение
+        (п. 4.4); при отказе раздел не меняется.
+        """
         if key not in self.pages:
+            return
+        if key != self.current_page and not self.confirm_leave_page():
             return
         self.current_page = key
         self.stack.setCurrentWidget(self.pages[key])
@@ -242,9 +282,51 @@ class AppController:
                 self.nav.setCurrentItem(item)
                 self.nav.blockSignals(False)
                 break
+        if key == "spec" and getattr(self, "spec_flow", None):
+            self.spec_flow.on_page_open()
 
     # Синоним с именем Tk-каркаса (привычные имена для будущих страниц).
     _select_page = select_page
+
+    def is_current_page_dirty(self) -> bool:
+        """Есть ли несохранённые данные на текущей странице (п. 4.4).
+
+        Пока жива только «Спецификация» (CP1); M4+ расширяет словарь.
+        Сбой чтения подписи контроллер считает «грязной» страницей.
+        """
+        if self.current_page == "spec" and getattr(self, "spec_flow", None):
+            try:
+                return self.spec_flow.is_form_dirty()
+            except Exception:
+                return True
+        return False
+
+    def confirm_leave_page(self) -> bool:
+        """Уход со страницы с изменениями — только через подтверждение.
+
+        Контракт Tk confirm_leave_page (document_context_controller):
+        без изменений — True без диалога; с изменениями — confirm с
+        деструктивной семантикой (U7: Enter не подтверждает потерю).
+        """
+        if not self.is_current_page_dirty():
+            return True
+        key = self.current_page
+        label = "Спецификация" if key == "spec" else key
+        return self.confirm(
+            self.window, "Несохранённые изменения",
+            f"На странице «{label}» есть несохранённые данные.\n\n"
+            "Перейти и потерять изменения?",
+            ok_text="Перейти", cancel_text="Остаться",
+            destructive=True,
+        )
+
+    def save_current_page(self) -> None:
+        """Ctrl+S: сохранение формы текущей страницы (п. 4.4)."""
+        if self.current_page == "spec" and getattr(self, "spec_flow", None):
+            self.spec_flow.save()
+
+    def _on_save_shortcut(self) -> None:
+        self.save_current_page()
 
     # ------------------------------------------------------------------ #
     #  Статус и тост
@@ -304,42 +386,30 @@ class AppController:
         if self._toast_path:
             self._show_path(self._toast_path)
 
-    def _open_path(self, file_path: str) -> bool:
+    def open_file(self, file_path: str) -> bool:
         """Открывает файл системным приложением; честный отказ без файла.
 
-        Контракт main.open_file (п. 6.2): absent — сразу отказ с алертом.
-        Собственная копия до M3: main.py связан с Tk-алертом и уйдёт в M8;
-        объединение хелперов — точка M3 (CP1 «Открыть файл»).
+        Точка M3 (докстринг M2): GUI-free ядро — shell_open.open_file_system,
+        общий для страниц (CP1 «Открыть файл»); алерты — qt. Контракт
+        main.open_file (п. 6.2): absent — сразу отказ с алертом, без
+        ложного «открыт».
         """
         if not file_path or not os.path.exists(file_path):
-            self.log.warning(
-                "Открытие отменено: файла нет на диске (%s)",
-                os.path.splitext(str(file_path or ""))[1].lower(),
-            )
             self.alert(
                 self.window, "Файл не найден",
                 f"Файл не найден на диске:\n{file_path or '—'}", "error",
             )
             return False
-        try:
-            if platform.system() == "Windows":
-                os.startfile(file_path)  # noqa: S606
-            elif platform.system() == "Darwin":
-                if subprocess.run(["open", file_path], check=False).returncode != 0:
-                    return False
-            else:
-                if subprocess.run(["xdg-open", file_path], check=False).returncode != 0:
-                    return False
+        if shell_open.open_file_system(file_path):
             return True
-        except Exception as exc:
-            self.log.warning(
-                "Не удалось открыть файл (%s): %s",
-                os.path.splitext(str(file_path))[1].lower(), type(exc).__name__,
-            )
-            self.alert(self.window, "Не удалось открыть файл", str(exc), "error")
-            return False
+        self.alert(
+            self.window, "Не удалось открыть файл",
+            "Система не смогла открыть файл:\n"
+            f"{file_path}\n\nПодробности — в app.log.", "error",
+        )
+        return False
 
-    def _show_path(self, file_path: str) -> None:
+    def show_in_folder(self, file_path: str) -> None:
         """Показ файла в проводнике без запуска (контракт main.show_in_folder)."""
         if not file_path or not os.path.exists(file_path):
             self.alert(
@@ -347,17 +417,17 @@ class AppController:
                 file_path or "Путь к файлу не указан.", "error",
             )
             return
-        try:
-            if platform.system() == "Windows":
-                subprocess.run(
-                    ["explorer", "/select,", os.path.normpath(file_path)], check=False,
-                )
-            elif platform.system() == "Darwin":
-                subprocess.run(["open", "-R", file_path], check=False)
-            else:
-                subprocess.run(["xdg-open", os.path.dirname(file_path)], check=False)
-        except Exception as exc:
-            self.alert(self.window, "Не удалось открыть папку", str(exc), "error")
+        if not shell_open.show_in_file_manager(file_path):
+            self.alert(
+                self.window, "Не удалось открыть папку",
+                "Система не смогла показать папку:\n"
+                f"{file_path}\n\nПодробности — в app.log.", "error",
+            )
+
+    # Имена из M2 (докстринг «Собственная копия до M3»): хелперы объединены
+    # на GUI-free shell_open, имена сохранены для тоста и тестов.
+    _open_path = open_file
+    _show_path = show_in_folder
 
     # ------------------------------------------------------------------ #
     #  Диалоги — замены ui.alert/ui.confirm/ui.choice_dialog
@@ -490,18 +560,36 @@ class AppController:
         return self.app.exec()
 
     def _on_close(self, event) -> None:
-        """Закрытие окна: останов опроса, честная запись в журнал.
+        """Закрытие окна: защита несохранённых (M3), останов опроса, журнал.
 
-        Защита несохранённых данных появится вместе со страницами
-        (M3+, подтверждение при уходе/закрытии); сейчас закрытие всегда
-        принимается — «грязных» форм в каркасе нет.
+        «Грязная» форма — только через подтверждение (п. 4.4, Tk-контракт
+        защиты при закрытии); отказ — окно остаётся открытым
+        (event.ignore). Подтверждение деструктивное: Enter не теряет
+        данные (U7).
         """
+        if not self._confirm_close_dirty():
+            event.ignore()
+            return
         self._stop_timers()
+        if self.spec_flow.preview_timer is not None:
+            self.spec_flow.preview_timer.stop()
         if self._toast_timer is not None:
             self._toast_timer.stop()
         self.log.info("Каркас Qt закрыт")
         perflog.flush()
         event.accept()
+
+    def _confirm_close_dirty(self) -> bool:
+        """Подтверждение закрытия с несохранёнными данными (п. 4.4)."""
+        if not self.is_current_page_dirty():
+            return True
+        return self.confirm(
+            self.window, "Несохранённые изменения",
+            "На странице «Спецификация» есть несохранённые данные.\n\n"
+            "Закрыть окно и потерять изменения?",
+            ok_text="Закрыть", cancel_text="Остаться",
+            destructive=True,
+        )
 
 
 def main() -> int:

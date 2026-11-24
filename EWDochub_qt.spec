@@ -83,10 +83,13 @@ a = Analysis(
     ['main_qt.py'],
     pathex=[],
     binaries=[],
-    # M2-каркас: только иконка. Шаблоны .docx подключаются в M3/M7, когда
-    # в Qt-сборке появится печать — сейчас их включение искажало бы замер.
+    # M3 (CP1): в Qt-сборке появилась печать спецификации — включаются
+    # spec_template*.docx. Остальные шаблоны — M6 (договор/доп. соглашение),
+    # финализация datas — M7.
     datas=[
         ('app_icon.ico', '.'),
+        ('spec_template.docx', '.'),
+        ('spec_template_ip.docx', '.'),
     ],
     hiddenimports=[
         'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets',

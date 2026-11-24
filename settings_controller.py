@@ -55,6 +55,7 @@ import tkinter as tk
 
 import app_common
 import dadata_client as dadata
+import services
 import storage
 import ui_macos as ui
 import updater
@@ -574,10 +575,9 @@ class SettingsController:
 
     @staticmethod
     def is_inside_directory(base: str, path: str) -> bool:
-        """Проверяет, что ``path`` не выходит за пределы ``base`` (п. 2.7)."""
-        try:
-            base_norm = os.path.normcase(os.path.normpath(base))
-            path_norm = os.path.normcase(os.path.normpath(path))
-            return os.path.commonpath([base_norm, path_norm]) == base_norm
-        except (ValueError, OSError):
-            return False
+        """Проверяет, что ``path`` не выходит за пределы ``base`` (п. 2.7).
+
+        Этап M3: реализация — общий GUI-free services.is_inside_directory
+        (Tk и Qt-сборки считают одинаково); метод сохранён для API.
+        """
+        return services.is_inside_directory(base, path)

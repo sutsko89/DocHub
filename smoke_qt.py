@@ -1,9 +1,10 @@
-"""Smoke-скелет Qt-каркаса EW.DocHub (этап M2 миграции Tk → PySide6).
+"""Smoke Qt-сборки EW.DocHub (этапы M2–M3 миграции Tk → PySide6).
 
-Проверяет критерии этапа M2 плана миграции на живом каркасе:
-старт → построение окна и разделов → журналы → perf-события старта →
-тема (переключение + перезапуск) → выход (закрытие окна завершает цикл
-событий). Запуск:
+Проверяет критерии этапов M2 (каркас: старт → построение окна и разделов →
+журналы → perf-события старта → тема → выход) и M3 (контрольная точка CP1:
+страница «Спецификация» — вставка блока из Excel с лимитом 500, итог,
+предпросмотр из шаблона без записи на диск, сохранение через
+services.save_document, защита несохранённых при закрытии). Запуск:
 
     python smoke_qt.py            # Windows — нативная рамка
     xvfb-run -a python smoke_qt.py  # Linux — Xvfb (или offscreen автоматически)
@@ -213,6 +214,98 @@ if sys.platform == "win32":
     check(_lock1.acquire() is True, "single instance: первый экземпляр блокирует")
     check(_lock2.acquire() is False, "single instance: второй экземпляр в процессе отклонён")
     _lock1.release()
+
+# ---------- 12. Спецификация CP1 (M3) ----------
+# Живая страница заменяет плейсхолдер; диалоги подменены выше (confirm=True).
+qapp = qt_app  # имя разделов CP1 — как в тестах pytest-qt
+check(ctrl.pages["spec"] is ctrl.spec_flow.page,
+      "CP1: страница «Спецификация» живая (плейсхолдер заменён)")
+check(ctrl.stack.currentWidget() is ctrl.spec_flow.page,
+      "CP1: активный раздел каркаса — «Спецификация»")
+check(not ctrl.spec_flow.preview_text.toPlainText().startswith("Не удалось"),
+      "CP1: предпросмотр собран без ошибки сборки")
+
+# Контрагент раздела 2 + договор-основание — контекст страницы (п. 4.2).
+_contract_rec = ctrl.store.add_document(
+    storage.KIND_CONTRACT, _party["id"], "516", "10 января",
+    data=dict(_party.get("fields", {})),
+    extra={"day": "10", "month": "января", "is_ip": False},
+    text="",
+)
+ctrl.spec_flow.refresh_parties()
+qapp.processEvents()
+check(ctrl.spec_flow.contract_combo.currentText() == "№ 516 от 10 января",
+      "CP1/п. 4.2: договор-основание подставлен автоматически")
+
+# PERF-1: вставка 600 строк из Excel даёт 500 и честное сообщение.
+_confirms_m3: list[tuple] = []
+mq.qt_dialogs.confirm = lambda *a, **k: _confirms_m3.append(a) or True
+qapp.clipboard().setText("\n".join(
+    f"Позиция {n}\t1\tшт\t10" for n in range(1, 601)
+))
+import time as _time
+_paste_started = _time.perf_counter()
+ctrl.spec_flow.table.paste_clipboard()
+_paste_ms = (_time.perf_counter() - _paste_started) * 1000.0
+print(f"perf: вставка 500 строк в Qt-таблицу — {_paste_ms:.1f} мс "
+      "(порог выставляется после К-2; Windows-замер — runbook M3)")
+check(ctrl.spec_flow.table.rowCount() == 500,
+      "CP1/PERF-1: вставка 600 строк даёт ровно 500")
+check("Вставлено 500" in ctrl.toast_label.text()
+      and "отброшено 100" in ctrl.toast_label.text(),
+      "CP1/PERF-1: сообщение «вставлено 500, отброшено 100» — тостом")
+
+# U12: итог под таблицей — один spec_total с печатной формой.
+qapp.clipboard().setText("Кабель ВВГнг 3х2.5\t120\tм\t85,5\n")
+ctrl.spec_flow.table.paste_clipboard()
+check(ctrl.spec_flow.totals_label.text() == "Позиций: 10 · Итого: 10260,00",
+      "CP1/U12: итог под таблицей = spec_total позиций (10260,00)")
+
+# Предпросмотр из шаблона + сохранение (транзакция сервисного слоя).
+# Папка документов изолируется в профиль смоука (не трогаем «Документы»
+# реального пользователя — профиль прогона, раздел Е).
+_docs_dir = os.path.join(os.environ["APPDATA"], "documents_smoke")
+os.makedirs(_docs_dir, exist_ok=True)
+ctrl.spec_flow.documents_dir = lambda: _docs_dir  # noqa: B010 — подмена прогона
+ctrl.spec_flow.number_entry.setText("1")
+qapp.processEvents()
+ctrl.spec_flow.flush_spec_preview()
+check("СПЕЦИФИКАЦИЯ" in ctrl.spec_flow.preview_text.toPlainText(),
+      "CP1: предпросмотр — печатная форма из шаблона spec_template.docx")
+ctrl.spec_flow.save_spec()
+_spec_docs = [d for d in ctrl.store.documents if d["kind"] == storage.KIND_SPEC]
+check(len(_spec_docs) == 1, "CP1: сохранение — запись в реестре")
+check(ctrl.store.get_document(_spec_docs[0]["id"]) is not None
+      and os.path.isdir(ctrl.spec_flow.documents_dir()),
+      "CP1: транзакция завершена — запись и папка документов на месте")
+check("Спецификация № 1" in ctrl.toast_label.text(),
+      "CP1: честное сообщение сохранения с номером")
+check(ctrl.spec_flow.is_form_dirty() is False,
+      "CP1: после сохранения форма «чистая» (baseline пересчитан)")
+
+# Защита несохранённых при закрытии (п. 4.4) — на «перезапущенном» каркасе.
+ctrl2.spec_flow.number_entry.setText("2")
+check(ctrl2.spec_flow.is_form_dirty() is True,
+      "CP1: правка номера — «грязная» форма")
+_ctrl2_confirms: list[tuple] = []
+
+
+def _recording_confirm(*args, **kwargs):
+    _ctrl2_confirms.append(args)
+    return True
+
+
+_prev_confirm = mq.qt_dialogs.confirm
+mq.qt_dialogs.confirm = _recording_confirm
+ctrl2.window.show()
+qapp.processEvents()
+ctrl2.window.close()
+qapp.processEvents()
+mq.qt_dialogs.confirm = _prev_confirm
+check(any("Несохранённые изменения" == str(a[1]) for a in _ctrl2_confirms),
+      "CP1/п. 4.4: закрытие с «грязной» формой — подтверждение")
+check(not ctrl2.window.isVisible(),
+      "CP1/п. 4.4: окно закрыто после подтверждения")
 
 # ---------- Сводка ----------
 try:

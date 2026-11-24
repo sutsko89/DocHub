@@ -149,6 +149,88 @@ QLabel#pagePlaceholderHint {{
     color: {c["text_tertiary"]};
     font-size: 12px;
 }}
+QLabel#pageTitle {{
+    color: {c["text"]};
+    font-size: 20px;
+    font-weight: bold;
+}}
+QLabel#pageSubtitle {{
+    color: {c["text_secondary"]};
+    font-size: 12px;
+}}
+QLabel#currentPartyLabel {{
+    color: {c["text"]};
+    font-weight: bold;
+    font-size: 12px;
+}}
+QLabel#cardCaption {{
+    color: {c["text_secondary"]};
+    font-size: 12px;
+    font-weight: bold;
+    letter-spacing: 0.3px;
+}}
+QLabel#fieldHint {{
+    color: {c["text_tertiary"]};
+    font-size: 11px;
+}}
+QLabel#fieldError {{
+    color: transparent;
+    font-size: 11px;
+}}
+QLabel#fieldErrorActive {{
+    color: #D03050;
+    font-size: 11px;
+}}
+QLabel#specTotals {{
+    color: {c["text_secondary"]};
+    font-size: 12px;
+}}
+QLabel#previewTitle {{
+    color: {c["text_secondary"]};
+    font-size: 12px;
+    font-weight: bold;
+}}
+QFrame#card {{
+    background: {c["card"]};
+    border: 1px solid {c["card_border"]};
+    border-radius: 10px;
+}}
+QFrame#partyBar {{
+    background: {c["sidebar_hover"]};
+    border-radius: 8px;
+}}
+QLineEdit, QComboBox {{
+    background: {c["entry_bg"]};
+    color: {c["text"]};
+    border: 1px solid {c["entry_border"]};
+    border-radius: 6px;
+    padding: 4px 8px;
+}}
+QLineEdit:focus, QComboBox:focus {{
+    border: 1px solid {c["accent"]};
+}}
+QPlainTextEdit#previewText {{
+    background: {c["card"]};
+    color: {c["text"]};
+    border: 1px solid {c["card_border"]};
+    border-radius: 8px;
+}}
+QTableWidget {{
+    background: {c["card"]};
+    color: {c["text"]};
+    border: 1px solid {c["card_border"]};
+    gridline-color: {c["hairline"]};
+    selection-background-color: {c["sidebar_active"]};
+    selection-color: {c["text"]};
+}}
+QHeaderView::section {{
+    background: {c["chrome"]};
+    color: {c["text_secondary"]};
+    border: none;
+    border-bottom: 1px solid {c["chrome_line"]};
+    padding: 6px;
+    font-weight: bold;
+}}
 QFrame#footer {{
     background: {c["window"]};
     border-top: 1px solid {c["hairline"]};

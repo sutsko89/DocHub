@@ -30,6 +30,24 @@ from document_builder import (
 
 MAX_PATH_LENGTH = 240
 MAX_FILENAME_LENGTH = 80
+
+
+def is_inside_directory(base: str, path: str) -> bool:
+    """Проверяет, что ``path`` не выходит за пределы ``base`` (п. 2.7).
+
+    Чистая os.path-функция, общий для Tk и Qt (M3) источник: раньше жила
+    staticmethod'ом у SettingsController (settings_controller.py), который
+    Tk-зависим и не импортируется из Qt-страниц. Тот же контракт:
+    normcase+normpath+commonpath; сбой — False.
+    """
+    try:
+        base_norm = os.path.normcase(os.path.normpath(base))
+        path_norm = os.path.normcase(os.path.normpath(path))
+        return os.path.commonpath([base_norm, path_norm]) == base_norm
+    except (ValueError, OSError):
+        return False
+
+
 def resource_path(relative_path):
     """ Получает абсолютный путь к ресурсу, работает для разработки и для PyInstaller """
     try:

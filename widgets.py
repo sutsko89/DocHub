@@ -14,6 +14,7 @@ import customtkinter as ctk
 import ui_macos as ui
 from decimal import Decimal
 from document_builder import digits_only, parse_decimal
+import spec_table_core as _stc  # этап M3: чистое ядро — общее с Qt-таблицей
 
 
 class SpecTable(ctk.CTkFrame):
@@ -24,14 +25,19 @@ class SpecTable(ctk.CTkFrame):
     столбцы, разделённые табуляцией); при нехватке строки добавляются сами.
     Одинарный клик выделяет строку, Delete удаляет выделенную строку,
     двойной клик по ячейке включает правку.
+
+    Этап M3 миграции: чистая логика вставки/нормализации/валидации
+    вынесена в GUI-free spec_table_core и делегируется ему — Qt-таблица
+    (spec_table_qt.SpecTableQt) считает одинаково с Tk. Поведение не
+    изменилось; тесты test_spec_table_validation идут без правок.
     """
 
-    HEADERS = ("№", "Наименование", "Кол-во", "Ед. изм.", "Цена за ед. с НДС (руб.)")
-    KEYS = ("name", "qty", "unit", "price")
-    MIN_ROWS = 10
-    MAX_ROWS = 500
+    HEADERS = _stc.HEADERS
+    KEYS = _stc.KEYS
+    MIN_ROWS = _stc.MIN_ROWS
+    MAX_ROWS = _stc.MAX_ROWS
     # Ширина фиксированных колонок в логических пикселях (№, Кол-во, Ед. изм., Цена).
-    COL_WIDTHS = {0: 34, 2: 64, 3: 84, 4: 150}
+    COL_WIDTHS = _stc.COL_WIDTHS
 
     def __init__(self, master, scale: float = 1.0, on_change=None,
                  on_notice=None, **kwargs):
@@ -545,47 +551,17 @@ class SpecTable(ctk.CTkFrame):
     @staticmethod
     def _paste_plan(matrix: list[list[str]], start_row: int,
                     max_rows: int) -> tuple[list[list[str]], int]:
-        """Обрезает вставляемый блок до лимита таблицы (PERF-1).
-
-        Возвращает ``(usable, dropped)`` — строки, которые встанут в таблицу
-        (итого после вставки не более ``max_rows`` с учётом стартовой ячейки
-        ``start_row``), и число отброшенных строк. Логика совпадает с полем
-        «Строк:» (set_row_count ограничена тем же MAX_ROWS).
-        """
-        capacity = max(0, max_rows - max(0, start_row))
-        if len(matrix) <= capacity:
-            return matrix, 0
-        return matrix[:capacity], len(matrix) - capacity
+        """Обрезает вставляемый блок до лимита таблицы (PERF-1)."""
+        return _stc.paste_plan(matrix, start_row, max_rows)
 
     @staticmethod
     def paste_notice_text(inserted: int, dropped: int, max_rows: int) -> str:
         """Сообщение об обрезке вставки: «Вставлено 500, отброшено 100 …»."""
-        return (
-            f"Вставлено {inserted}, отброшено {dropped}: лимит таблицы — "
-            f"{max_rows} строк. Остальные строки остались в источнике и в "
-            "буфере обмена."
-        )
+        return _stc.paste_notice_text(inserted, dropped, max_rows)
 
     def _map_row(self, cells: list[str]) -> list[str]:
         """Эвристика раскладки вставленных столбцов по колонкам таблицы."""
-        cells = [cell.strip() for cell in cells]
-        while cells and not cells[-1]:
-            cells.pop()
-        n = len(cells)
-        if n == 0:
-            return ["", "", "", ""]
-        if n == 1:
-            return [cells[0], "", "", ""]
-        if n == 2:  # Наименование, Кол-во
-            return [cells[0], self._normalize_number(cells[1]), "", ""]
-        if n == 3:
-            # «Наименование, Кол-во, Цена» либо «Наименование, Кол-во, Ед. изм.»
-            if self._normalize_number(cells[2]):
-                return [cells[0], self._normalize_number(cells[1]), "",
-                        self._normalize_number(cells[2])]
-            return [cells[0], self._normalize_number(cells[1]), cells[2], ""]
-        return [cells[0], self._normalize_number(cells[1]), cells[2],
-                self._normalize_number(cells[3])]
+        return _stc.map_row(cells)
 
     @staticmethod
     def _normalize_number(text: str) -> str:
@@ -654,23 +630,17 @@ class SpecTable(ctk.CTkFrame):
     @staticmethod
     def _validate_digits(new_value: str) -> bool:
         """Кол-во: цифры и запятая/точка (может быть дробным)."""
-        return new_value == "" or all(ch.isdigit() or ch in ",." for ch in new_value)
+        return _stc.validate_digits(new_value)
 
     @staticmethod
     def _validate_price(new_value: str) -> bool:
         """Цена: цифры, разряды и запятая/точка (копейки)."""
-        return new_value == "" or all(
-            ch.isdigit() or ch in " .," for ch in new_value
-        )
+        return _stc.validate_price(new_value)
 
     @classmethod
     def _sanitize_value(cls, key: str, value: str) -> str:
         """Приводит значение к правилам ячейки (вставка мимо validate="key")."""
-        if key in ("qty", "price"):
-            value = cls._normalize_number(value)
-            validator = cls._validate_digits if key == "qty" else cls._validate_price
-            return value if validator(value) else ""
-        return value
+        return _stc.sanitize_value(key, value)
 
     def _cell_changed(self):
         self._notify()

@@ -98,7 +98,17 @@ def test_default_page_is_spec(controller):
 
 
 def test_placeholder_pages_announce_stage(controller):
-    for key, title, stage in main_qt.NAV_PAGES:
+    """Страницы, ещё не ставшие живыми, сообщают «в разработке» и этап.
+
+    Этап M3: «Спецификация» — живая страница CP1 (SpecPageController
+    заменяет плейсхолдер), поэтому проверяются только будущие разделы.
+    Живость spec закреплена в test_spec_page_qt.
+    """
+    placeholder_stages = (
+        (key, title, stage) for key, title, stage in main_qt.NAV_PAGES
+        if key != "spec"  # живая страница CP1 (M3)
+    )
+    for key, title, stage in placeholder_stages:
         page = controller.pages[key]
         labels = page.findChildren(QLabel)
         texts = [label.text() for label in labels]

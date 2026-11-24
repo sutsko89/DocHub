@@ -152,12 +152,14 @@ def test_spec_page_replaces_placeholder(controller):
 
 
 def test_placeholder_pages_remaining(controller):
-    """Живы «Спецификация» (M3), «Добавить контрагента» (M4) и «Реестр» (M5);
-    остальные сообщают этап (M2-контракт, продлевается честно на каждый этап)."""
+    """Живы «Спецификация» (M3), «Добавить контрагента» (M4), «Реестр» (M5),
+    «Договор» и «Доп. соглашение» (M6); остальные сообщают этап
+    (M2-контракт, продлевается честно на каждый этап)."""
     for key, _title, stage in main_qt.NAV_PAGES:
         page = controller.pages[key]
         texts = [label.text() for label in page.findChildren(QLabel)]
-        if key in ("spec", "counterparty", "registry"):  # живые страницы M3/M4/M5
+        if key in ("spec", "counterparty", "registry", "contract", "additional"):
+            # живые страницы M3/M4/M5/M6-a
             assert not any("в разработке" in text for text in texts), key
         else:
             assert any("в разработке" in text for text in texts), key

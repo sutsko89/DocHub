@@ -94,6 +94,8 @@ def position_issues_message(items: list[dict]) -> str:
 class SpecPageController:
     """Страница «Спецификация»: контекст, итоги, предпросмотр, сохранение."""
 
+    page_key = "spec"
+
     def __init__(self, app) -> None:
         self.app = app
         self.log = app.log
@@ -508,13 +510,17 @@ class SpecPageController:
 
         Контракт Tk on_party_selected (п. 4.2): выбор запоминается в
         общем контексте каркаса и переносится на остальные страницы
-        (M4+); пустой выбор честно сбрасывает контекст.
+        документов (M6: договор и доп. соглашение); пустой выбор честно
+        сбрасывает контекст. Перенос — через каркас (fan-out), рекурсия
+        исключена guard'ом _syncing_party.
         """
         rec = self.selected_party()
         self.app.current_party_id = rec["id"] if rec else None
         self.refresh_contracts()
         self._sync_current_party()
         self.regenerate_spec()
+        if rec is not None and not getattr(self.app, "_syncing_party", False):
+            self.app.set_current_party(rec, source="spec")
 
     def on_contract_changed(self, *args) -> None:
         """Смена договора-основания: явная строка + предпросмотр (п. 4.2)."""

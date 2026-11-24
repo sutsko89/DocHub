@@ -56,6 +56,7 @@ import app_common
 import applog
 import counterparty_page_qt
 import dadata_qt
+import document_page_qt
 import lifecycle_qt
 import perflog
 import qt_dialogs
@@ -125,6 +126,10 @@ class AppController:
         # Единый текущий контрагент (п. 4.2; Tk: _current_party_id) —
         # общий контекст будущих страниц документов (M4+).
         self.current_party_id = None
+        # Guard переноса выбора контрагента между страницами документов
+        # (п. 4.2; Tk: _syncing_party): fan-out не вызывает обратный
+        # перенос из страниц — рекурсия исключена по построению.
+        self._syncing_party = False
 
         qt_theme.apply_theme(app, self._settings.get("theme", qt_theme.DEFAULT_THEME))
 
@@ -164,6 +169,11 @@ class AppController:
         # (экспорт Word, корзина) — Qt-аналог Tk _lifecycle_flow.
         self.lifecycle_flow = lifecycle_qt.LifecycleFlowQt(self)
         self.registry_flow = registry_page_qt.RegistryPageController(self)
+
+        # Живые страницы M6: «Договор поставки» и «Доп. соглашение» с
+        # отложенными предпросмотрами — Qt-аналог Tk _doc_page_flow.
+        self.contract_flow = document_page_qt.ContractPageQt(self)
+        self.additional_flow = document_page_qt.AdditionalPageQt(self)
 
         # Ctrl+S — сохранение формы текущей страницы (п. 4.4, Tk-контракт).
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self.window)
@@ -280,6 +290,12 @@ class AppController:
             # 2.19.0: провал в документы не переживает уход со страницы;
             # ленивый рендер реестра — при первом открытии.
             self.registry_flow.on_page_open()
+        if key in ("contract", "additional"):
+            # P-07: предпросмотр скрытой страницы не рендерится — при
+            # переключении его пересобирает on_page_open.
+            flow = getattr(self, f"{key}_flow", None)
+            if flow is not None:
+                flow.on_page_open()
 
     def select_page(self, key: str) -> None:
         """Переключение раздела по ключу (для клавиатуры и тестов).
@@ -304,6 +320,10 @@ class AppController:
             self.spec_flow.on_page_open()
         if key == "registry" and getattr(self, "registry_flow", None):
             self.registry_flow.on_page_open()
+        if key in ("contract", "additional"):
+            flow = getattr(self, f"{key}_flow", None)
+            if flow is not None:
+                flow.on_page_open()
 
     # Синоним с именем Tk-каркаса (привычные имена для будущих страниц).
     _select_page = select_page
@@ -311,20 +331,16 @@ class AppController:
     def is_current_page_dirty(self) -> bool:
         """Есть ли несохранённые данные на текущей странице (п. 4.4).
 
-        Живые страницы: «Спецификация» (CP1) и «Добавить контрагента»
-        (M4); M5+ расширяет словарь. Сбой чтения подписи контроллер
-        считает «грязной» страницей.
+        Живые страницы: «Спецификация» (CP1), «Добавить контрагента»
+        (M4), «Договор» и «Доп. соглашение» (M6). Сбой чтения подписи
+        контроллер считает «грязной» страницей.
         """
-        if self.current_page == "spec" and getattr(self, "spec_flow", None):
+        flow = getattr(self, f"{self.current_page}_flow", None) \
+            if self.current_page in ("spec", "counterparty", "contract", "additional") \
+            else None
+        if flow is not None:
             try:
-                return self.spec_flow.is_form_dirty()
-            except Exception:
-                return True
-        if self.current_page == "counterparty" and getattr(
-            self, "counterparty_flow", None,
-        ):
-            try:
-                return self.counterparty_flow.is_form_dirty()
+                return flow.is_form_dirty()
             except Exception:
                 return True
         return False
@@ -339,11 +355,9 @@ class AppController:
         if not self.is_current_page_dirty():
             return True
         key = self.current_page
-        label = {
-            "spec": "Спецификация",
-            # Tk-подпись document_context_controller.form_label (п. 4.4).
-            "counterparty": "Карточка контрагента",
-        }.get(key, key)
+        # Tk-подписи document_context_controller.form_label (п. 4.4);
+        # словарь общий для ухода и закрытия окна — document_page_qt.
+        label = document_page_qt.PAGE_LABELS.get(key, key)
         return self.confirm(
             self.window, "Несохранённые изменения",
             f"На странице «{label}» есть несохранённые данные.\n\n"
@@ -354,40 +368,70 @@ class AppController:
 
     def save_current_page(self) -> None:
         """Ctrl+S: сохранение формы текущей страницы (п. 4.4)."""
-        if self.current_page == "spec" and getattr(self, "spec_flow", None):
-            self.spec_flow.save()
-        if self.current_page == "counterparty" and getattr(
-            self, "counterparty_flow", None,
-        ):
-            self.counterparty_flow.save()
+        flow = getattr(self, f"{self.current_page}_flow", None) \
+            if self.current_page in ("spec", "counterparty", "contract", "additional") \
+            else None
+        if flow is not None:
+            flow.save()
 
     # ------------------------------------------------------------------ #
     #  Единый текущий контрагент (п. 4.2; Tk set_current_party)
     # ------------------------------------------------------------------ #
-    def set_current_party(self, rec: dict) -> None:
-        """Единый текущий контрагент для всех страниц (Tk _current_party_id).
+    def set_current_party(self, rec: dict, source: str | None = None) -> None:
+        """Единый текущий контрагент для всех страниц (Tk set_current_party).
 
-        Делегирует странице «Спецификация» (список и панель «Документ
-        для»); M5 реестр и M6 договор присоединятся к тому же контракту.
-        Список контрагентов освежается до выбора: карточка, добавленная
+        Fan-out по живым страницам документов (п. 4.2): выбор, сделанный
+        на одной странице (или поиском по ИНН, или правкой карточки по
+        дубликату ИНН), переносится на остальные. Страница-источник
+        пропускается — её комбо уже показывают этот выбор. Guard
+        ``_syncing_party`` исключает обратную рекурсию из страниц.
+        Списки контрагентов освежаются ДО выбора: карточка, добавленная
         или выбранная по дубликату ИНН (п. 4.1), обязана быть в комбо —
-        иначе контекстный выбор честно очистится (п. 4.2) — как в Tk
-        refresh_party_combo_values внутри set_current_party.
+        иначе контекстный выбор честно очистится (п. 4.2).
         """
-        if getattr(self, "spec_flow", None):
-            self.spec_flow.refresh_parties()
-            self.spec_flow.set_current_party(rec)
-        else:
-            self.current_party_id = rec.get("id")
+        if not isinstance(rec, dict):
+            return
+        self.current_party_id = rec.get("id")
+        self._syncing_party = True
+        try:
+            # getattr: на старте страницы строятся по очереди — spec может
+            # транслировать выбор до создания M6-потоков (база с данными).
+            for flow in (
+                getattr(self, "spec_flow", None),
+                getattr(self, "contract_flow", None),
+                getattr(self, "additional_flow", None),
+            ):
+                if flow is None or (source is not None and flow.page_key == source):
+                    continue
+                try:
+                    flow.refresh_parties()
+                except Exception:
+                    pass  # сбой списка не отменяет перенос выбора (Tk-паритет)
+                try:
+                    flow.set_current_party(rec, source=source)
+                except RuntimeError:
+                    pass  # страница могла быть разрушена
+        finally:
+            self._syncing_party = False
 
     def refresh_after_party_change(self) -> None:
         """Обновление зависимых списков после добавления/правки карточки.
 
         Tk: refresh_party_combo_values + _update_status + реестр (M5):
-        с M5 реестр живой и обновляется вместе с комбо страниц документов.
+        с M5 реестр живой; с M6 списки страниц документов и их
+        предпросмотры обновляются вместе с ним.
         """
-        if getattr(self, "spec_flow", None):
-            self.spec_flow.refresh_parties()
+        for flow in (
+            getattr(self, "spec_flow", None),
+            getattr(self, "contract_flow", None),
+            getattr(self, "additional_flow", None),
+        ):
+            if flow is not None:
+                flow.refresh_parties()
+                if flow.page_key != "spec":
+                    # Предпросмотры M6-страниц откладываются на 120 мс (п. 5.6);
+                    # у спецификации пересборку делает refresh_parties.
+                    flow.preview_deferred()
         if getattr(self, "registry_flow", None):
             self.registry_flow.refresh()
         self.refresh_status()
@@ -673,10 +717,11 @@ class AppController:
         """
         if not self.is_current_page_dirty():
             return True
-        label = {
-            "spec": "Спецификация",
-            "counterparty": "Карточка контрагента",
-        }.get(self.current_page, "текущей странице")
+        # Подпись страницы — по разделу (исправление M4-хвоста; подписи —
+        # Tk document_context_controller.form_label).
+        label = document_page_qt.PAGE_LABELS.get(
+            self.current_page, "текущей странице",
+        )
         return self.confirm(
             self.window, "Несохранённые изменения",
             f"На странице «{label}» есть несохранённые данные.\n\n"

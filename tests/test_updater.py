@@ -455,9 +455,9 @@ def test_result_tick_silent_when_window_closes(app):
 
 
 def test_status_text_contains_version(app, monkeypatch):
-    import main
+    import app_common
 
-    monkeypatch.setattr(main, "APP_VERSION", "9.9.9", raising=False)
+    monkeypatch.setattr(app_common, "APP_VERSION", "9.9.9", raising=False)
     assert "9.9.9" in app._update_flow.status_text()
 
 

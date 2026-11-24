@@ -21,11 +21,10 @@ smoke-тест, всегда идут через ``self.app.*``:
 ``spec_table``, ``spec_party_var`` …, ``_spec_preview_after``): его читают и
 меняют страницы договора и доп. соглашения, защита несохранённых данных
 (п. 4.2, 4.4) и smoke-тест — контроллер владеет кодом, а не данными
-страницы. Ширины разметки (``main.ENTRY_WIDTH`` и соседние) и печатные
-настройки спецификации (``main.get_spec_settings``) берутся поздним импортом
-main: модуль main импортирует этот контроллер, поэтому верхнеуровневый
-импорт дал бы цикл, а к моменту любого вызова метода main уже полностью
-инициализирован.
+страницы. Ширины разметки (``ENTRY_WIDTH`` и соседние) и печатные настройки
+спецификации (``get_spec_settings``) берутся напрямую из GUI-free модуля
+app_common (этап M1 миграции Tk → PySide6 — поздние ``import main``
+ликвидированы).
 
 Поведение один в один повторяет код, вынесенный из main.py версии 2.5.0,
 включая подтверждение повтора номера (аудит 2.0.1, п. 4.1) и транзакцию
@@ -44,6 +43,7 @@ from typing import Any
 import customtkinter as ctk
 import tkinter as tk
 
+import app_common
 import services
 import storage
 import ui_macos as ui
@@ -104,7 +104,6 @@ class DocumentSaveController:
     def build_spec_page(self):
         """Строит страницу «Спецификация»: таблица позиций + карточки слева."""
         app = self.app
-        import main  # поздний импорт: константы разметки main.py (см. докстринг)
 
         _page, left, right, textbox = app._make_page(
             "spec", "Спецификация",
@@ -151,7 +150,7 @@ class DocumentSaveController:
         app.spec_party_var = tk.StringVar(value="")
         app.spec_party_combo = ui.option_menu(
             card.body, ["— выберите контрагента —"],
-            width=int(main.ENTRY_WIDTH * app.scale), variable=app.spec_party_var,
+            width=int(app_common.ENTRY_WIDTH * app.scale), variable=app.spec_party_var,
         )
         card.wide(app.spec_party_combo, pady=(int(2 * app.scale), int(10 * app.scale)))
         # U3 (UX-A): поиск по ИНН как на «Договоре» — не листать комбобокс.
@@ -168,7 +167,7 @@ class DocumentSaveController:
         app.spec_contract_var = tk.StringVar(value="")
         app.spec_contract_combo = ui.option_menu(
             card.body, ["— нет сохранённых договоров —"],
-            width=int(main.ENTRY_WIDTH * app.scale), variable=app.spec_contract_var,
+            width=int(app_common.ENTRY_WIDTH * app.scale), variable=app.spec_contract_var,
         )
         card.wide(app.spec_contract_combo, pady=(int(2 * app.scale), int(4 * app.scale)))
         app.spec_contract_info_var = tk.StringVar(value="Договор-основание не выбран.")
@@ -177,7 +176,7 @@ class DocumentSaveController:
                 card.body, textvariable=app.spec_contract_info_var,
                 font=ui.font(11), text_color=ui.COLORS["text_secondary"],
                 anchor="w", justify="left",
-                wraplength=int((main.LEFT_PANEL_WIDTH - 40) * app.scale),
+                wraplength=int((app_common.LEFT_PANEL_WIDTH - 40) * app.scale),
             ),
             pady=(int(2 * app.scale), int(2 * app.scale)),
         )
@@ -193,7 +192,7 @@ class DocumentSaveController:
 
         app.spec_number_var = tk.StringVar()
         number = ui.entry(
-            card.body, width=int(main.SHORT_WIDTH * app.scale),
+            card.body, width=int(app_common.SHORT_WIDTH * app.scale),
             textvariable=app.spec_number_var,
         )
         app._page_widgets[("spec", F.NUMBER)] = number
@@ -216,7 +215,7 @@ class DocumentSaveController:
 
         app.spec_delivery_term_var = tk.StringVar()
         delivery_term = ui.entry(
-            card.body, width=int(main.ENTRY_WIDTH * app.scale),
+            card.body, width=int(app_common.ENTRY_WIDTH * app.scale),
             textvariable=app.spec_delivery_term_var,
         )
         app._page_widgets[("spec", F.DELIVERY_TERM)] = delivery_term
@@ -225,7 +224,7 @@ class DocumentSaveController:
 
         app.spec_payment_terms_var = tk.StringVar()
         payment_terms = ui.entry(
-            card.body, width=int(main.ENTRY_WIDTH * app.scale),
+            card.body, width=int(app_common.ENTRY_WIDTH * app.scale),
             textvariable=app.spec_payment_terms_var,
         )
         app._page_widgets[("spec", F.PAYMENT_TERMS)] = payment_terms
@@ -234,7 +233,7 @@ class DocumentSaveController:
 
         app.spec_delivery_basis_var = tk.StringVar()
         delivery_basis = ui.entry(
-            card.body, width=int(main.ENTRY_WIDTH * app.scale),
+            card.body, width=int(app_common.ENTRY_WIDTH * app.scale),
             textvariable=app.spec_delivery_basis_var,
         )
         app._page_widgets[("spec", F.DELIVERY_BASIS)] = delivery_basis
@@ -243,7 +242,7 @@ class DocumentSaveController:
 
         app.spec_prices_until_var = tk.StringVar(value=prices_valid_until_default())
         prices_until = ui.entry(
-            card.body, width=int(main.ENTRY_WIDTH * app.scale),
+            card.body, width=int(app_common.ENTRY_WIDTH * app.scale),
             textvariable=app.spec_prices_until_var,
         )
         card.row("Цены действительны до", prices_until,
@@ -396,9 +395,7 @@ class DocumentSaveController:
 
     def render_spec_docx(self, rec: dict) -> "Document":
         """Спецификация из шаблона (ООО/ИП) — сборка в сервисном слое (п. 9.2)."""
-        import main  # поздний импорт: печатные настройки main.get_spec_settings
-
-        return services.render_spec(rec, self.app.store, main.get_spec_settings())
+        return services.render_spec(rec, self.app.store, app_common.get_spec_settings())
 
     def rec_is_ip(self, rec: dict) -> bool:
         """Признак ИП у сохранённой записи (учитывая старые записи реестра)."""
@@ -479,7 +476,6 @@ class DocumentSaveController:
     def render_spec_preview(self):
         """Собирает текст предпросмотра спецификации из состояния страницы."""
         app = self.app
-        import main  # поздний импорт: печатные настройки main.get_spec_settings
 
         app._spec_preview_after = None
         # UPD-UI (P-07): предпросмотр — только при видимой странице; при
@@ -494,7 +490,7 @@ class DocumentSaveController:
         data = dict(party.get("fields", {}))
 
         lines: list[str] = []
-        spec = main.get_spec_settings()
+        spec = app_common.get_spec_settings()
         if contract is not None:
             lines.append(
                 f"Приложение № {spec['spec_appendix_number']} к Договору поставки "

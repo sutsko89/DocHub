@@ -28,13 +28,11 @@ DadataController («Заполнить по ИНН»), защита несохр
 Контроллер создаётся в ``__init__`` ДО построения страниц:
 ``_build_counterparty_page`` уже идёт через контроллер.
 
-Зависимости от модуля main — только поздним импортом: ширина полей
-(main.ENTRY_WIDTH) и форматирование телефона при вводе
-(main.make_phone_formatter) берутся через ``import main`` внутри методов.
-Обычный верхнеуровневый импорт дал бы цикл, а к моменту вызова метода main
-уже полностью инициализирован. Остальные зависимости — модули services,
-storage, ui_macos, document_builder — импортируются напрямую, как в
-предыдущих контроллерах.
+Ширина полей (``ENTRY_WIDTH``) и форматирование телефона при вводе
+(``make_phone_formatter``) берутся напрямую из GUI-free модуля app_common
+(этап M1 миграции Tk → PySide6 — поздние ``import main`` ликвидированы).
+Остальные зависимости — модули services, storage, ui_macos,
+document_builder — импортируются напрямую, как в предыдущих контроллерах.
 
 Поведение один в один повторяет код, вынесенный из main.py версии 2.6.0:
 честная обработка сбоя чтения полей (аудит 2.0.1 — сбойное поле не
@@ -49,6 +47,7 @@ from __future__ import annotations
 import customtkinter as ctk
 import tkinter as tk
 
+import app_common
 import dadata_controller
 import services
 import storage
@@ -240,8 +239,6 @@ class CounterpartyController:
         self.on_type_change("Юр. лицо")
 
     def build_cp_fields(self, card, mode: str):
-        import main  # поздний импорт: константы разметки main.py (см. докстринг)
-
         app = self.app
         error_var = self.error_var_for(mode)
 
@@ -291,7 +288,7 @@ class CounterpartyController:
             card.section("Руководитель")
             self.add_field(card, mode, F.DIRECTOR, F.DIRECTOR, required=True)
             widget = ui.option_menu(card.body, ["Устав", "Доверенность"],
-                                    width=int(main.ENTRY_WIDTH * app.scale))
+                                    width=int(app_common.ENTRY_WIDTH * app.scale))
             widget.set("Устав")
             app._cp_entries[mode][F.BASIS] = widget
             card.row(F.BASIS, widget)
@@ -334,10 +331,8 @@ class CounterpartyController:
     def add_field(self, card, mode: str, key: str, label: str, kind="text",
                   width=None, required=False, stretch=True, max_len=None,
                   hint: str | None = None, placeholder: str | None = None):
-        import main  # поздний импорт: ширина поля и формат телефона из main.py
-
         app = self.app
-        width = width or int(main.ENTRY_WIDTH * app.scale)
+        width = width or int(app_common.ENTRY_WIDTH * app.scale)
         validate = None
         if kind == "digits":
             validate = app._digits_vcmd_for(max_len) if max_len else (app._digits_vcmd, "%P")
@@ -353,7 +348,7 @@ class CounterpartyController:
         elif kind == "phone":
             phone_var = tk.StringVar()
             widget.entry.configure(textvariable=phone_var)
-            phone_var.trace_add("write", main.make_phone_formatter(phone_var, widget.entry))
+            phone_var.trace_add("write", app_common.make_phone_formatter(phone_var, widget.entry))
             ui.enable_sanitized_paste(
                 widget.entry,
                 lambda s: "".join(ch for ch in str(s) if ch.isdigit() or ch in "+-()/. "),
@@ -514,8 +509,6 @@ class CounterpartyController:
         затрагиваются: каждый документ хранит собственную копию реквизитов
         на момент создания.
         """
-        import main  # поздний импорт: ширина поля и формат телефона из main.py
-
         app = self.app
         mode = "ip" if rec.get("type") == "ip" else "ooo"
         is_ip = mode == "ip"
@@ -587,7 +580,7 @@ class CounterpartyController:
 
         def add_field(key, label, kind="text", width=None, required=False,
                       stretch=True, max_len=None, hint=None, placeholder=None):
-            width = width or int(main.ENTRY_WIDTH * app.scale)
+            width = width or int(app_common.ENTRY_WIDTH * app.scale)
             validate = None
             if kind == "digits":
                 validate = app._digits_vcmd_for(max_len) if max_len else (app._digits_vcmd, "%P")
@@ -602,7 +595,7 @@ class CounterpartyController:
             elif kind == "phone":
                 phone_var = tk.StringVar()
                 widget.entry.configure(textvariable=phone_var)
-                phone_var.trace_add("write", main.make_phone_formatter(phone_var, widget.entry))
+                phone_var.trace_add("write", app_common.make_phone_formatter(phone_var, widget.entry))
                 ui.enable_sanitized_paste(
                     widget.entry,
                     lambda s: "".join(ch for ch in str(s) if ch.isdigit() or ch in "+-()/. "),
@@ -656,7 +649,7 @@ class CounterpartyController:
             card.section("Руководитель")
             add_field(F.DIRECTOR, F.DIRECTOR, required=True)
             widget = ui.option_menu(card.body, ["Устав", "Доверенность"],
-                                    width=int(main.ENTRY_WIDTH * app.scale))
+                                    width=int(app_common.ENTRY_WIDTH * app.scale))
             basis = str(saved.get(F.BASIS, "")).strip()
             widget.set(basis if basis in ("Устав", "Доверенность") else "Устав")
             entries[F.BASIS] = widget

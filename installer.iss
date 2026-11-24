@@ -18,8 +18,8 @@
 
 #define MyAppName "EW.DocHub"
 #define MyAppExeName "EW.DocHub.exe"
-; Версия релиза: синхронизируется с APP_VERSION (main.py) скриптом
-; tools/bump_version.py. В EWDochub.spec версия из main.py читается напрямую.
+; Версия релиза: синхронизируется с APP_VERSION (app_common.py) скриптом
+; tools/bump_version.py. В EWDochub.spec версия из app_common.py читается напрямую.
 #define MyAppVersion "2.28.2"
 
 [Setup]

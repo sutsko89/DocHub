@@ -33,12 +33,10 @@
   inline-валидации страниц, его читают защита несохранённых данных и
   подсветка ошибок.
 
-Ширины разметки (``main.ENTRY_WIDTH``, ``main.SHORT_WIDTH``,
-``main.LEFT_PANEL_WIDTH``) и хелпер курсора
-``main.restore_caret_after_reformat`` берутся поздним импортом main:
-модуль main импортирует этот контроллер, поэтому верхнеуровневый импорт
-дал бы цикл, а к моменту любого вызова метода main уже полностью
-инициализирован.
+Ширины разметки (``ENTRY_WIDTH``, ``SHORT_WIDTH``, ``LEFT_PANEL_WIDTH``)
+и хелпер курсора ``restore_caret_after_reformat`` берутся напрямую из
+GUI-free модуля app_common (этап M1 миграции Tk → PySide6 — поздние
+``import main`` ликвидированы).
 
 Поведение один в один повторяет код, вынесенный из main.py версии 2.7.0.
 """
@@ -51,6 +49,7 @@ from typing import Any
 import customtkinter as ctk
 import tkinter as tk
 
+import app_common
 import ui_macos as ui
 from document_builder import (
     F, MONTHS_GENITIVE, digits_only, docx_to_text, format_number_grouped,
@@ -80,7 +79,6 @@ class DocumentPageController:
     def build_contract_page(self):
         """Страница «Договор поставки» в основном окне программы."""
         app = self.app
-        import main  # поздний импорт: константы разметки main.py (см. докстринг)
 
         _page, left, _right, textbox = app._make_page(
             "contract", "Договор поставки",
@@ -98,7 +96,7 @@ class DocumentPageController:
         app.contract_party_var = tk.StringVar(value="")
         app.contract_party_combo = ui.option_menu(
             card.body, ["— выберите контрагента —"],
-            width=int(main.ENTRY_WIDTH * app.scale), variable=app.contract_party_var,
+            width=int(app_common.ENTRY_WIDTH * app.scale), variable=app.contract_party_var,
         )
         card.wide(app.contract_party_combo, pady=(int(2 * app.scale), int(10 * app.scale)))
 
@@ -112,7 +110,7 @@ class DocumentPageController:
 
         app.contract_number_var = tk.StringVar()
         number = ui.entry(
-            card.body, width=int(main.SHORT_WIDTH * app.scale),
+            card.body, width=int(app_common.SHORT_WIDTH * app.scale),
             textvariable=app.contract_number_var,
         )
         app._page_widgets[("contract", F.NUMBER)] = number
@@ -250,7 +248,6 @@ class DocumentPageController:
     def build_additional_page(self):
         """Страница «Доп. соглашение» в основном окне программы."""
         app = self.app
-        import main  # поздний импорт: константы разметки main.py (см. докстринг)
 
         _page, left, _right, textbox = app._make_page(
             "additional", "Доп. соглашение",
@@ -268,7 +265,7 @@ class DocumentPageController:
         app.addl_party_var = tk.StringVar(value="")
         app.addl_party_combo = ui.option_menu(
             card.body, ["— выберите контрагента —"],
-            width=int(main.ENTRY_WIDTH * app.scale), variable=app.addl_party_var,
+            width=int(app_common.ENTRY_WIDTH * app.scale), variable=app.addl_party_var,
         )
         card.wide(app.addl_party_combo, pady=(int(2 * app.scale), int(10 * app.scale)))
         # U3 (UX-A): поиск по ИНН как на «Договоре» — не листать комбобокс.
@@ -285,7 +282,7 @@ class DocumentPageController:
         app.addl_contract_var = tk.StringVar(value="")
         app.addl_contract_combo = ui.option_menu(
             card.body, ["— нет сохранённых договоров —"],
-            width=int(main.ENTRY_WIDTH * app.scale), variable=app.addl_contract_var,
+            width=int(app_common.ENTRY_WIDTH * app.scale), variable=app.addl_contract_var,
         )
         card.wide(app.addl_contract_combo, pady=(int(2 * app.scale), int(4 * app.scale)))
         app.addl_contract_info_var = tk.StringVar(value="Договор-основание не выбран.")
@@ -294,7 +291,7 @@ class DocumentPageController:
                 card.body, textvariable=app.addl_contract_info_var,
                 font=ui.font(11), text_color=ui.COLORS["text_secondary"],
                 anchor="w", justify="left",
-                wraplength=int((main.LEFT_PANEL_WIDTH - 40) * app.scale),
+                wraplength=int((app_common.LEFT_PANEL_WIDTH - 40) * app.scale),
             ),
             pady=(int(2 * app.scale), int(2 * app.scale)),
         )
@@ -304,7 +301,7 @@ class DocumentPageController:
                 text="Договоры берутся из реестра: сначала создайте договор поставки.",
                 font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
                 anchor="w", justify="left",
-                wraplength=int((main.LEFT_PANEL_WIDTH - 40) * app.scale),
+                wraplength=int((app_common.LEFT_PANEL_WIDTH - 40) * app.scale),
             ),
             pady=(int(4 * app.scale), int(6 * app.scale)),
         )
@@ -316,7 +313,7 @@ class DocumentPageController:
 
         app.addl_number_var = tk.StringVar()
         number = ui.entry(
-            card.body, width=int(main.SHORT_WIDTH * app.scale),
+            card.body, width=int(app_common.SHORT_WIDTH * app.scale),
             textvariable=app.addl_number_var,
         )
         card.row("Номер доп. соглашения", number,
@@ -488,7 +485,6 @@ class DocumentPageController:
     def format_limit(self, *_args):
         """Форматирует лимит с разделителями разрядов и обновляет сумму прописью."""
         app = self.app
-        import main  # поздний импорт: хелпер курсора main.py (см. докстринг)
 
         raw = app._limit_var.get()
         formatted = format_number_grouped(raw)
@@ -501,7 +497,7 @@ class DocumentPageController:
             except Exception:
                 pass
             app._limit_var.set(formatted)
-            main.restore_caret_after_reformat(entry, caret, len(raw), len(formatted))
+            app_common.restore_caret_after_reformat(entry, caret, len(raw), len(formatted))
         self.update_limit_words()
 
     def update_limit_words(self):

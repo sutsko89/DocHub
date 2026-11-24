@@ -2,8 +2,9 @@
 """Единый бамп версии EW.DocHub (аудит 2.0.1, P0 «версии разъехались»).
 
 Версия живёт в двух местах, но синхронизируется одним скриптом:
-  * main.py        — APP_VERSION (единый источник; EWDochub.spec читает его
-                     напрямую при сборке);
+  * app_common.py  — APP_VERSION (единый источник; EWDochub.spec читает его
+                     напрямую при сборке; с этапа M1 миграции источник
+                     здесь — раньше был main.py);
   * installer.iss  — MyAppVersion.
 
 Скрипт меняет оба места, обновляет README (заголовок и имена setup.exe)
@@ -23,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 TARGETS = [
     (
-        REPO_ROOT / "main.py",
+        REPO_ROOT / "app_common.py",
         r'APP_VERSION = "[\d.]+"',
         'APP_VERSION = "{version}"',
     ),
@@ -39,7 +40,7 @@ FORBIDDEN_LITERALS = [
     (
         REPO_ROOT / "EWDochub.spec",
         r'APP_VERSION\s*=\s*"\d+\.\d+\.\d+"',
-        "EWDochub.spec: версия должна читаться из main.py, а не дублироваться",
+        "EWDochub.spec: версия должна читаться из app_common.py, а не дублироваться",
     ),
 ]
 

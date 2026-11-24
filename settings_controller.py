@@ -33,11 +33,10 @@ Tk-диалогов для импорта и проверка выхода пу�
   ``self.app._persist_settings``: иначе при аварийном завершении выбор
   терялся бы до закрытия программы.
 
-Зависимости от модуля main (``main.SETTINGS_DIR_NAME``, ширины разметки
-``main.ENTRY_WIDTH`` / ``main.LEFT_PANEL_WIDTH``) берутся поздним импортом
-внутри методов: модуль main импортирует этот контроллер, поэтому
-верхнеуровневый импорт дал бы цикл, а к моменту любого вызова метода main
-уже полностью инициализирован. Папка «Документы» берётся напрямую из
+Ширины разметки (``ENTRY_WIDTH`` / ``LEFT_PANEL_WIDTH``) и имя папки
+профиля (``SETTINGS_DIR_NAME``) берутся напрямую из GUI-free модуля
+app_common (этап M1 миграции Tk → PySide6 — поздние ``import main``
+ликвидированы). Папка «Документы» берётся напрямую из
 ``win_shell.documents_known_folder`` (п. 9.3). Остальные зависимости —
 ``ui_macos``, ``win_shell``, ``dadata_client``, ``tkinter`` — импортируются
 напрямую.
@@ -54,6 +53,7 @@ from typing import Any
 import customtkinter as ctk
 import tkinter as tk
 
+import app_common
 import dadata_client as dadata
 import storage
 import ui_macos as ui
@@ -96,7 +96,6 @@ class SettingsController:
     def build_settings_page(self):
         """Страница «Настройки»: тема, папка документов, ключ DaData."""
         app = self.app
-        import main  # поздний импорт: ширины разметки main.py (см. докстринг)
 
         _page, left, _right, _textbox = app._make_page(
             "settings", "Настройки",
@@ -126,7 +125,7 @@ class SettingsController:
                 card.body, textvariable=app._documents_dir_var,
                 font=ui.font(12), text_color=ui.COLORS["text"],
                 anchor="w", justify="left",
-                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+                wraplength=int((app_common.LEFT_PANEL_WIDTH - 48) * app.scale),
             ),
             pady=(int(2 * app.scale), int(6 * app.scale)),
         )
@@ -147,7 +146,7 @@ class SettingsController:
                      "Для каждого контрагента заводится своя папка с его документами.",
                 font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
                 anchor="w", justify="left",
-                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+                wraplength=int((app_common.LEFT_PANEL_WIDTH - 48) * app.scale),
             ),
             pady=(int(4 * app.scale), int(2 * app.scale)),
         )
@@ -168,11 +167,11 @@ class SettingsController:
                      "никуда не отправляются.",
                 font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
                 anchor="w", justify="left",
-                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+                wraplength=int((app_common.LEFT_PANEL_WIDTH - 48) * app.scale),
             ),
             pady=(int(2 * app.scale), int(6 * app.scale)),
         )
-        app._dadata_key_entry = ui.entry(card.body, width=int(main.ENTRY_WIDTH * app.scale))
+        app._dadata_key_entry = ui.entry(card.body, width=int(app_common.ENTRY_WIDTH * app.scale))
         try:
             app._dadata_key_entry.entry.configure(show="•")
         except Exception:
@@ -187,7 +186,7 @@ class SettingsController:
                 card.body, textvariable=app._dadata_key_status_var,
                 font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
                 anchor="w", justify="left",
-                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+                wraplength=int((app_common.LEFT_PANEL_WIDTH - 48) * app.scale),
             ),
             pady=(int(2 * app.scale), int(4 * app.scale)),
         )
@@ -219,7 +218,7 @@ class SettingsController:
                 card.body, textvariable=app._update_status_var,
                 font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
                 anchor="w", justify="left",
-                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+                wraplength=int((app_common.LEFT_PANEL_WIDTH - 48) * app.scale),
             ),
             pady=(int(2 * app.scale), int(6 * app.scale)),
         )
@@ -254,7 +253,7 @@ class SettingsController:
                 card.body, textvariable=app._backup_status_var,
                 font=ui.font(12), text_color=ui.COLORS["text"],
                 anchor="w", justify="left",
-                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+                wraplength=int((app_common.LEFT_PANEL_WIDTH - 48) * app.scale),
             ),
             pady=(int(2 * app.scale), int(6 * app.scale)),
         )
@@ -277,7 +276,7 @@ class SettingsController:
                      "на том же диске — от отказа диска она не защищает.",
                 font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
                 anchor="w", justify="left",
-                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+                wraplength=int((app_common.LEFT_PANEL_WIDTH - 48) * app.scale),
             ),
             pady=(int(4 * app.scale), int(2 * app.scale)),
         )
@@ -299,7 +298,7 @@ class SettingsController:
                      "пользователя — его можно переслать целиком.",
                 font=ui.font(11), text_color=ui.COLORS["text_tertiary"],
                 anchor="w", justify="left",
-                wraplength=int((main.LEFT_PANEL_WIDTH - 48) * app.scale),
+                wraplength=int((app_common.LEFT_PANEL_WIDTH - 48) * app.scale),
             ),
             pady=(int(2 * app.scale), int(6 * app.scale)),
         )
@@ -461,7 +460,6 @@ class SettingsController:
         к прежнему месту в профиле пользователя.
         """
         app = self.app
-        import main  # поздний импорт: константы main.py (см. докстринг)
 
         base = os.path.join(win_shell.documents_known_folder(), "EW.DocHub")
         try:
@@ -481,7 +479,7 @@ class SettingsController:
                 )
         base = os.path.join(
             os.environ.get("APPDATA") or os.path.expanduser("~"),
-            main.SETTINGS_DIR_NAME, "documents",
+            app_common.SETTINGS_DIR_NAME, "documents",
         )
         try:
             os.makedirs(base, exist_ok=True)

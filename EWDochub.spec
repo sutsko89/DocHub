@@ -23,14 +23,15 @@ except NameError:
 
 # VersionInfo для exe — версия видна в свойствах файла (п. 6.1 плана).
 # Аудит 2.0.1: версия больше НЕ дублируется в spec — она читается из
-# APP_VERSION в main.py (единый источник), и бинарные filevers/prodvers
-# вычисляются из неё же (раньше строка была 2.0.1, а filevers=(1,5,0,0)).
+# APP_VERSION в app_common.py (единый источник; этап M1 миграции перенёс
+# её из main.py), и бинарные filevers/prodvers вычисляются из неё же
+# (раньше строка была 2.0.1, а filevers=(1,5,0,0)).
 _match = re.search(
     r'APP_VERSION\s*=\s*"(\d+)\.(\d+)\.(\d+)"',
-    (_SPEC_DIR / "main.py").read_text(encoding="utf-8"),
+    (_SPEC_DIR / "app_common.py").read_text(encoding="utf-8"),
 )
 if not _match:
-    raise SystemExit("EWDochub.spec: не удалось прочитать APP_VERSION из main.py")
+    raise SystemExit("EWDochub.spec: не удалось прочитать APP_VERSION из app_common.py")
 APP_VERSION = ".".join(_match.groups())
 FILEVERS = tuple(int(group) for group in _match.groups()) + (0,)
 

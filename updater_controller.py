@@ -30,12 +30,14 @@ Tk; рабочий поток не трогает Tk и не вызывает ``
 * ``run_installer_command`` — модульная функция запуска setup.exe;
 * ``ui.alert`` / ``ui.confirm`` — атрибуты общего модуля ui_macos.
 
-Зависимость от main (APP_VERSION, подмена main.threading в smoke) берётся
-поздним импортом внутри методов — main импортирует этот контроллер.
+APP_VERSION берётся напрямую из GUI-free модуля app_common (этап M1
+миграции Tk → PySide6 — поздние ``import main`` ликвидированы): чтение
+по атрибуту модуля на момент вызова, подмена в тестах видна.
 """
 
 from __future__ import annotations
 
+import app_common
 import applog
 import os
 import queue
@@ -77,8 +79,6 @@ class UpdateController:
         пользователем в настройках, суточный троттлинг. Любой False — выход
         без сетевых вызовов и без интерфейсных изменений.
         """
-        import main  # поздний импорт: цикл main → контроллер
-
         if not updater.check_enabled():
             return
         if not updater.auto_check_enabled(self.app._settings):
@@ -94,8 +94,6 @@ class UpdateController:
         self._start(auto=False)
 
     def _start(self, auto: bool) -> None:
-        import main  # поздний импорт: APP_VERSION читается на момент проверки
-
         self.busy = True
         self._set_busy_ui(True)
         # Очередь результата + опрос из главного потока (паттерн
@@ -104,7 +102,7 @@ class UpdateController:
         self.result_queue = result_queue
         threading.Thread(
             target=self._worker,
-            args=(main.APP_VERSION, auto, result_queue),
+            args=(app_common.APP_VERSION, auto, result_queue),
             daemon=True,
         ).start()
         self.result_after = self.app.root.after(80, self.result_tick)
@@ -200,13 +198,11 @@ class UpdateController:
     #  Диалог обновления: «Обновить сейчас» / страница / позже
     # ------------------------------------------------------------------ #
     def _show_update_dialog(self, release: dict) -> None:
-        import main  # поздний импорт: APP_VERSION (см. докстринг класса)
-
         newest = str(release.get("version_str") or release.get("tag") or "")
         has_installer = bool(release.get("installer_url"))
         if has_installer:
             message = (
-                f"Установлена версия: {main.APP_VERSION}\n"
+                f"Установлена версия: {app_common.APP_VERSION}\n"
                 f"Новая версия: {newest}\n\n"
                 "«Обновить сейчас» скачает установщик, проверит его целостность "
                 "и запустит обновление — приложение закроется и запустится "
@@ -221,7 +217,7 @@ class UpdateController:
             # Установщика в релизе нет — обновиться программой нельзя,
             # остаётся страница релиза (CI мог ещё не выложить ассет).
             message = (
-                f"Установлена версия: {main.APP_VERSION}\n"
+                f"Установлена версия: {app_common.APP_VERSION}\n"
                 f"Новая версия: {newest}\n\n"
                 "Установщик ещё не выложен в релиз — открыть страницу релиза, "
                 "чтобы скачать его вручную?"
@@ -516,10 +512,9 @@ class UpdateController:
         в журнале.
         """
         try:
-            import main  # поздний импорт: APP_VERSION без цикла
             import storage
 
-            storage.create_update_snapshot(self.app.store, main.APP_VERSION)
+            storage.create_update_snapshot(self.app.store, app_common.APP_VERSION)
         except Exception as exc:  # noqa: BLE001 — обновление не блокируем
             applog.get_logger("updater").warning(
                 "Снимок реестра перед обновлением не создан: %s", type(exc).__name__,
@@ -529,10 +524,12 @@ class UpdateController:
     #  Текст статуса для страницы «Настройки»
     # ------------------------------------------------------------------ #
     def status_text(self) -> str:
-        """Строка «Установлена версия X.Y.Z» — без сетевых вызовов."""
-        import main
+        """Строка «Установлена версия X.Y.Z» — без сетевых вызовов.
 
-        return f"Установлена версия {main.APP_VERSION}"
+        Версия читается по атрибуту app_common на момент вызова:
+        подмена APP_VERSION в тестах видна здесь без перезапуска.
+        """
+        return f"Установлена версия {app_common.APP_VERSION}"
 
 
 def run_installer_command(path: str) -> None:

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import copy
 import counterparty_controller
-import json
 import os
 import platform
 import queue
@@ -83,12 +82,23 @@ from services import (
     safe_filename, copy_with_zone_identifier,
 )
 
+# GUI-free константы и настройки приложения (M1 миграции Tk → PySide6):
+# версия, флейвор сборки, константы разметки контроллеров, settings.json,
+# печатные настройки спецификации, хелперы каретки/телефона. Имена
+# реэкспортируются, чтобы main.py, smoke_test.py и тесты работали как
+# раньше; единый источник версии — app_common.py (его читают EWDochub.spec
+# и tools/bump_version.py).
+import app_common
+from app_common import (
+    APP_VERSION, APP_UI_FLAVOR, DEFAULT_SPEC_SETTINGS, ENTRY_WIDTH,
+    LEFT_PANEL_WIDTH, SETTINGS_DIR_NAME, SHORT_WIDTH, get_spec_settings,
+    load_settings, make_phone_formatter, restore_caret_after_reformat,
+    settings_path, write_settings,
+)
+
 
 # Составные виджеты вынесены в widgets.py (п. 9.4).
 from widgets import SpecTable
-
-
-APP_VERSION = "2.28.2"
 
 # Уведомление о сроках доп. соглашений (2.18.0): раз в сутки, ключ
 # settings.json — как у автопроверки обновлений (updater.SETTINGS_KEY_TS).
@@ -110,89 +120,13 @@ win_shell.enable_dpi_awareness()
 # Кэш инвалидируется по mtime — правка шаблона подхватывается без перезапуска.
 
 
-# ---------- Сохранение настроек между запусками ----------
-SETTINGS_DIR_NAME = "DogovorGenerator"
+# ---------- Окно ----------
 MIN_WINDOW_WIDTH = 1120  # логические пиксели
 MIN_WINDOW_HEIGHT = 620
 
-
-def settings_path() -> str:
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    return os.path.join(base, SETTINGS_DIR_NAME, "settings.json")
-
-
-def load_settings() -> dict:
-    try:
-        with open(settings_path(), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def write_settings(settings: dict) -> bool:
-    """Сохраняет настройки атомарно (tmp + os.replace).
-
-    Прямая перезапись при аварийном завершении оставляла обрезанный файл,
-    из-за чего тема, геометрия окна и папка документов молча сбрасывались.
-    """
-    path = settings_path()
-    tmp = path + ".tmp"
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(settings, fh, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-        return True
-    except (OSError, TypeError, ValueError) as exc:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
-        print(f"Не удалось сохранить настройки ({path}): {exc}", file=sys.stderr)
-        return False
-
-
-# ---------- Настройки печатной формы спецификации (п. 9.7) ----------
-# Магические значения печатной формы спецификации вынесены в settings.json:
-# поставщик, подписант, город, год, ставка НДС и номер приложения меняются
-# без правки кода. Отсутствующие или битые значения заменяются дефолтами.
-# Год здесь НЕ фиксируется: раньше datetime.now().year вычислялся при импорте
-# модуля, и приложение, пережившее Новый год в запущенном виде, ставило в
-# спецификации прошлый год (аудит 2.0.1). Актуальный год берётся на момент
-# вызова get_spec_settings().
-DEFAULT_SPEC_SETTINGS = {
-    "spec_supplier": "ООО «Эдельвейс»",
-    "spec_supplier_signatory": "А.Н. Верещагин",
-    "spec_city": "Хабаровск",
-    "spec_vat_rate": SPEC_VAT_RATE,
-    "spec_appendix_number": SPEC_APPENDIX_NUMBER,
-}
-
-
-def get_spec_settings() -> dict:
-    """Печатная форма спецификации: дефолты, перекрытые settings.json."""
-    saved = load_settings()
-    out = dict(DEFAULT_SPEC_SETTINGS)
-    out["spec_year"] = datetime.now().year  # на момент вызова, не импорта
-    for key in out:
-        value = saved.get(key)
-        if value is None:
-            continue
-        if key == "spec_vat_rate":
-            try:
-                out[key] = max(0, min(int(value), 100))
-            except (TypeError, ValueError):
-                pass
-        elif key == "spec_year":
-            try:
-                out[key] = int(value)
-            except (TypeError, ValueError):
-                pass
-        else:
-            out[key] = str(value)
-    return out
+# SETTINGS_DIR_NAME, settings_path/load_settings/write_settings и печатные
+# настройки спецификации (DEFAULT_SPEC_SETTINGS/get_spec_settings) вынесены
+# в app_common.py (M1 миграции Tk → PySide6) и реэкспортируются в шапке.
 
 
 # ---------- Функции валидации ----------
@@ -234,52 +168,9 @@ IMPORT_MIN_FREE_SPACE = importer.MIN_FREE_SPACE
 # ---------- Месяцы и маски ввода ----------
 
 
-def restore_caret_after_reformat(entry, caret, old_len, new_len):
-    """Ставит курсор с поправкой на изменение длины строки при переформатировании.
-
-    При var.set() Tk сбрасывает курсор в непредсказуемую позицию — без этой
-    поправки ввод телефона «рассыпается» уже со второй цифры. Установка через
-    after_idle: внутренний callback Entry обновляет текст и курсор ПОСЛЕ
-    нашего trace-обработчика, поэтому немедленный icursor затирается.
-    """
-    if entry is None or caret is None:
-        return
-
-    def _apply():
-        try:
-            entry.icursor(min(max(caret + new_len - old_len, 0), new_len))
-        except Exception:
-            pass
-
-    try:
-        entry.after_idle(_apply)
-    except Exception:
-        _apply()
-
-
-def make_phone_formatter(var: "tk.StringVar", entry=None):
-    """Trace-функция: переформатирует ввод телефона в маску +7 (___) ___-__-__."""
-
-    def _format(*_args):
-        raw = var.get()
-        digits = digits_only(raw)
-        if digits.startswith("8"):
-            digits = "7" + digits[1:]
-        if digits and not digits.startswith("7"):
-            digits = "7" + digits
-        formatted = format_phone(digits)
-        if raw == formatted:
-            return
-        caret = None
-        if entry is not None:
-            try:
-                caret = entry.index(tk.INSERT)
-            except Exception:
-                caret = None
-        var.set(formatted)
-        restore_caret_after_reformat(entry, caret, len(raw), len(formatted))
-
-    return _format
+# Хелперы каретки и телефона (restore_caret_after_reformat /
+# make_phone_formatter) вынесены в app_common.py (M1 миграции Tk → PySide6)
+# и реэкспортируются в шапке.
 
 
 # ---------- Числа прописью (RU) ----------
@@ -363,11 +254,10 @@ class _RootHolder:
 ROOT_HOLDER = _RootHolder()
 
 # ---------- Параметры разметки ----------
-ENTRY_WIDTH = 300
-SHORT_WIDTH = 150
+# ENTRY_WIDTH / SHORT_WIDTH / LEFT_PANEL_WIDTH — в app_common.py (M1),
+# реэкспортируются в шапке; здесь — геометрия окна Tk-сборки.
 DAY_WIDTH = 56
 MONTH_WIDTH = 146
-LEFT_PANEL_WIDTH = 400
 SIDEBAR_WIDTH = 210
 BASE_WIDTH = 1280
 BASE_HEIGHT = 740

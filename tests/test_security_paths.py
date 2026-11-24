@@ -81,9 +81,11 @@ def test_fit_document_path_long_dir_raises(tmp_path):
 # ---------- Allowlist импорта ----------
 
 def test_import_allowlist_is_docx_xlsx_only():
-    import main  # константа allowlist живёт рядом с диалогом импорта
+    # Канонический источник allowlist — import_controller (M1: тесты берут
+    # константы напрямую из модулей-источников, не через main).
+    import import_controller
 
-    assert main.IMPORT_ALLOWED_EXTENSIONS == {".docx", ".xlsx"}
+    assert import_controller.ALLOWED_EXTENSIONS == {".docx", ".xlsx"}
 
 
 def test_doc_extension_rejected_by_importer(tmp_path):

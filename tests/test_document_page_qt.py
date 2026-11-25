@@ -79,6 +79,8 @@ def controller(qapp, appdata, stub_dialogs, monkeypatch):
     ctrl.window.show()
     qapp.processEvents()
     yield ctrl
+    ctrl.startup_flow.stop()
+    ctrl.stop_poll_timer("startup_tick")
     ctrl._stop_timers()
     for flow in (ctrl.spec_flow, ctrl.contract_flow, ctrl.additional_flow):
         if getattr(flow, "preview_timer", None) is not None:

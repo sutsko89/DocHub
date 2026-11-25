@@ -158,8 +158,9 @@ def test_placeholder_pages_remaining(controller):
     for key, _title, stage in main_qt.NAV_PAGES:
         page = controller.pages[key]
         texts = [label.text() for label in page.findChildren(QLabel)]
-        if key in ("spec", "counterparty", "registry", "contract", "additional"):
-            # живые страницы M3/M4/M5/M6-a
+        if key in ("spec", "counterparty", "registry", "contract", "additional",
+                   "settings"):
+            # живые страницы M3/M4/M5/M6
             assert not any("в разработке" in text for text in texts), key
         else:
             assert any("в разработке" in text for text in texts), key

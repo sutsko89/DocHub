@@ -65,6 +65,7 @@ import perflog
 import qt_dialogs
 import qt_theme
 import registry_page_qt
+import settings_page_qt
 import shell_open
 import single_instance
 import startup_qt
@@ -212,6 +213,10 @@ class AppController:
         # Автокопия реестра при запуске (BKUP-1): прежняя точка запуска Tk
         # (root.after(400)); отказ копирования старт не блокирует.
         QTimer.singleShot(400, self._create_startup_backup)
+
+        # Живая страница M6: «Настройки» — Qt-аналог Tk _settings_flow.
+        # После каркаса: страница читает текущую тему и состояние копий.
+        self.settings_flow = settings_page_qt.SettingsPageController(self)
 
         # Ctrl+S — сохранение формы текущей страницы (п. 4.4, Tk-контракт).
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self.window)
@@ -587,12 +592,14 @@ class AppController:
         if settings_flow is not None:
             settings_flow.update_backup_status(result)
 
-    def save_setting(self, key: str, value) -> None:
+    def save_setting(self, key: str, value) -> bool:
         """Сохранение настройки профиля (Tk ContractApp.save_setting).
 
         Атомарная запись settings.json (app_common.write_settings) — тот
         же файл, что у Tk-сборки; отказ записи сообщается алертом,
-        значение в сеансе остаётся применённым.
+        значение в сеансе остаётся применённым. Возвращает результат
+        записи (Tk _persist_settings): вызывающая страница решает,
+        показывать ли success-сообщение.
         """
         self._settings[key] = value
         if not app_common.write_settings(self._settings):
@@ -601,6 +608,8 @@ class AppController:
                 f"Не удалось записать файл:\n{app_common.settings_path()}",
                 "error",
             )
+            return False
+        return True
 
     def _on_save_shortcut(self) -> None:
         self.save_current_page()

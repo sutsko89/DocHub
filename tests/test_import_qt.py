@@ -107,6 +107,8 @@ def controller(qapp, appdata, stub_dialogs, monkeypatch, tmp_path):
     ctrl.window.show()
     qapp.processEvents()
     yield ctrl
+    ctrl.startup_flow.stop()
+    ctrl.stop_poll_timer("startup_tick")
     ctrl._stop_timers()
     ctrl.stop_poll_timer("import_tick")
     for flow in (ctrl.spec_flow, ctrl.contract_flow, ctrl.additional_flow):

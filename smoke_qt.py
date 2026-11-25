@@ -717,6 +717,145 @@ check(len(_ticks_m6) >= 2,
       f"M6: таймеры каркаса отзывчивы после полного маршрута ({len(_ticks_m6)} тиков)")
 ctrl.stop_poll_timer("m6_probe")
 
+# --- Обновления (Г #17, M7): карточка «Обновлений», флейвор-ассеты ---
+# Сеть заглушена env (EWDOCHUB_NO_UPDATE_CHECK=1 в шапке файла) —
+# проверяются только разбор версий/ответа GitHub, выбор ассета по
+# флейвору (И.2) и виджеты страницы; сетевые функции не вызываются.
+import hashlib as _hashlib
+import queue as _queue
+import shutil as _shutil
+import tempfile as _tempfile
+import threading as _threading
+
+import updater as _upd
+
+check(hasattr(ctrl, "_update_check_button")
+      and hasattr(ctrl, "_update_status_label"),
+      "M7/Г#17: на «Настройках» есть кнопка проверки обновлений и статус версии")
+check(str(app_common.APP_VERSION) in ctrl._update_status_label.text()
+      and ctrl._update_status_label.text().endswith("-qt"),
+      f"M7/Г#17: статус показывает версию с суффиксом флейвора "
+      f"{app_common.APP_VERSION}-qt")
+check(ctrl.settings_flow._update_auto_checkbox.isChecked() is True,
+      "M7/Г#17: авто-проверка обновлений включена по умолчанию")
+check(ctrl.update_flow.busy is False and ctrl.update_flow.result_queue is None,
+      "M7/Г#17: глушилка EWDOCHUB_NO_UPDATE_CHECK отключила автопроверку при старте")
+check(_upd.parse_version("v2.16.0") == (2, 16, 0)
+      and _upd.is_newer("2.15", "2.15.0") is False
+      and _upd.is_newer("2.16.0", "2.15.0") is True,
+      "M7/Г#17: сравнение версий — v-префикс и выравнивание длины")
+check(_upd.parse_release_payload({"tag_name": "v1.0", "draft": True}) is None
+      and _upd.parse_release_payload({"tag_name": ""}) is None,
+      "M7/Г#17: draft-релиз и ответ без тега не считаются релизом")
+_upd_rel = _upd.parse_release_payload({
+    "tag_name": "v2.29.0",
+    "html_url": "https://example.com/release/v2.29.0",
+    "assets": [
+        {"name": "EW.DocHub-2.29.0-setup.exe",
+         "browser_download_url": "https://example.com/EW.DocHub-2.29.0-setup.exe"},
+        {"name": "EW.DocHub-2.29.0-qt-setup.exe",
+         "browser_download_url": "https://example.com/EW.DocHub-2.29.0-qt-setup.exe"},
+    ],
+})
+check(_upd_rel is not None and _upd_rel["version_str"] == "2.29.0"
+      and _upd_rel["installers"]["qt"]["name"] == "EW.DocHub-2.29.0-qt-setup.exe",
+      "M7/Г#17: из ответа GitHub извлекаются ассеты обоих флейворов")
+check(_upd.installer_asset_for_flavor(_upd_rel, "qt")["url"]
+      .endswith("2.29.0-qt-setup.exe")
+      and _upd.installer_asset_for_flavor(_upd_rel, "tk")["url"]
+      .endswith("2.29.0-setup.exe"),
+      "M7/Г#17: ассет выбирается по флейвору сборки (И.2)")
+_qt_only = _upd.parse_release_payload({
+    "tag_name": "v2.29.0",
+    "assets": [{"name": "EW.DocHub-2.29.0-qt-setup.exe",
+                "browser_download_url": "https://example.com/EW.DocHub-2.29.0-qt-setup.exe"}],
+})
+check(_upd.installer_asset_for_flavor(_qt_only, "tk") == {},
+      "M7/Г#17: чужой флейвор не скачивается (чужой ассет недоступен)")
+
+_upd_settings: dict = {}
+_upd.mark_checked(_upd_settings)
+check(not _upd.auto_check_due(_upd_settings),
+      "M7/Г#17: суточный троттлинг — сразу после проверки автопроверка не нужна")
+check(_upd.check_enabled() is False,
+      "M7/Г#17: check_enabled() видит env-глушку smoke-прогона")
+
+# 2.18.0 (Tk-контракт): подтверждение → снимок реестра → тихий запуск
+# установщика; приложение закрывается штатно (call_later(500)).
+_inst_dir = os.path.join(_tempfile.gettempdir(), "EW.DocHub-smoke")
+os.makedirs(_inst_dir, exist_ok=True)
+_inst_path = os.path.join(_inst_dir, "EW.DocHub-2.29.0-qt-smoke-setup.exe")
+with open(_inst_path, "wb") as _f:
+    _f.write(b"setup-payload")
+_smoke_launch: list = []
+_orig_run = _upd.run_installer_command
+_upd.run_installer_command = lambda path: _smoke_launch.append(path)
+_smoke_closes: list = []
+_orig_call_later = ctrl.call_later
+ctrl.call_later = lambda ms, cb: _smoke_closes.append((ms, cb))
+_upd_flow = ctrl.update_flow
+_upd_flow.run_installer(_inst_path)
+_upd.run_installer_command = _orig_run
+ctrl.call_later = _orig_call_later
+check(_smoke_launch == [_inst_path],
+      "M7/Г#17: установщик запускается после подтверждения (run_installer)")
+check(bool(_smoke_closes) and _smoke_closes[0][0] == 500,
+      "M7/Г#17: закрытие приложения откладывается на 500 мс после запуска")
+
+# 2.18.0 (Tk-контракт): рабочий поток скачивания отдаёт progress/phase/done
+# при корректной сумме — сетевые функции подменены, потока нет (синхронно).
+_rel = {"installer_name": "EW.DocHub-2.29.0-qt-smoke-setup.exe",
+        "sums_url": "https://github.com/x/SHA256SUMS.txt"}
+_digest = _hashlib.sha256(b"setup-payload").hexdigest()
+_q = _queue.Queue()
+_orig_dl = _upd.download_file
+_orig_ft = _upd.fetch_text
+
+
+def _fake_download(url, dest, **kwargs):
+    # Стаб без сети: настоящий download_file создаёт каталог назначения
+    # и отчитывается прогрессом — стаб повторяет оба контракта.
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    _cb = kwargs.get("progress_cb")
+    if callable(_cb):
+        _cb(0, len(b"setup-payload"))
+        _cb(len(b"setup-payload"), len(b"setup-payload"))
+    return _shutil.copy(_inst_path, dest)
+
+
+_upd.download_file = _fake_download
+_upd.fetch_text = lambda url: f"{_digest}  {_rel['installer_name']}"
+_upd_flow._download_worker(
+    _rel, "https://x/setup.exe", "EW.DocHub-2.29.0-qt-smoke-setup.exe",
+    _threading.Event(), _q)
+_upd.download_file = _orig_dl
+_upd.fetch_text = _orig_ft
+_kinds = []
+while not _q.empty():
+    _kinds.append(_q.get_nowait())
+check(any(item[0] == "progress" for item in _kinds),
+      "M7/Г#17: рабочий поток отчитывается событиями прогресса")
+check(any(item[0] == "phase" for item in _kinds),
+      "M7/Г#17: после скачивания идёт фаза проверки целостности")
+check(any(item[0] == "done" for item in _kinds),
+      "M7/Г#17: скачивание и проверка SHA-256 завершаются успехом")
+
+# Окно скачивания: прогресс в МБ, закрытие окна = отмена (Tk-контракт
+# WM_DELETE_WINDOW → cancel_download).
+ctrl.update_flow.download_queue = _queue.Queue()
+ctrl.update_flow.cancel_event = _threading.Event()
+ctrl.update_flow._build_progress_window(
+    {"version_str": "2.29.0", "tag": "v2.29.0"})
+check(ctrl.update_flow.download_window is not None
+      and ctrl.update_flow.download_window.isVisible(),
+      "M7/Г#17: окно скачивания с прогрессом открыто")
+ctrl.update_flow.download_window.set_progress(1024 * 1024, 20 * 1024 * 1024)
+check("МБ" in ctrl.update_flow.download_window.status_label.text(),
+      "M7/Г#17: прогресс скачивания отображается в МБ")
+ctrl.update_flow.download_window.close()
+check(ctrl.update_flow.cancel_event.is_set(),
+      "M7/Г#17: закрытие окна скачивания = отмена загрузки")
+
 
 # ---------- Сводка ----------
 try:

@@ -14,12 +14,20 @@
 * 2.18.0 — автообновление: ``download_file`` (потоковое скачивание
   установщика с прогрессом и отменой), ``fetch_text``/``match_sums_line``
   (SHA256SUMS.txt) и ``verify_sha256`` (контроль целостности перед
-  запуском установщика).
+  запуском установщика);
+* M7 (И.2 плана миграции) — выбор ассета релиза по флейвору сборки:
+  рядом с Tk-ассетом (``*-setup.exe`` без суффикса — историческое имя)
+  в релизе лежит Qt-ассет (``*-qt-setup.exe``); ``parse_release_payload``
+  разбирает оба, ``installer_asset_for_flavor`` отдаёт свой;
+  ``run_installer_command`` — тихий запуск установщика Inno Setup
+  (переехал из updater_controller.py: GUI-free модуль нужен и Qt-сборке,
+  у которой стек Tk исключён из поставки).
 
-Оркестрация с очередью и опросом из главного потока Tk — в
-updater_controller.py (паттерн dadata_controller: рабочий поток не трогает
-Tk). Модуль не импортирует main — APP_VERSION передаётся аргументом,
-поэтому верхнеуровневый импорт updater.py безопасен из любого модуля.
+Оркестрация с очередью и опросом из главного потока GUI — в
+updater_controller.py (Tk) и updater_qt.py (Qt, этап M7): рабочий поток
+не трогает интерфейс. Модуль не импортирует main — APP_VERSION передаётся
+аргументом, поэтому верхнеуровневый импорт updater.py безопасен из любого
+модуля.
 
 Отключение проверки (приватность, offline-среды, тесты): переменная
 окружения ``EWDOCHUB_NO_UPDATE_CHECK=1`` — приоритетнее всех настроек;
@@ -34,6 +42,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -58,6 +68,17 @@ SETTINGS_KEY_AUTO = "auto_update_check"
 # Скачивание установщика (2.18.0): размер порции и имя ассета-сумм.
 CHUNK_SIZE = 256 * 1024
 SUMS_ASSET_NAME = "sha256sums.txt"
+
+# И.2 (M7): суффиксы флейворов в имени ассета-установщика. Tk-сборка
+# исторически без суффикса («EW.DocHub-2.28.2-setup.exe»), Qt-сборка —
+# «EW.DocHub-2.28.2-qt-setup.exe». Сравнение версий — только по числовой
+# части тега: Qt-сборка не «новее» Tk той же версии (parse_version/is_newer
+# без изменений). Формат SHA256SUMS.txt (два пробела, hex64 + имя) не меняется.
+TK_SETUP_SUFFIX = "-setup.exe"
+QT_SETUP_SUFFIX = "-qt-setup.exe"
+# Тег флейвора → суффикс имени ассета (единственный источник знания об
+# именах: и release.yml, и installer_qt.iss собирают ассеты по этому правилу).
+FLAVOR_SETUP_SUFFIX = {"tk": TK_SETUP_SUFFIX, "qt": QT_SETUP_SUFFIX}
 
 # SEC-1 (D11): канал обновлений ходит только на хосты GitHub. Ссылки
 # ассетов приходят из JSON релиза — компрометация релиза/перенаправление
@@ -195,8 +216,10 @@ def parse_release_payload(payload: object) -> dict | None:
 
     Возвращает None для несловарного ответа, draft-релиза и ответа без
     тега (например, если релизов ещё нет — GitHub вернёт 404, это ловится
-    выше). ``installer_url`` — ссылка на ``*-setup.exe`` из ассетов, если
-    установщик уже выложен.
+    выше). ``installer_url``/``installer_name`` — Tk-ассет, если он
+    выложен (контракт 2.18.0, Tk-контроллер читает напрямую);
+    ``installers`` — карта «флейвор → {url, name}» для выбора ассета
+    своего флейвора (И.2, M7): чужой флейвор через неё не достать.
     """
     if not isinstance(payload, dict):
         return None
@@ -212,13 +235,21 @@ def parse_release_payload(payload: object) -> dict | None:
     ]
     installer_url = ""
     sums_url = ""
+    # И.2 (M7): установщики по флейворам. Один проход по ассетам;
+    # дубликат ассета того же флейвора не перезаписывает первый.
+    installers: dict[str, dict] = {}
     for asset in assets:
         name = str(asset.get("name") or "").strip()
         lowered = name.lower()
-        if lowered.endswith("-setup.exe"):
-            installer_url = str(asset.get("browser_download_url") or "")
+        flavor = parse_installer_name(lowered)
+        if flavor is not None:
+            asset_url = str(asset.get("browser_download_url") or "")
+            if flavor not in installers:
+                installers[flavor] = {"url": asset_url, "name": name}
         elif lowered == SUMS_ASSET_NAME:
             sums_url = str(asset.get("browser_download_url") or "")
+    tk_asset = installers.get("tk") or {}
+    installer_url = tk_asset.get("url", "")
     return {
         "tag": tag,
         "version": version,
@@ -230,7 +261,40 @@ def parse_release_payload(payload: object) -> dict | None:
         "sums_url": sums_url,
         "installer_name": os.path.basename(installer_url.split("?")[0])
         if installer_url else "",
+        "installers": installers,
     }
+
+
+def parse_installer_name(name: str) -> str | None:
+    """Флейвор по имени ассета: «*-qt-setup.exe» → «qt», «*-setup.exe» → «tk».
+
+    Tk-суффикс исторически без маркера флейвора, поэтому сначала
+    проверяется более длинный Qt-суффикс: строка, оканчивающаяся на
+    «-qt-setup.exe», — Qt-ассет, а не Tk. Не-установщик (SHA256SUMS.txt,
+    исходники) → None.
+    """
+    lowered = str(name or "").strip().lower()
+    if lowered.endswith(QT_SETUP_SUFFIX):
+        return "qt"
+    if lowered.endswith(TK_SETUP_SUFFIX):
+        return "tk"
+    return None
+
+
+def installer_asset_for_flavor(release: dict, flavor: str) -> dict:
+    """Ассет СВОЕГО флейвора из разобранного релиза: {"url", "name"} | {}.
+
+    Критерий M7: чужой флейвор не скачивается — Qt-сборка при отсутствии
+    Qt-ассета получает пустой словарь (диалог «установщик ещё не выложен»
+    со ссылкой на страницу), а не Tk-установщик; и наоборот.
+    """
+    assets = (release or {}).get("installers")
+    if not isinstance(assets, dict):
+        return {}
+    asset = assets.get(str(flavor or ""))
+    if not isinstance(asset, dict) or not str(asset.get("url") or ""):
+        return {}
+    return {"url": str(asset["url"]), "name": str(asset.get("name") or "")}
 
 
 def human_error(exc: Exception) -> str:
@@ -422,3 +486,34 @@ def verify_sha256(path: str, expected_hex: str) -> bool:
         for chunk in iter(lambda: source.read(CHUNK_SIZE), b""):
             digest.update(chunk)
     return digest.hexdigest() == expected
+
+
+def run_installer_command(path: str) -> None:
+    """Стартует установщик Inno Setup в тихом режиме (M7: GUI-free ядро).
+
+    /VERYSILENT — без вопросов (обновление в ту же папку, профиль в
+    %APPDATA% не трогается); /NORESTART — без перезагрузки;
+    /SUPPRESSMSGBOXES и /FORCECLOSEAPPLICATIONS — тихо закрывают
+    запущенную программу, если она не успела выйти (все данные
+    сохраняются сразу при изменениях, риск минимальный); после установки
+    приложение перезапускается само ([Run] skipifnotsilent). На других ОС
+    функция не запускается (обновление — Windows-сценарий).
+
+    Функция живёт в ядре (переехала из updater_controller.py в M7):
+    updater_controller переэкспортирует имя для обратной совместимости
+    тестов/smoke, updater_qt вызывает напрямую — стек Tk в Qt-сборке
+    исключён, импорт Tk-контроллера из неё невозможен.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Установщик не найден: {path}")
+    if not sys.platform.startswith("win"):
+        raise OSError("Автообновление доступно только в Windows.")
+    # creationflags: DETACHED_PROCESS — установщик живёт после закрытия
+    # приложения; без консольного окна.
+    detached = getattr(subprocess, "DETACHED_PROCESS", 0)
+    subprocess.Popen(
+        [path, "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES",
+         "/FORCECLOSEAPPLICATIONS"],
+        close_fds=True,
+        creationflags=detached,
+    )

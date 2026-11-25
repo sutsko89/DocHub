@@ -18,14 +18,16 @@ DaData (сохранённый ключ не подставляется в по�
   (dadata.save_api_key — DPAPI на Windows); сохранённый ключ НЕ
   подставляется в поле; удаление — с подтверждением (деструктивное, U7);
 * состояние копий реестра — storage.backup_status_text; папка копий
-  создаётся при открытии, если копий ещё не было.
+  создаётся при открытии, если копий ещё не было;
+* карточка «Обновления» (2.15.0, этап M7): статус версии с суффиксом
+  флейвора («2.28.2-qt»), кнопка «Проверить обновления» (guard в
+  UpdateControllerQt) и переключатель тихой автопроверки при старте
+  (раз в сутки, хранится в settings.json).
 
 Отличия от Tk-сборки (docs/qt-migration-stage-notes.md): переключатель
-темы — пара радиокнопок вместо самописного ThemeToggle; карточка
-«Обновления» появится вместе с UI обновлений (этап M7 — оркестрация
-updater_controller на QTimer); окно правки констант спецификации
-отсутствует в обеих сборках — константы задаются settings.json
-(app_common.get_spec_settings, M1).
+темы — пара радиокнопок вместо самописного ThemeToggle; окно правки
+констант спецификации отсутствует в обеих сборках — константы задаются
+settings.json (app_common.get_spec_settings, M1).
 """
 
 from __future__ import annotations
@@ -33,8 +35,8 @@ from __future__ import annotations
 import os
 
 from PySide6.QtWidgets import (
-    QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QRadioButton, QScrollArea, QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QLineEdit, QPushButton, QRadioButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 import applog
@@ -43,6 +45,7 @@ import qt_theme
 import services
 import shell_open
 import storage
+import updater
 from settings_controller import HOTKEY_HINTS
 
 
@@ -177,6 +180,30 @@ class SettingsPageController:
         key_hint.setObjectName("fieldHint")
         key_hint.setWordWrap(True)
         card.grid.addWidget(key_hint)
+
+        # -- Обновления (2.15.0, этап M7) --------------------------------- #
+        # Текущая версия + кнопка «Проверить обновления» (ручная проверка,
+        # guard в UpdateControllerQt) + переключатель тихой автопроверки
+        # при старте (раз в сутки, хранится в settings.json). Атрибуты
+        # каркаса _update_check_button/_update_status_label — Tk-паритет
+        # имён: контроллер обновления блокирует кнопку и обновляет статус
+        # по ним, тесты/smoke ищут их на каркасе.
+        card = self._card("Обновления")
+        app._update_status_label = QLabel(app.update_flow.status_text(), card)
+        app._update_status_label.setObjectName("fieldHint")
+        app._update_status_label.setWordWrap(True)
+        card.grid.addWidget(app._update_status_label)
+        update_buttons = QHBoxLayout()
+        app._update_check_button = QPushButton("Проверить обновления", card)
+        app._update_check_button.clicked.connect(app.update_flow.check_now)
+        update_buttons.addWidget(app._update_check_button)
+        update_buttons.addStretch(1)
+        card.grid.addLayout(update_buttons)
+        self._update_auto_checkbox = QCheckBox("Проверять автоматически", card)
+        self._update_auto_checkbox.setChecked(
+            updater.auto_check_enabled(app.settings))
+        self._update_auto_checkbox.toggled.connect(self.toggle_auto_update_check)
+        card.grid.addWidget(self._update_auto_checkbox)
 
         # -- Копии реестра (BKUP-1) ---------------------------------------- #
         card = self._card("Копии реестра")
@@ -381,6 +408,18 @@ class SettingsPageController:
         self._dadata_key_status.setText(self.dadata_key_status_text())
         app.alert(app.window, "Ключ удалён",
                   "Ключ DaData удалён из профиля пользователя.", "success")
+
+    # ------------------------------------------------------------------ #
+    #  Обновления (2.15.0, этап M7)
+    # ------------------------------------------------------------------ #
+    def toggle_auto_update_check(self, checked: bool) -> None:
+        """Переключатель «Проверять автоматически»: сохраняется немедленно.
+
+        Tk-паритет (settings_controller.toggle_auto_update_check): ключ
+        settings.json ``auto_update_check``, запись — тот же маршрут
+        ``app.save_setting`` (атомарная app_common.write_settings).
+        """
+        self.app.save_setting(updater.SETTINGS_KEY_AUTO, bool(checked))
 
     # ------------------------------------------------------------------ #
     #  Копии реестра (BKUP-1) и диагностика

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import sys
 import threading
 import urllib.error
 from types import SimpleNamespace
@@ -781,7 +782,9 @@ def test_download_worker_cancelled(app, tmp_path, monkeypatch):
 def test_run_installer_command_requires_windows(app, tmp_path, monkeypatch):
     path = tmp_path / "setup.exe"
     path.write_bytes(b"MZ")
-    monkeypatch.setattr(ucc.sys, "platform", "linux")
+    # M7: проверка платформы переехала вместе с функцией в updater.py —
+    # цель подмены следует за реализацией (контракт «вне Windows отказ»).
+    monkeypatch.setattr(updater.sys, "platform", "linux")
     try:
         ucc.run_installer_command(str(path))
         raised = None
@@ -951,3 +954,137 @@ def test_download_tick_cancelled_stops_polling(app, ui_stubs):
     assert flow.download_queue is None
     assert ui_stubs["alerts"] == [] and ui_stubs["confirms"] == []
     assert scheduled == [], "терминальное событие не планирует новый опрос"
+
+
+# --------------------------------------------------------------------------- #
+#  Выбор ассета по флейвору (И.2 плана миграции, этап M7)
+# --------------------------------------------------------------------------- #
+def test_parse_installer_name_matrix():
+    """Имя ассета → флейвор: Qt-суффикс длиннее Tk, проверяется первым."""
+    assert updater.parse_installer_name("EW.DocHub-2.29.0-setup.exe") == "tk"
+    assert updater.parse_installer_name("EW.DocHub-2.29.0-qt-setup.exe") == "qt"
+    assert updater.parse_installer_name(
+        "ew.docHub-2.29.0-QT-SETUP.exe".lower()) == "qt"
+    assert updater.parse_installer_name("SHA256SUMS.txt") is None
+    assert updater.parse_installer_name("EW.DocHub-2.29.0.zip") is None
+    assert updater.parse_installer_name("") is None
+    assert updater.parse_installer_name(None) is None
+
+
+def test_parse_release_payload_collects_both_flavors():
+    """Оба ассета в одном релизе: карта installers полная, Tk-контракты целы."""
+    release = updater.parse_release_payload({
+        "tag_name": "v2.29.0",
+        "html_url": "https://github.com/x/tag/v2.29.0",
+        "assets": [
+            {"name": "EW.DocHub-2.29.0-setup.exe",
+             "browser_download_url": "https://github.com/x/EW.DocHub-2.29.0-setup.exe"},
+            {"name": "EW.DocHub-2.29.0-qt-setup.exe",
+             "browser_download_url": "https://github.com/x/EW.DocHub-2.29.0-qt-setup.exe"},
+            {"name": "SHA256SUMS.txt",
+             "browser_download_url": "https://github.com/x/SHA256SUMS.txt"},
+        ],
+    })
+    assert set(release["installers"]) == {"tk", "qt"}
+    assert release["installers"]["qt"]["name"] == "EW.DocHub-2.29.0-qt-setup.exe"
+    # Контракт 2.18.0: installer_url/installer_name — Tk-ассет (Tk-контроллер).
+    assert release["installer_url"].endswith("EW.DocHub-2.29.0-setup.exe")
+    assert release["installer_name"] == "EW.DocHub-2.29.0-setup.exe"
+    assert release["sums_url"].endswith("SHA256SUMS.txt")
+
+
+def test_parse_release_payload_qt_only_release_tk_gets_empty():
+    """Релиз только с Qt-ассетом: Tk-поле пусто — Tk-сборка идёт на страницу."""
+    release = updater.parse_release_payload({
+        "tag_name": "v2.29.0",
+        "assets": [
+            {"name": "EW.DocHub-2.29.0-qt-setup.exe",
+             "browser_download_url": "https://github.com/x/EW.DocHub-2.29.0-qt-setup.exe"},
+        ],
+    })
+    assert release["installer_url"] == "" and release["installer_name"] == ""
+    assert set(release["installers"]) == {"qt"}
+
+
+def test_installer_asset_for_flavor_returns_own_asset():
+    release = updater.parse_release_payload({
+        "tag_name": "v2.29.0",
+        "assets": [
+            {"name": "EW.DocHub-2.29.0-setup.exe",
+             "browser_download_url": "https://github.com/x/EW.DocHub-2.29.0-setup.exe"},
+            {"name": "EW.DocHub-2.29.0-qt-setup.exe",
+             "browser_download_url": "https://github.com/x/EW.DocHub-2.29.0-qt-setup.exe"},
+        ],
+    })
+    assert updater.installer_asset_for_flavor(release, "qt")["url"] \
+        .endswith("EW.DocHub-2.29.0-qt-setup.exe")
+    assert updater.installer_asset_for_flavor(release, "tk")["url"] \
+        .endswith("EW.DocHub-2.29.0-setup.exe")
+
+
+def test_installer_asset_for_flavor_never_returns_foreign():
+    """Критерий M7: чужой флейвор не скачивается.
+
+    Qt-сборка при отсутствии Qt-ассета получает пустой словарь
+    (диалог «установщик ещё не выложен»), а НЕ Tk-установщик; и наоборот.
+    """
+    qt_only = updater.parse_release_payload({
+        "tag_name": "v2.29.0",
+        "assets": [{"name": "EW.DocHub-2.29.0-qt-setup.exe",
+                    "browser_download_url": "https://github.com/x/qt-setup.exe"}],
+    })
+    assert updater.installer_asset_for_flavor(qt_only, "qt") != {}
+    assert updater.installer_asset_for_flavor(qt_only, "tk") == {}
+    tk_only = updater.parse_release_payload({
+        "tag_name": "v2.28.2",
+        "assets": [{"name": "EW.DocHub-2.28.2-setup.exe",
+                    "browser_download_url": "https://github.com/x/tk-setup.exe"}],
+    })
+    assert updater.installer_asset_for_flavor(tk_only, "tk") != {}
+    assert updater.installer_asset_for_flavor(tk_only, "qt") == {}
+
+
+def test_installer_asset_for_flavor_bad_input_is_empty():
+    """Сломанный/неполный релиз — пустой результат, не исключение."""
+    assert updater.installer_asset_for_flavor({}, "qt") == {}
+    assert updater.installer_asset_for_flavor(None, "qt") == {}
+    assert updater.installer_asset_for_flavor({"installers": "мусор"}, "qt") == {}
+    assert updater.installer_asset_for_flavor({"installers": {"qt": {}}}, "qt") == {}
+    assert updater.installer_asset_for_flavor(
+        {"installers": {"qt": {"url": "", "name": "x"}}}, "qt") == {}
+
+
+def test_match_sums_line_finds_flavor_asset_by_name():
+    """SHA256SUMS.txt перечисляет оба ассета — выбор по точному имени файла.
+
+    Формат файла не меняется (запрет 4): match_sums_line ищет строку по
+    имени, флейвор-выбор делается на уровне ассета релиза.
+    """
+    sums = (
+        f"{'a' * 64}  EW.DocHub-2.29.0-setup.exe\n"
+        f"{'b' * 64}  EW.DocHub-2.29.0-qt-setup.exe\n"
+    )
+    assert updater.match_sums_line(
+        sums, "EW.DocHub-2.29.0-qt-setup.exe") == "b" * 64
+    assert updater.match_sums_line(
+        sums, "ew.docHub-2.29.0-qt-setup.exe") == "b" * 64
+    assert updater.match_sums_line(
+        sums, "EW.DocHub-2.29.0-setup.exe") == "a" * 64
+    assert updater.match_sums_line(
+        sums, "EW.DocHub-2.30.0-qt-setup.exe") == ""
+
+
+def test_run_installer_command_moved_to_core(tmp_path):
+    """M7: реализация в GUI-free ядре; Tk-контроллер делегирует имя."""
+    import updater_controller as ucc
+
+    assert ucc.run_installer_command is not None
+    # Отсутствующий файл — та же ошибка, что и до переезда (Tk-контракт).
+    with pytest.raises(FileNotFoundError):
+        updater.run_installer_command(str(tmp_path / "nope.exe"))
+    with pytest.raises(FileNotFoundError):
+        ucc.run_installer_command(str(tmp_path / "nope.exe"))
+    # Не-Windows — честный отказ (обновление — Windows-сценарий).
+    if not sys.platform.startswith("win"):
+        with pytest.raises(OSError):
+            updater.run_installer_command(str(tmp_path / "setup.exe"))

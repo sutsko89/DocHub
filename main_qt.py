@@ -70,6 +70,7 @@ import shell_open
 import single_instance
 import startup_qt
 import storage
+import updater_qt
 from services import resource_path
 import spec_page_qt
 
@@ -213,6 +214,14 @@ class AppController:
         # Автокопия реестра при запуске (BKUP-1): прежняя точка запуска Tk
         # (root.after(400)); отказ копирования старт не блокирует.
         QTimer.singleShot(400, self._create_startup_backup)
+
+        # Проверка обновлений (M7, Г #17): создаётся ДО построения страниц —
+        # карточка «Обновления» на «Настройках» читает статус и подключает
+        # кнопку (Tk-контракт: UpdateController до страниц). Тихая
+        # автопроверка — стартовый таймер 2200 мс, как root.after(2200)
+        # в Tk; env-глушилка EWDOCHUB_NO_UPDATE_CHECK приоритетнее.
+        self.update_flow = updater_qt.UpdateControllerQt(self)
+        QTimer.singleShot(2200, self.update_flow.maybe_auto_check)
 
         # Живая страница M6: «Настройки» — Qt-аналог Tk _settings_flow.
         # После каркаса: страница читает текущую тему и состояние копий.

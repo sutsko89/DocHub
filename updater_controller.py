@@ -41,8 +41,6 @@ import app_common
 import applog
 import os
 import queue
-import subprocess
-import sys
 import threading
 import webbrowser
 from typing import Any
@@ -533,26 +531,12 @@ class UpdateController:
 
 
 def run_installer_command(path: str) -> None:
-    """Стартует установщик Inno Setup в тихом режиме (модульная для тестов).
+    """Запускает setup.exe в тихом режиме (модульная для тестов).
 
-    /VERYSILENT — без вопросов (обновление в ту же папку, профиль в
-    %APPDATA% не трогается); /NORESTART — без перезагрузки;
-    /SUPPRESSMSGBOXES и /FORCECLOSEAPPLICATIONS — тихо закрывают
-    запущенную программу, если она не успела выйти (все данные
-    сохраняются сразу при изменениях, риск минимальный); после установки
-    приложение перезапускается само ([Run] skipifnotsilent). На других ОС
-    функция не запускается (обновление — Windows-сценарий).
+    M7: реализация переехала в GUI-free updater.run_installer_command —
+    Qt-сборка исключает стек Tk, но тот же запуск установщика нужен и ей
+    (updater_qt). Делегирование сохраняет контракт: smoke-тест и
+    test_updater подменяют именно этот модульный атрибут, вызов из
+    UpdateController идёт через имя модуля в момент вызова.
     """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Установщик не найден: {path}")
-    if not sys.platform.startswith("win"):
-        raise OSError("Автообновление доступно только в Windows.")
-    # creationflags: DETACHED_PROCESS — установщик живёт после закрытия
-    # приложения; без консольного окна.
-    detached = getattr(subprocess, "DETACHED_PROCESS", 0)
-    subprocess.Popen(
-        [path, "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES",
-         "/FORCECLOSEAPPLICATIONS"],
-        close_fds=True,
-        creationflags=detached,
-    )
+    updater.run_installer_command(path)

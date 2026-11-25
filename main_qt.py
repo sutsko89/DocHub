@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 # Linux/macOS без дисплея: платформа offscreen до создания QApplication.
 # На Windows ничего не переопределяется — там каркас идёт с нативной рамкой.
@@ -66,6 +67,7 @@ import qt_theme
 import registry_page_qt
 import shell_open
 import single_instance
+import startup_qt
 import storage
 from services import resource_path
 import spec_page_qt
@@ -201,6 +203,15 @@ class AppController:
         # Tk _import_flow; точка входа — кнопка на странице реестра
         # и перетаскивание файлов в окно (п. 4.5).
         self.import_flow = import_qt.ImportFlowQt(self)
+
+        # Стартовые дисковые задачи (M6, START-1): сверка папки, очистки
+        # и сбор сроков — в рабочем потоке; результаты применяются
+        # в главном потоке (очередь + tick). Запускается после построения.
+        self.startup_flow = startup_qt.StartupFlowQt(self)
+        self.startup_flow.run(include_notice=self._expiry_notice_due())
+        # Автокопия реестра при запуске (BKUP-1): прежняя точка запуска Tk
+        # (root.after(400)); отказ копирования старт не блокирует.
+        QTimer.singleShot(400, self._create_startup_backup)
 
         # Ctrl+S — сохранение формы текущей страницы (п. 4.4, Tk-контракт).
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self.window)
@@ -485,6 +496,97 @@ class AppController:
             return
         self.import_flow.start([str(path) for path in paths])
 
+    # ------------------------------------------------------------------ #
+    #  Стартовые задачи (START-1): TRASH-WARN, сверка, сроки (2.18.0)
+    # ------------------------------------------------------------------ #
+    def _expiry_notice_due(self) -> bool:
+        """Суточный гейт уведомления о сроках: пора ли напоминать (START-1)."""
+        last = self._settings.get(startup_qt.EXPIRY_NOTICE_SETTINGS_KEY)
+        return not (
+            isinstance(last, (int, float))
+            and (time.time() - float(last)) < startup_qt.EXPIRY_NOTICE_INTERVAL
+        )
+
+    def apply_expiry_notice(self, text: "str | None") -> None:
+        """Применяет результат фонового сбора сроков (START-1, 2.18.0).
+
+        Просроченные и истекающие соглашения показываются одним диалогом
+        с переходом в реестр; отметка «показано» пишется только когда
+        диалог действительно показывается. Тишина, когда тревожить не о чем.
+        """
+        if not text:
+            return
+        self._settings[startup_qt.EXPIRY_NOTICE_SETTINGS_KEY] = time.time()
+        if not app_common.write_settings(self._settings):
+            self.log.warning("Не удалось записать отметку уведомления о сроках")
+        choice = self.choice(
+            self.window, "Сроки действия доп. соглашений", text,
+            [
+                ("later", "Позже", False),
+                ("registry", "Открыть реестр", True),
+            ],
+        )
+        if choice == "registry":
+            self.select_page("registry")
+
+    def cleanup_expired_trash(self, planned: "int | None" = None) -> None:
+        """Физически удаляет записи, пролежавшие в корзине дольше срока.
+
+        TRASH-WARN (этап 2): корзина не удаляет записи молча. Перед
+        очисткой — сводка «будет удалено N записей» в журнале, после —
+        итог в статусе и немодальном уведомлении; при пустой сводке
+        очистка не запускается. START-1: план подсчитан в рабочем потоке
+        и приходит параметром (мутация реестра — только главный поток);
+        без параметра план считается на месте (ручные вызовы и тесты).
+        """
+        if planned is None:
+            try:
+                planned = self.store.count_expired_trash()
+            except Exception as exc:  # noqa: BLE001 — фоновая задача не должна падать
+                self.log.warning(
+                    "Подсчёт корзины перед автоочисткой не удался: %s",
+                    type(exc).__name__,
+                )
+                return
+        if not planned:
+            return  # удалять нечего — никаких действий и сообщений
+        # Сводка ДО удаления (критерий карточки TRASH-WARN).
+        self.log.warning(
+            "Автоочистка корзины: будет удалено %d записей, пролежавших "
+            "в корзине дольше %d дн.", planned, storage.TRASH_RETENTION_DAYS,
+        )
+        try:
+            removed = self.store.cleanup_trash()
+        except Exception as exc:  # noqa: BLE001 — фоновая задача не должна падать
+            self.log.warning("Автоочистка корзины не удалась: %s", type(exc).__name__)
+            return
+        if removed:
+            if getattr(self, "registry_flow", None) is not None:
+                self.registry_flow.refresh()
+            self.refresh_status()
+            self.notify(
+                f"Автоочистка корзины: удалено {removed} записей, "
+                f"пролежавших в корзине дольше {storage.TRASH_RETENTION_DAYS} дн."
+            )
+
+    def _create_startup_backup(self) -> None:
+        """Автокопия реестра при запуске (BKUP-1) — Tk-паритет main.py.
+
+        До 7 копий, только при изменениях с последней копии; состояние
+        показывается на странице «Настройки» (M6-d).
+        """
+        try:
+            with applog.timed("startup.backup", 500, "startup"):
+                result = storage.create_startup_backup(self.store, app_common.APP_VERSION)
+        except Exception as exc:  # noqa: BLE001 — стартовая задача не должна падать
+            self.log.warning("Автокопия реестра не удалась: %s", type(exc).__name__)
+            return
+        if result["status"] == "failed":
+            self.log.warning("Автокопия реестра: %s", result["message"])
+        settings_flow = getattr(self, "settings_flow", None)
+        if settings_flow is not None:
+            settings_flow.update_backup_status(result)
+
     def save_setting(self, key: str, value) -> None:
         """Сохранение настройки профиля (Tk ContractApp.save_setting).
 
@@ -745,6 +847,10 @@ class AppController:
         if not self._confirm_close_dirty():
             event.ignore()
             return
+        # Стартовый воркер: флаг остановки — работник проверяет его между
+        # шагами и файлами (START-1); таймер опроса остановится ниже.
+        if getattr(self, "startup_flow", None) is not None:
+            self.startup_flow.stop()
         self._stop_timers()
         if self.spec_flow.preview_timer is not None:
             self.spec_flow.preview_timer.stop()

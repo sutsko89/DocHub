@@ -40,6 +40,8 @@ M5), колонки «Контрагент · Тип · ИНН · ID · Адре
 
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import (
     QAbstractTableModel, QItemSelectionModel, QModelIndex, QRectF, QTimer, Qt,
 )
@@ -52,9 +54,11 @@ from PySide6.QtWidgets import (
 import agreements
 import applog
 import qt_theme
+import reconcile
 import registry_core as rcore
 import storage
 from document_builder import F, digits_only
+from services import safe_filename
 from registry_core import (
     DOC_COLUMNS,
     PARTY_COLUMNS,
@@ -473,6 +477,9 @@ class RegistryPageController:
             (app.settings or {}).get("registry_sort", "added"))
         if self._registry_sort not in SORT_LABEL_BY_VALUE:
             self._registry_sort = "added"
+        # Файлы вне реестра (DEF-3): заполняется сверкой START-1 (M6) —
+        # баннер с кнопкой «Разобрать» показывается при непустом списке.
+        self._orphans: list = []
 
         self._build_page()
 
@@ -1168,11 +1175,11 @@ class RegistryPageController:
             pass  # страница могла быть разрушена
 
     def _update_banners(self) -> None:
-        """Баннер сроков доп. соглашений над списком (2.18.0).
+        """Баннеры сроков и файлов вне реестра над списком (2.18.0 / 2.4).
 
-        Перестраивается при каждом обновлении: 0–1 компактный фрейм;
-        баннер файлов вне реестра появится вместе со сверкой (M6,
-        START-1 — в Qt-сборке сверки ещё нет, ``_orphans`` пуст).
+        Перестраиваются при каждом обновлении: 0–2 компактных фрейма;
+        баннер сирот появляется после сверки START-1 (M6) или ручного
+        скана (open_reconcile_dialog).
         """
         layout = self._banners_layout
         while layout.count():
@@ -1183,21 +1190,160 @@ class RegistryPageController:
         try:
             buckets = agreements.collect(self.app.store)
         except Exception:
-            return
+            buckets = {"expired": [], "soon": []}
         expired, soon = buckets["expired"], buckets["soon"]
-        if not expired and not soon:
+        if expired or soon:
+            lines: list[str] = []
+            if expired:
+                lines.append(f"Просрочено доп. соглашений: {len(expired)} — "
+                             "строки отмечены красным.")
+            if soon:
+                lines.append(f"Истекает в течение месяца: {len(soon)} — "
+                             "строки отмечены жёлтым.")
+            banner = QLabel("\n".join(lines), self._registry_banners)
+            banner.setObjectName("cardCaption")
+            banner.setWordWrap(True)
+            self._banners_layout.addWidget(banner)
+        self._render_orphans_banner()
+
+    def _render_orphans_banner(self) -> None:
+        """Баннер файлов вне реестра с кнопкой «Разобрать» (п. 2.4, DEF-3)."""
+        if not self._orphans:
             return
-        lines: list[str] = []
-        if expired:
-            lines.append(f"Просрочено доп. соглашений: {len(expired)} — "
-                         "строки отмечены красным.")
-        if soon:
-            lines.append(f"Истекает в течение месяца: {len(soon)} — "
-                         "строки отмечены жёлтым.")
-        banner = QLabel("\n".join(lines), self._registry_banners)
-        banner.setObjectName("cardCaption")
-        banner.setWordWrap(True)
-        self._banners_layout.addWidget(banner)
+        holder = QWidget(self._registry_banners)
+        holder_layout = QHBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        text = QLabel(
+            f"В папке документов найдено файлов вне реестра: {len(self._orphans)}.\n"
+            "Их можно восстановить в реестр или убрать в служебную папку _trash.",
+            holder,
+        )
+        text.setObjectName("cardCaption")
+        text.setWordWrap(True)
+        holder_layout.addWidget(text, 1)
+        parse_btn = QPushButton("Разобрать", holder)
+        parse_btn.clicked.connect(self.open_reconcile_dialog)
+        holder_layout.addWidget(parse_btn)
+        self._banners_layout.addWidget(holder)
+
+    # ------------------------------------------------------------------ #
+    #  Сверка реестра с папкой документов (п. 2.4, START-1, DEF-3)
+    # ------------------------------------------------------------------ #
+    def scan_consistency(self, orphans: "list[str] | None" = None) -> None:
+        """Сверка «реестр ↔ папка документов»: применяет результат (START-1).
+
+        ``orphans`` — готовый список файлов вне реестра из рабочего потока
+        (START-1); без него сверка выполняется на месте синхронно
+        (ручной вызов и тесты) через bulk-карту source_file (LAZY-1).
+        """
+        app = self.app
+        if orphans is None:
+            try:
+                base = self._documents_dir_for_scan()
+                orphans = reconcile.find_orphans(
+                    base, app.store, source_files=app.store.bulk_source_files(),
+                )
+            except Exception as exc:  # noqa: BLE001 — фоновая задача не должна падать
+                app.log.warning(
+                    "Сверка реестра с папкой не удалась: %s", type(exc).__name__,
+                )
+                return
+        else:
+            app.log.info("Сверка реестра с папкой выполнена в фоне")
+        self._orphans = orphans
+        if orphans:
+            app.log.info("Файлов вне реестра: %d", len(orphans))
+        self._update_banners()
+
+    def _documents_dir_for_scan(self) -> str:
+        """Папка документов без диалогов (ручная сверка и тесты)."""
+        custom = str((self.app.settings.get("documents_dir") or "")).strip()
+        if custom:
+            os.makedirs(custom, exist_ok=True)
+            return custom
+        import shell_open
+
+        base = os.path.join(shell_open.documents_known_folder(), "EW.DocHub")
+        os.makedirs(base, exist_ok=True)
+        return base
+
+    def open_reconcile_dialog(self) -> None:
+        """Диалог разбора файлов вне реестра: восстановить или убрать в _trash."""
+        app = self.app
+        base = self._documents_dir_for_scan()
+        orphans = reconcile.find_orphans(
+            base, app.store, source_files=app.store.bulk_source_files(),
+        )
+        self._orphans = orphans
+        if not orphans:
+            app.alert(
+                app.window, "Файлы вне реестра",
+                "Все файлы документов учтены в реестре.", "info",
+            )
+            self._update_banners()
+            return
+
+        preview = "\n".join(f"• {os.path.basename(path)}" for path in orphans[:8])
+        if len(orphans) > 8:
+            preview += f"\n• …и ещё {len(orphans) - 8}"
+        choice = app.choice(
+            app.window,
+            "Файлы вне реестра",
+            f"В папке документов найдено файлов вне реестра: {len(orphans)}.\n\n"
+            f"{preview}\n\n"
+            "«Восстановить» — создать записи реестра (тип документа и контрагент "
+            "определяются по имени файла и папки).\n"
+            "«В корзину» — перенести файлы в служебную папку _trash внутри папки "
+            "документов.",
+            [
+                ("skip", "Оставить", False),
+                ("trash", "В корзину", False),
+                ("restore", "Восстановить в реестр", True),
+            ],
+        )
+        if choice == "restore":
+            added = reconcile.restore_orphans(
+                app.store, base, orphans, safe_filename,
+            )
+            failed = len(orphans) - added
+            if app.store.last_error:
+                # D1: сбой финальной записи — честные счётчики «восстановлено /
+                # не восстановлено», а не молчаливый успех.
+                app.alert(
+                    app.window, "Восстановление не удалось",
+                    f"{app.store.last_error}\n\n"
+                    f"Восстановлено файлов: {added}, не восстановлено: {failed}.",
+                    "error",
+                )
+            else:
+                message = f"Добавлено записей в реестр: {added}."
+                if failed:
+                    message += (
+                        f"\nНе восстановлено файлов: {failed} "
+                        "(подробности в журнале)."
+                    )
+                message += "\n\nПроверьте типы документов и контрагентов в реестре."
+                app.alert(
+                    app.window, "Реестр восстановлен",
+                    message, "success",
+                )
+            self._orphans = reconcile.find_orphans(
+                base, app.store, source_files=app.store.bulk_source_files(),
+            )
+            app.refresh_after_party_change()
+            self.refresh()
+        elif choice == "trash":
+            moved = reconcile.move_orphans_to_trash(base, orphans)
+            app.alert(
+                app.window, "Файлы перемещены",
+                f"Перемещено файлов: {moved}.\n\n"
+                f"Папка: {os.path.join(base, reconcile.TRASH_DIR_NAME)}",
+                "info",
+            )
+            self._orphans = reconcile.find_orphans(
+                base, app.store, source_files=app.store.bulk_source_files(),
+            )
+            self.refresh()
 
     # ------------------------------------------------------------------ #
     #  Выделение и панель действий (V3)

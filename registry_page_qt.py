@@ -499,6 +499,12 @@ class RegistryPageController:
         self._registry_back_btn.setVisible(False)
         header_layout.addWidget(self._registry_back_btn)
         header_layout.addStretch(1)
+        # Импорт пакета (M6): точка входа Tk-реестра «Добавить документы…».
+        import_btn = QPushButton("Добавить документы…", header)
+        import_btn.clicked.connect(
+            lambda _checked=False: self.app.import_documents_dialog()
+        )
+        header_layout.addWidget(import_btn)
         refresh_btn = QPushButton("Обновить", header)
         refresh_btn.clicked.connect(lambda _checked=False: self.refresh())
         header_layout.addWidget(refresh_btn)

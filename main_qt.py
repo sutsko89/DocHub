@@ -48,8 +48,9 @@ if sys.platform != "win32" and not os.environ.get("DISPLAY"):
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMainWindow, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QMainWindow, QPushButton, QStackedWidget, QVBoxLayout,
+    QWidget,
 )
 
 import app_common
@@ -57,6 +58,7 @@ import applog
 import counterparty_page_qt
 import dadata_qt
 import document_page_qt
+import import_qt
 import lifecycle_qt
 import perflog
 import qt_dialogs
@@ -99,11 +101,31 @@ STORE_WARNING_DELAY_MS = 300  # алерт после построения ок�
 
 
 class MainWindow(QMainWindow):
-    """Главное окно со стандартной рамкой; closeEvent передаётся каркасу."""
+    """Главное окно со стандартной рамкой; closeEvent передаётся каркасу.
+
+    Принимает перетащенные файлы (п. 4.5): нативный Qt drag&drop —
+    Win32-хуки Tk (WM_DROPFILES) в Qt-сборку не переносятся.
+    """
 
     def __init__(self, controller: "AppController"):
         super().__init__()
         self._controller = controller
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 — имя Qt
+        urls = event.mimeData().urls() if event.mimeData() else []
+        if urls:
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 — имя Qt
+        urls = event.mimeData().urls() if event.mimeData() else []
+        paths = [
+            url.toLocalFile() for url in urls
+            if url.isLocalFile() and url.toLocalFile()
+        ]
+        if paths:
+            event.acceptProposedAction()
+            self._controller.import_drop_files(paths)
 
     def closeEvent(self, event) -> None:  # noqa: N802 — имя Qt
         self._controller._on_close(event)
@@ -174,6 +196,11 @@ class AppController:
         # отложенными предпросмотрами — Qt-аналог Tk _doc_page_flow.
         self.contract_flow = document_page_qt.ContractPageQt(self)
         self.additional_flow = document_page_qt.AdditionalPageQt(self)
+
+        # Пакетный импорт (M6): guard/воркер/U9/U10 — Qt-аналог
+        # Tk _import_flow; точка входа — кнопка на странице реестра
+        # и перетаскивание файлов в окно (п. 4.5).
+        self.import_flow = import_qt.ImportFlowQt(self)
 
         # Ctrl+S — сохранение формы текущей страницы (п. 4.4, Tk-контракт).
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self.window)
@@ -435,6 +462,28 @@ class AppController:
         if getattr(self, "registry_flow", None):
             self.registry_flow.refresh()
         self.refresh_status()
+
+    def import_documents_dialog(self) -> None:
+        """Выбор файлов для загрузки в реестр (Tk _import_documents_dialog)."""
+        if self.import_flow.running:
+            return
+        files, _filter = QFileDialog.getOpenFileNames(
+            self.window,
+            "Выберите договоры, доп. соглашения и спецификации",
+            "",
+            "Документы Word и Excel (*.docx *.xlsx);;"
+            "Документы Word (*.docx);;Таблицы Excel (*.xlsx)",
+        )
+        if not files:
+            return
+        self.import_flow.start(list(files))
+
+    def import_drop_files(self, paths: list) -> None:
+        """Перетащенные в окно файлы — в пакетный импорт (п. 4.5)."""
+        if self.import_flow.running:
+            self.notify("Импорт уже выполняется — дождитесь завершения.")
+            return
+        self.import_flow.start([str(path) for path in paths])
 
     def save_setting(self, key: str, value) -> None:
         """Сохранение настройки профиля (Tk ContractApp.save_setting).

@@ -25,7 +25,10 @@ jobs:
   build:
     name: Windows — exe + установщик + SHA-256
     runs-on: windows-latest
-    timeout-minutes: 45
+    # 90 мин (релизный прогон v2.29.0, run #23): на windows-latest pytest 1181
+    # тестов + smoke Tk/Qt + две сборки PyInstaller + два Inno Setup не
+    # укладываются в прежние 45 мин (лимит был рассчитан на Tk-эру, 855 тестов).
+    timeout-minutes: 90
     defaults:
       run:
         shell: pwsh

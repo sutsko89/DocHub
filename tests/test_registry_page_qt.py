@@ -946,8 +946,13 @@ def test_registry_10k_portion_reach_and_search(qapp, appdata, stub_dialogs):
         qapp.processEvents()
         bar = flow.table.verticalScrollBar()
         assert bar.maximum() > 0
-        bar.setValue(bar.maximum())
-        qapp.processEvents()
+        # Прокрутка до конца — двухпроходная: после смены фильтра первая
+        # компоновка может сдвинуть максимум на один тик (M6 изменила
+        # высоту шапки страницы), повторный проход равен поведению
+        # реальной прокрутки пользователя до конца списка.
+        for _ in range(3):
+            bar.setValue(bar.maximum())
+            qapp.processEvents()
         assert bar.value() == bar.maximum()
     finally:
         ctrl._stop_timers()

@@ -162,12 +162,13 @@ Xvfb :99 (Tk) / offscreen (Qt). Приёмка Windows — по runbook
   документация этапа — `docs/qt-migration-stage-notes.md` (раздел M6),
   `docs/qt-migration-M6-report.md`, `docs/qt-migration-M6-windows-runbook.md`
   — снимок-коммит поверх `9c829c3` (M2-эпоха).
-- Каноническая история (10 коммитов M1–M6, включая 6 коммитов M6) — в
+- Каноническая история (11 коммитов M1–M6, включая 6 коммитов M6) — в
   bundle **DocHub-qt-migration-M6.bundle** (verify пройден). Публикация
-  кода одной командой на машине с bundle:
-  `git bundle verify DocHub-qt-migration-M6.bundle && git fetch DocHub-qt-migration-M6.bundle qt-migration:qt-migration && git push origin qt-migration`
-  (origin отстанет на коммиты M3…M6; обновление документации на origin
-  при этом перекроется — force-with-lease или повторный коммит docs).
+  кода — на машине с bundle:
+  `git clone DocHub-qt-migration-M6.bundle dochub-m6 && cd dochub-m6 && git push origin qt-migration`
+  (origin получит настоящую историю; коммит документации от плагина
+  перекроется — при желании сохранить его, сделать merge или
+  force-with-lease).
 
 ## 9. Итог этапа
 

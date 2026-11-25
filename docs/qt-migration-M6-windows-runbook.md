@@ -9,8 +9,8 @@ Windows-машине; Linux-статус «выполнено» не замен�
 Подготовка (один раз):
 
 ```bat
-git bundle verify DocHub-qt-migration-M6.bundle
-git fetch DocHub-qt-migration-M6.bundle qt-migration:qt-migration
+git clone DocHub-qt-migration-M6.bundle dochub-m6
+cd dochub-m6
 git checkout qt-migration
 py -3.13 -m pip install -r requirements.txt -r requirements-dev.txt
 ```

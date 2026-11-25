@@ -256,6 +256,27 @@ if sys.platform == "win32":
 # ---------- 12. Спецификация CP1 (M3) ----------
 # Живая страница заменяет плейсхолдер; диалоги подменены выше (confirm=True).
 qapp = qt_app  # имя разделов CP1 — как в тестах pytest-qt
+
+# Буфер обмена (релизный прогон v2.29.0): на Windows-раннере CI чтение
+# OS-буфера в RDP-сессии может блокировать OleGetClipboard — smoke проверяет
+# план вставки/лимит/сообщения (spec_table_core.paste_plan), а не интеграцию
+# с ОС-буфером. Подменяем QClipboard памяти-двойником для обоих сценариев
+# вставки ниже (продукт не тронут: в живом приложении с event loop буфер
+# работает штатно).
+class _FakeClipboard:
+    def __init__(self) -> None:
+        self._text = ""
+
+    def setText(self, text: str) -> None:  # noqa: N802 — Qt-имя
+        self._text = text
+
+    def text(self) -> str:
+        return self._text
+
+_fake_clipboard = _FakeClipboard()
+QApplication.clipboard = (  # type: ignore[assignment]
+    lambda *a, **k: _fake_clipboard
+)
 check(ctrl.pages["spec"] is ctrl.spec_flow.page,
       "CP1: страница «Спецификация» живая (плейсхолдер заменён)")
 check(ctrl.stack.currentWidget() is ctrl.spec_flow.page,

@@ -790,11 +790,17 @@ def test_keyboard_delete_triggers_delete_selected(controller):
 
 def test_click_toggle_clears_and_restores_selection(controller):
     pid = add_party(controller, "ООО Тоггл", "7701234560")["id"]
+    # Вторая запись: клик делаем по строке 1 — полировка платформы
+    # (offscreen и «windows») сама ставит выделение/текущий индекс на
+    # строку 0 после reset() модели, под X11/Xvfb — нет. Строка 1 на
+    # любой платформе стартует чистой (релизный прогон v2.29.0, Windows).
+    add_party(controller, "ООО Тоггл Второй", "7709999960")
     flow = controller.registry_flow
+    pid = flow.parties()[-1]["id"]  # строка 1 = вторая запись (порядок добавления)
     controller.select_page("registry")
     controller.app.processEvents()
     model = flow.table.model
-    row_rect = flow.table.visualRect(model.index(0, 0))
+    row_rect = flow.table.visualRect(model.index(1, 0))
     viewport = flow.table.viewport()
     center = row_rect.center()
 

@@ -215,11 +215,43 @@ def _tsv(rows: int) -> str:
     return "\n".join(f"Позиция {n}\t1\tшт\t10" for n in range(1, rows + 1))
 
 
-def test_paste_600_rows_clamps_to_500_with_notice(controller, qapp, seeded_party):
+class _FakeClipboard:
+    """Памяти-двойник буфера (релизный прогон v2.29.0, Windows).
+
+    На windows-latest чтение OS-буфера (OleGetClipboard) в RDP-сессии
+    может блокировать поток — paste-тесты проверяют план вставки, лимит
+    и сообщения (spec_table_core.paste_plan), а не интеграцию с
+    ОС-буфером. Двойник подменяет QClipboard и для вызовов теста
+    (qapp.clipboard()), и для продуктового чтения
+    (spec_table_qt.QApplication.clipboard()).
+    """
+
+    def __init__(self) -> None:
+        self._text = ""
+
+    def setText(self, text: str) -> None:  # noqa: N802 — Qt-имя
+        self._text = text
+
+    def text(self) -> str:
+        return self._text
+
+
+@pytest.fixture()
+def fake_clipboard(monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    fake = _FakeClipboard()
+    monkeypatch.setattr(QApplication, "clipboard",
+                        lambda *a, **k: fake)
+    return fake
+
+
+def test_paste_600_rows_clamps_to_500_with_notice(controller, fake_clipboard,
+                                                  seeded_party):
     flow = controller.spec_flow
     notices: list[str] = []
     flow.table.notice.connect(notices.append)
-    qapp.clipboard().setText(_tsv(600))
+    fake_clipboard.setText(_tsv(600))
     flow.table.paste_clipboard()
     assert flow.table.rowCount() == spec_table_core.MAX_ROWS == 500
     assert len(notices) == 1
@@ -227,41 +259,42 @@ def test_paste_600_rows_clamps_to_500_with_notice(controller, qapp, seeded_party
     assert flow.totals_label.text() == "Позиций: 500 · Итого: 5000,00"
 
 
-def test_paste_exact_limit_no_notice(controller, qapp, seeded_party):
+def test_paste_exact_limit_no_notice(controller, fake_clipboard, seeded_party):
     flow = controller.spec_flow
     notices: list[str] = []
     flow.table.notice.connect(notices.append)
-    qapp.clipboard().setText(_tsv(500))
+    fake_clipboard.setText(_tsv(500))
     flow.table.paste_clipboard()
     assert flow.table.rowCount() == 500
     assert notices == [], "вставка ровно до лимита — без сообщения"
 
 
-def test_paste_respects_start_cell(controller, qapp, seeded_party):
+def test_paste_respects_start_cell(controller, fake_clipboard, seeded_party):
     """Вставка в непустую таблицу со сдвигом: 250 + 300 → 250 строк (PERF-1)."""
     flow = controller.spec_flow
     fill_item(controller, row=0, values=("Начальная позиция", "1", "шт", "1"))
-    qapp.clipboard().setText(_tsv(300))
+    fake_clipboard.setText(_tsv(300))
     flow.table.paste_block_at(250, 1)  # Ctrl+V в ячейку «Наименование» 251-й строки
     assert flow.table.rowCount() == spec_table_core.MAX_ROWS
     assert flow.table._text(250, 1) == "Позиция 1"
     assert flow.table._text(499, 1) == "Позиция 250"
 
 
-def test_paste_sanitizes_garbage_in_numeric_cells(controller, qapp, seeded_party):
+def test_paste_sanitizes_garbage_in_numeric_cells(controller, fake_clipboard,
+                                                  seeded_party):
     """Мусор в «Кол-во»/«Цена» отсекается (аудит 2.0.1, P2) — Qt-обвязка."""
     flow = controller.spec_flow
-    qapp.clipboard().setText("Болт М8\tabc\tшт\t150 руб")
+    fake_clipboard.setText("Болт М8\tabc\tшт\t150 руб")
     flow.table.paste_clipboard()
     values = flow.table.row_values()[0]
     assert values["qty"] == ""
     assert values["price"] == "150"
 
 
-def test_paste_notice_shown_as_toast(controller, qapp, seeded_party):
+def test_paste_notice_shown_as_toast(controller, fake_clipboard, seeded_party):
     """PERF-1 сообщение — немодальным тостом каркаса (Tk: on_notice=app._notify)."""
     flow = controller.spec_flow
-    qapp.clipboard().setText(_tsv(600))
+    fake_clipboard.setText(_tsv(600))
     flow.table.paste_clipboard()
     assert "Вставлено 500" in controller.toast_label.text()
 

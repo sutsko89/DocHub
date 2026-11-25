@@ -25,10 +25,10 @@ jobs:
   build:
     name: Windows — exe + установщик + SHA-256
     runs-on: windows-latest
-    # 90 мин (релизный прогон v2.29.0, run #23): на windows-latest pytest 1181
-    # тестов + smoke Tk/Qt + две сборки PyInstaller + два Inno Setup не
-    # укладываются в прежние 45 мин (лимит был рассчитан на Tk-эру, 855 тестов).
-    timeout-minutes: 90
+    # 120 мин (замер полного набора v2.29.0 на windows-latest, diag af79444):
+    # pytest 1172/0/11 занимает 74 мин, далее smoke Tk/Qt, две сборки
+    # PyInstaller и два Inno Setup — прежние 45/90 мин не вмещали конвейер.
+    timeout-minutes: 120
     defaults:
       run:
         shell: pwsh

@@ -1,0 +1,33 @@
+name: Diag Windows
+
+# ВРЕМЕННЫЙ диагностический прогон (релиз v2.29.0): на windows-latest pytest
+# (а) даёт F на tests/test_registry_page_qt.py::test_click_toggle_clears_and_
+# restores_selection (строка [54%]) и (б) ЗАВИСАЕТ в зоне тестов #721–#792 —
+# после строки [60%] ни одной точки за 28 минут, задание снято лимитом 90 мин.
+# Задача шагов: pytest-timeout убивает зависший тест (--timeout=180,
+# thread-метод) и продолжает прогон — лог с -v даёт точный адрес зависания;
+# второй шаг возвращает текст отказа click-toggle. Файл удаляется после
+# диагностики, в релизную конфигурацию не входит.
+
+on:
+  push:
+    branches: [qt-migration]
+
+jobs:
+  diag:
+    name: Windows — диагностическая зона
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (P2-14: пин по SHA)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0 (P2-14)
+        with:
+          python-version: "3.13"
+      - name: Зависимости + pytest-timeout (только для диагностики)
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt pytest-timeout
+      - name: Зона зависания #721–#792 (single_instance, spec_page_qt, spec_table_validation, startup_controller, startup_qt)
+        run: python -m pytest tests/test_single_instance.py tests/test_spec_page_qt.py tests/test_spec_table_validation.py tests/test_startup_controller.py tests/test_startup_qt.py -v --timeout=180 --timeout-method=thread -ra
+      - name: Реестр Qt — текст отказа click-toggle (F #598)
+        run: python -m pytest tests/test_registry_page_qt.py -v --timeout=180 --timeout-method=thread -rf

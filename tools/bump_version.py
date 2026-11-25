@@ -2,12 +2,14 @@
 """Единый бамп версии EW.DocHub (аудит 2.0.1, P0 «версии разъехались»).
 
 Версия живёт в двух местах, но синхронизируется одним скриптом:
-  * app_common.py  — APP_VERSION (единый источник; EWDochub.spec читает его
-                     напрямую при сборке; с этапа M1 миграции источник
-                     здесь — раньше был main.py);
-  * installer.iss  — MyAppVersion.
+  * app_common.py  — APP_VERSION (единый источник; EWDochub.spec и
+                     EWDochub_qt.spec читают его напрямую при сборке;
+                     с этапа M1 миграции источник здесь — раньше был
+                     main.py);
+  * installer.iss  — MyAppVersion (Tk-сборка);
+  * installer_qt.iss — MyAppVersion (Qt-сборка, этап M7).
 
-Скрипт меняет оба места, обновляет README (заголовок и имена setup.exe)
+Скрипт меняет все места, обновляет README (заголовок и имена setup.exe)
 и проверяет, что spec не держит собственной копии версии.
 
 Использование:
@@ -30,6 +32,11 @@ TARGETS = [
     ),
     (
         REPO_ROOT / "installer.iss",
+        r'#define MyAppVersion "[\d.]+"',
+        '#define MyAppVersion "{version}"',
+    ),
+    (
+        REPO_ROOT / "installer_qt.iss",
         r'#define MyAppVersion "[\d.]+"',
         '#define MyAppVersion "{version}"',
     ),

@@ -1,13 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Измерительная ONEDIR-сборка Qt-каркаса EW.DocHub (этап M2, критерий К-3):
-# старт до окна, WorkingSet и размер папки сборки фиксируются на Windows
-# и не «на глаз». Финализируется в M7: включение шаблонов .docx, Inno Setup
-# (installer_qt.iss), суффикс сборки и SHA256SUMS — по разделам И.2/М7 плана.
+# ONEDIR-сборка Qt-версии EW.DocHub (этап M7, финализация; измерительная
+# версия каркаса — M2, критерий К-3). Отличия от EWDochub.spec (Tk-сборка):
+# точка входа main_qt.py, PySide6 включается (Tk-сборка его исключает), стек
+# Tk/CustomTkinter исключается. Qt-плагины (platforms/styles/imageformats)
+# PyInstaller 6.x подтягивает хуками PySide6 по фактическим импортам каркаса.
 #
-# Главное отличие от EWDochub.spec (Tk-сборка): точка входа main_qt.py,
-# PySide6 включается (Tk-сборка его исключает), стек Tk/CustomTkinter
-# исключается. Qt-плагины (platforms/styles/imageformats) PyInstaller 6.x
-# подтягивает хуками PySide6 по фактическим импортам каркаса.
+# Полный набор шаблонов .docx (M7): договор/доп. соглашение (M6) + спецификация
+# — как у Tk-сборки; app_icon.ico для окна и установщика.
+#
+# Установщик: installer_qt.iss (те же AppMutex/AppId — обновление Tk 2.28.2 → Qt
+# в ту же папку, критерий CP2). Ассет релиза: EW.DocHub-<версия>-qt-setup.exe
+# (суффикс флейвора — И.2 плана).
 #
 # Сборка: pyinstaller EWDochub_qt.spec --noconfirm
 
@@ -83,11 +86,15 @@ a = Analysis(
     ['main_qt.py'],
     pathex=[],
     binaries=[],
-    # M3 (CP1): в Qt-сборке появилась печать спецификации — включаются
-    # spec_template*.docx. Остальные шаблоны — M6 (договор/доп. соглашение),
-    # финализация datas — M7.
+    # Полный набор шаблонов печатных форм (M7-финализация; как у Tk-сборки):
+    # M3 — спецификация, M6 — договор/доп. соглашение; .docx читаются через
+    # services.resource_path (заморозка поддерживается).
     datas=[
         ('app_icon.ico', '.'),
+        ('dogovor_template.docx', '.'),
+        ('dogovor_template_ip.docx', '.'),
+        ('additional_agreement.docx', '.'),
+        ('additional_agreement_ip.docx', '.'),
         ('spec_template.docx', '.'),
         ('spec_template_ip.docx', '.'),
     ],

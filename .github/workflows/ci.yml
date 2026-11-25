@@ -33,11 +33,13 @@ jobs:
              --cov=document_builder --cov=services --cov-report=term-missing
       - name: smoke_test.py (интерфейс под Xvfb)
         run: xvfb-run -a -s "-screen 0 1280x800x24" python smoke_test.py
+      - name: smoke_qt.py (Qt-сборка под Xvfb, M7)
+        run: xvfb-run -a -s "-screen 0 1280x800x24" python smoke_qt.py
 
   windows:
     name: Windows — pytest + smoke (GUI-сессия)
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     env:
       PYTHONIOENCODING: utf-8
     steps:
@@ -52,6 +54,12 @@ jobs:
         run: python -m pytest tests/
       - name: smoke_test.py (графическая сессия Windows, без Xvfb)
         run: python smoke_test.py
+      - name: smoke_qt.py (графическая сессия Windows, M7)
+        run: python smoke_qt.py
+      - name: Контрольная сборка Qt-версии (PyInstaller, M7)
+        run: |
+          pyinstaller --noconfirm EWDochub_qt.spec
+          if (-not (Test-Path "dist\EW.DocHub-qt\EW.DocHub-qt.exe")) { throw "Qt-сборка не содержит EW.DocHub-qt.exe (Qt-плагины/datas)" }
 
 # TODO (аудит 2.0.1, P2): закрепить actions/checkout и setup-python по SHA,
 # а не по major-тегу — проверить актуальные SHA и обновить оба jobs.

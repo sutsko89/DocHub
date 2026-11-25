@@ -46,41 +46,59 @@ jobs:
       - name: pytest (без интерфейса)
         run: python -m pytest tests/
 
-      - name: smoke_test.py (графическая сессия)
+      - name: smoke_test.py (графическая сессия, Tk-сборка)
         run: python smoke_test.py
         env:
           PYTHONIOENCODING: utf-8
 
-      - name: Сборка приложения (PyInstaller)
+      - name: smoke_qt.py (графическая сессия, Qt-сборка, M7)
+        run: python smoke_qt.py
+        env:
+          PYTHONIOENCODING: utf-8
+
+      - name: Сборка Tk-версии (PyInstaller)
         run: pyinstaller --noconfirm EWDochub.spec
 
-      - name: Подпись EW.DocHub.exe (signtool, опционально)
+      - name: Сборка Qt-версии (PyInstaller, M7)
+        run: |
+          pyinstaller --noconfirm EWDochub_qt.spec
+          if (-not (Test-Path "dist\EW.DocHub-qt\EW.DocHub-qt.exe")) { throw "Qt-сборка не содержит EW.DocHub-qt.exe — проверьте EWDochub_qt.spec (Qt-плагины/datas)" }
+
+      - name: Подпись EW.DocHub.exe / EW.DocHub-qt.exe (signtool, опционально)
         if: env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != ''
         run: |
           ./tools/sign_artifact.ps1 "dist\EW.DocHub\EW.DocHub.exe"
+          ./tools/sign_artifact.ps1 "dist\EW.DocHub-qt\EW.DocHub-qt.exe"
 
-      - name: Сборка установщика (Inno Setup)
+      - name: Сборка установщиков (Inno Setup — Tk и Qt, M7)
         run: |
           choco install innosetup -y --no-progress
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { $iscc = "C:\Program Files (x86)\Inno Setup 7\ISCC.exe" }
           if (-not (Test-Path $iscc)) { throw "ISCC.exe не найден после установки Inno Setup" }
           & $iscc installer.iss
-          if ($LASTEXITCODE -ne 0) { throw "Inno Setup завершился с ошибкой $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup (Tk) завершился с ошибкой $LASTEXITCODE" }
+          & $iscc installer_qt.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup (Qt) завершился с ошибкой $LASTEXITCODE" }
 
-      - name: Подпись setup.exe (signtool, опционально)
+      - name: Подпись setup.exe (signtool, опционально — оба флейвора)
         if: env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != ''
         run: |
-          $setup = Get-ChildItem "installer\*-setup.exe" | Select-Object -First 1
-          if (-not $setup) { throw "Установщик не найден в installer\" }
-          ./tools/sign_artifact.ps1 $setup.FullName
+          $setups = Get-ChildItem "installer\*-setup.exe"
+          if (-not $setups) { throw "Установщики не найдены в installer\" }
+          foreach ($setup in $setups) { ./tools/sign_artifact.ps1 $setup.FullName }
 
-      - name: SHA-256 артефактов (после подписи)
+      - name: SHA-256 артефактов (после подписи, оба ассета — И.2)
         run: |
-          $setup = Get-ChildItem "installer\*-setup.exe" | Select-Object -First 1
-          if (-not $setup) { throw "Установщик не найден в installer\" }
-          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
-          "$hash  $($setup.Name)" | Out-File -Encoding ascii "installer\SHA256SUMS.txt"
+          # SHA256SUMS.txt перечисляет ОБА ассета релиза (Tk + Qt): приложение
+          # выбирает ассет своего флейвора (updater.installer_asset_for_flavor).
+          $setups = Get-ChildItem "installer\*-setup.exe"
+          if (-not $setups) { throw "Установщики не найдены в installer\" }
+          Remove-Item "installer\SHA256SUMS.txt" -ErrorAction SilentlyContinue
+          foreach ($setup in $setups) {
+            $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($setup.Name)" | Out-File -Encoding ascii -Append "installer\SHA256SUMS.txt"
+          }
           Get-Content "installer\SHA256SUMS.txt"
 
       - name: Артефакты релиза
@@ -102,8 +120,11 @@ jobs:
             installer/*-setup.exe
             installer/SHA256SUMS.txt
           body: |
-            Установщик Windows: скачать **EW.DocHub-*-setup.exe** ниже и запустить.
-            Контрольная сумма SHA-256 — в файле `SHA256SUMS.txt` рядом с установщиком.
+            Установщики Windows (M7, два флейвора):
+            * **EW.DocHub-*-setup.exe** — классическая Tk-сборка (2.28.2);
+            * **EW.DocHub-*-qt-setup.exe** — сборка на Qt (PySide6) — целевой интерфейс миграции.
+            Контрольные суммы SHA-256 обоих ассетов — в файле `SHA256SUMS.txt` рядом с установщиками.
+            Автообновление скачивает ассет своего флейвора и сверяет сумму по SHA256SUMS.txt (И.2).
 
             Требования: Windows 10/11 x64. После установки в программе нет ни данных,
             ни ключей — реестр пуст, ключ DaData вводится в «Настройках» (п. 6.1).

@@ -120,12 +120,21 @@ def run_and_drain(controller, qapp, include_notice=True, hold=None,
             flow.stop()
         if hold is not None:
             hold.set()
-    for _ in range(2000):
+    # Дедлайн вместо фиксированного числа итераций: дренаж без sleep
+    # выжимает все 2000 итераций за миллисекунды и под нагрузкой может
+    # кончиться раньше первого слайса GIL фонового воркера (флак
+    # релизного прогона 2.29.0 — гонка планирования, не дефект воркера;
+    # воркер завершается за миллисекунды — зондами подтверждено).
+    # 2 мс на итерацию гарантируют воркеру процессорное время; итоговый
+    # бюджет — 15 с, после чего падаем с тем же сообщением.
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
         qapp.processEvents()
         if flow._queue is not None:
             flow.tick()  # дренаж; 'done' останавливает таймер опроса
         if not flow.running:
             return applied
+        time.sleep(0.002)
     raise AssertionError("стартовый воркер не завершился за отведённое время")
 
 

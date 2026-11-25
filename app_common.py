@@ -43,7 +43,7 @@ from document_builder import (
     SPEC_APPENDIX_NUMBER, SPEC_VAT_RATE, digits_only, format_phone,
 )
 
-APP_VERSION = "2.28.2"
+APP_VERSION = "2.29.0"
 
 # Признак интерфейса сборки (план миграции, И.2): "tk" — Tk/CustomTkinter
 # сборка, "qt" — сборка на PySide6 (каркас появляется на этапе M2).

@@ -24,7 +24,7 @@
 #define MyAppExeName "EW.DocHub-qt.exe"
 ; Версия релиза: синхронизируется с APP_VERSION (app_common.py) скриптом
 ; tools/bump_version.py (M7: скрипт обновляет оба установщика).
-#define MyAppVersion "2.28.2"
+#define MyAppVersion "2.29.0"
 
 [Setup]
 AppId={{7B4E6F2A-91C4-4A3E-9B5D-2C8A1D6E4F10}

@@ -224,8 +224,11 @@ check(not ctrl.window.isVisible(), "выход: окно закрыто")
 check(os.path.exists(applog.log_path()), "журналы: app.log создан в профиле")
 with open(applog.log_path(), encoding="utf-8") as fh:
     _log = fh.read()
-check("Запуск EW.DocHub 2.28.2-qt" in _log,
-      "журналы: строка старта с версией-флейвором «2.28.2-qt»")
+# Ожидаемая строка старта — из единого источника версии (литерал
+# «2.28.2-qt» ломался на каждом бампе; найдено релизным прогоном 2.29.0).
+_expect_start = f"Запуск EW.DocHub {app_common.APP_VERSION}-{mq.UI_FLAVOR}"
+check(_expect_start in _log,
+      f"журналы: строка старта с версией-флейвором «{_expect_start}»")
 check("Каркас Qt построен" in _log, "журналы: построение каркаса записано")
 check("Каркас Qt закрыт" in _log, "журналы: закрытие каркаса записано")
 check(os.path.exists(os.path.join(applog.log_dir(), applog.CRASH_FILE_NAME)),

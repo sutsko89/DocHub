@@ -26,6 +26,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+from datetime import datetime, timedelta
 
 # Изолированный профиль и заглушки окружения — до импортов приложения.
 os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "dogovor_smoke_qt_appdata")
@@ -48,7 +49,7 @@ import single_instance
 import storage
 from document_builder import F
 from PySide6.QtCore import QCoreApplication, QEvent, QTimer
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QLineEdit
 
 FAILURES: list[str] = []
 _TOTAL_CHECKS = 0
@@ -83,8 +84,37 @@ applog.setup_logging(f"{app_common.APP_VERSION}-{mq.UI_FLAVOR}")
 applog.enable_crash_dump()  # путь crash.log, как включает точка входа Qt
 
 # Модальные диалоги в smoke никто не закроет — подменяем (маршруты main_qt).
+# choice: стартовые задачи (START-1) на свежем профиле показывают диалог
+# сроков доп. соглашений — подмена не даёт смоку зависнуть; запись — для U9.
+CHOICES: list[tuple] = []
+_CHOICE_RESULT = None
 mq.qt_dialogs.alert = lambda *args, **kwargs: ALERTS.append(args)
 mq.qt_dialogs.confirm = lambda *args, **kwargs: True
+
+
+def _fake_choice(*args, **kwargs):
+    CHOICES.append(args)
+    return _CHOICE_RESULT
+
+
+mq.qt_dialogs.choice = _fake_choice
+
+
+class _SyncFactory:
+    """Фабрика потока, исполняющая воркер синхронно (подмена для смоука).
+
+    Как RecordingFactory в test_import_controller: воркер отрабатывает
+    внутри start(), очередь опрашивается tick() вручную — прогон
+    детерминирован без реальных потоков.
+    """
+
+    def __call__(self, target=None, args=(), daemon=None, **_kw):
+        self._target = target
+        self._args = args
+        return self
+
+    def start(self) -> None:
+        self._target(*self._args)
 
 qt_app = QApplication.instance() or QApplication(sys.argv)
 
@@ -469,6 +499,223 @@ with _sq.connect(storage.db_path()) as _conn:
     _meta5 = dict(_conn.execute("SELECT key, value FROM meta"))
 check(int(_meta5.get("schema_version", "0")) == storage.SQLITE_SCHEMA_VERSION,
       "M5: schema_version не изменён операциями реестра (запрет З.1)")
+
+
+# ---------- 15. Полный маршрут M6: договор → доп. соглашение → спецификация → импорт → корзина → сверка ----------
+# Сценарии Г #4, #5, #13, #14, #15, #16 одной цепочкой на живых страницах.
+# Папка документов — настройка профиля смоука (не «Документы» пользователя):
+# путь через save_setting — тот же маршрут, что на странице «Настройки».
+ctrl.save_setting("documents_dir", _docs_dir)
+
+# --- Договор (Г #4): выбор по ИНН, сохранение, честное «сохранён», Word ---
+ctrl.select_page("contract")
+check(ctrl.pages["contract"] is ctrl.contract_flow.page,
+      "M6/Г#4: страница «Договор поставки» живая (плейсхолдер заменён)")
+ctrl.contract_flow.search_entry.setText("7701234567")
+ctrl.contract_flow.find_party_by_inn(ctrl.contract_flow.search_entry)
+check(ctrl.contract_flow.selected_party() is not None
+      and ctrl.contract_flow.selected_party()["id"] == _m5_ids[0],
+      "M6/Г#4/U3: поиск по ИНН подставил контрагента «ООО Ромашка»")
+check(ctrl.additional_flow.party_combo.currentText()
+      == ctrl.contract_flow.party_combo.currentText(),
+      "M6/п. 4.2: выбор контрагента перенесён на страницу доп. соглашения")
+ctrl.contract_flow.number_entry.setText("601")
+ctrl.contract_flow.day_entry.setText("10")
+qapp.processEvents()
+ctrl.contract_flow.preview_timer.stop()
+ctrl.contract_flow.render_preview()
+check(len(ctrl.contract_flow.preview_text.toPlainText()) > 500,
+      "M6/Г#4: предпросмотр договора — печатная форма из шаблона")
+ctrl.contract_flow.save_contract()
+_m6_contracts = [d for d in ctrl.store.documents
+                 if d["kind"] == storage.KIND_CONTRACT and d["number"] == "601"]
+check(len(_m6_contracts) == 1, "M6/Г#4: договор № 601 — запись в реестре")
+check("сохранён" in ctrl.toast_label.text() and "601" in ctrl.toast_label.text(),
+      "M6/Г#4: честное «сохранён» с номером договора")
+_m6_party_dir = os.path.join(_docs_dir, "ООО Ромашка")
+check(any(os.path.exists(os.path.join(_m6_party_dir, name))
+          for name in (os.listdir(_m6_party_dir) if os.path.isdir(_m6_party_dir) else [])),
+      "M6/Г#4: файл договора записан в папку контрагента")
+
+# --- Доп. соглашение (Г #5): договор-основание автоподставлен, «Действует до» ---
+ctrl.select_page("additional")
+check(ctrl.pages["additional"] is ctrl.additional_flow.page,
+      "M6/Г#5: страница «Доп. соглашение» живая (плейсхолдер заменён)")
+ctrl.additional_flow.refresh_parties()
+check(ctrl.additional_flow.contract_combo.currentText() == "№ 516 от 10 января",
+      "M6/п. 5.1: договор-основание подставлен автоматически (первый из реестра)")
+check(ctrl.additional_flow.valid_entry.text() ==
+      f"31.12.{datetime.now().year}",
+      "M6/Г#5: «Действует до» по умолчанию — 31 декабря текущего года (2.18.0)")
+ctrl.additional_flow.limit_entry.setText("10000")
+check(ctrl.additional_flow.limit_entry.text() == "10 000",
+      "M6: лимит форматируется с разрядами")
+ctrl.additional_flow.term_entry.setText("10")
+check("десять" in ctrl.additional_flow.words_label.text().lower(),
+      "M6: срок прописью под полем отсрочки")
+check("десять тысяч" in ctrl.additional_flow.limit_words_label.text().lower(),
+      "M6: сумма прописью под полем лимита")
+ctrl.additional_flow.valid_entry.setText("31.03.2027")
+ctrl.additional_flow.save_additional()
+_m6_addls = [d for d in ctrl.store.documents
+             if d["kind"] == storage.KIND_ADDITIONAL]
+check(len(_m6_addls) == 1, "M6/Г#5: доп. соглашение — запись в реестре")
+check(_m6_addls[0]["extra"]["valid_until"] == "31.03.2027"
+      and _m6_addls[0]["extra"]["valid_until_iso"] == "2027-03-31",
+      "M6/Г#5/2.18.0: «Действует до» в extra — вид и ISO")
+check("сохранено" in ctrl.toast_label.text(),
+      "M6/Г#5: честное «сохранено» доп. соглашения")
+check(ctrl.additional_flow.is_form_dirty() is False,
+      "M6: после сохранения доп. соглашения форма «чистая»")
+
+# --- Спецификация: третья запись маршрута к тому же контрагенту/договору ---
+ctrl.select_page("spec")
+ctrl.spec_flow.refresh_parties()
+ctrl.spec_flow.number_entry.setText("2")
+ctrl.spec_flow.flush_spec_preview()
+ctrl.spec_flow.save_spec()
+check(len([d for d in ctrl.store.documents
+           if d["kind"] == storage.KIND_SPEC]) == 2,
+      "M6/маршрут: вторая спецификация сохранена (маршрут полн)")
+
+# --- Импорт пакета (Г #13): U9-сводка, реестр, unknown, отчёт с «Открыть реестр» ---
+from docx import Document as _SmokeDoc  # noqa: E402 — как в smoke_test.py
+import document_importer as _di  # noqa: E402
+import import_qt as _iq  # noqa: E402
+
+_import_src = os.path.join(os.environ["APPDATA"], "import_source")
+os.makedirs(_import_src, exist_ok=True)
+_import_main = os.path.join(_import_src, "Договор поставки № 888.docx")
+_d = _SmokeDoc()
+_d.add_paragraph("ДОГОВОР ПОСТАВКИ № 888")
+_d.add_paragraph("«11» января 2026 г.")
+_d.add_paragraph("ООО «Ромашка-Импорт», именуемое в дальнейшем «Покупатель»,")
+_d.add_paragraph("ИНН 2540123456, КПП 254001001")
+_d.save(_import_main)
+_m6_no_inn = []
+for _n in (1, 2):
+    # «Старые» файлы без ИНН: тип опознан (договор), реквизитов нет —
+    # ok=True, recognized=False → контур U9 (файл требует решения).
+    _p = os.path.join(_import_src, f"Договор поставки без ИНН {_n}.docx")
+    _d = _SmokeDoc()
+    _d.add_paragraph("ДОГОВОР ПОСТАВКИ")
+    _d.add_paragraph("ООО «Старый пакет», именуемое в дальнейшем «Покупатель»")
+    _d.save(_p)
+    _m6_no_inn.append(_p)
+
+import_qt_reports: list[tuple] = []
+ctrl.import_flow.show_report = (
+    lambda entries, summary: import_qt_reports.append((entries, summary)))
+CHOICES.clear()
+_CHOICE_RESULT = "create_by_name"
+ctrl.import_flow.start([_import_main, *_m6_no_inn],
+                       thread_factory=_SyncFactory())
+ctrl.import_flow.tick()
+qapp.processEvents()
+_CHOICE_RESULT = None
+check(len(CHOICES) >= 1
+      and "файлов без ИНН" in str(CHOICES[-1][2]),
+      "M6/Г#13/U9: серия файлов без ИНН — ОДИН диалог сводки")
+check(len(CHOICES) == 1,
+      "M6/U9: 3 файла — один пакетный диалог, без серии на каждый файл")
+check(len(ctrl.store.active_counterparties()) == 5,
+      "M6/Г#13: «Ромашка-Импорт» (по ИНН) + «Старый пакет» (по названию)")
+check(len([d for d in ctrl.store.documents
+           if d["kind"] == storage.KIND_CONTRACT]) >= 2
+      and len(import_qt_reports) == 1,
+      "M6/Г#13: пакет зарегистрирован, отчёт показан")
+_entries_m6, _summary_m6 = import_qt_reports[0]
+check("Добавлено документов: 3" in _summary_m6,
+      "M6/Г#13: сводка импорта честная (3 добавлено, 2 новых контрагента)")
+check(len(_entries_m6) == 3, "M6/п. 3.5: по каждому файлу строка отчёта")
+_check_unknown = os.path.isdir(os.path.join(_docs_dir, "unknown"))
+check(_check_unknown is False or os.listdir(os.path.join(_docs_dir, "unknown")) == [],
+      "M6/п. 3.5: отклонённых файлов нет — все распознаны")
+
+# Отчёт: диалог «Открыть реестр» (U10) — оболочка строится, кнопка ведёт в реестр.
+_m6_report = _iq.ImportReportDialog(
+    ctrl.window, _entries_m6, _summary_m6, storage.KIND_LABELS, ctrl.import_flow.open_registry)
+check(_m6_report.open_registry_btn.text() == "Открыть реестр",
+      "M6/U10: кнопка «Открыть реестр» в отчёте импорта")
+_m6_report.deleteLater()
+QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+# --- Корзина (Г #14): мягкое удаление импортированного договора и возврат ---
+_ctrl_registry_model = ctrl.registry_flow.table.model
+_m6_doc_to_trash = next(d for d in ctrl.store.documents
+                        if d["kind"] == storage.KIND_CONTRACT
+                        and d["number"] == "888")
+ctrl.select_page("registry")
+ctrl.registry_flow.refresh()
+ctrl.registry_flow.run_action("doc", _m6_doc_to_trash, second=True)
+check(ctrl.store.get_document(_m6_doc_to_trash["id"], include_deleted=True)
+      .get("deleted_at") is not None,
+      "M6/Г#14: документ в корзине (мягкое удаление)")
+ctrl.registry_flow.run_action("trash_doc", _m6_doc_to_trash)
+check(ctrl.store.get_document(_m6_doc_to_trash["id"]).get("deleted_at") is None,
+      "M6/Г#14: документ восстановлен из корзины")
+# TRASH-WARN: просроченная запись удаляется со сводкой в журнале.
+_m6_trash_doc = ctrl.store.get_document(_m6_doc_to_trash["id"])
+_m6_trash_doc["deleted_at"] = (
+    datetime.now() - timedelta(days=storage.TRASH_RETENTION_DAYS + 5)
+).isoformat(timespec="seconds")
+_m6_warn_before = len(_log) if isinstance(_log, str) else 0
+ctrl.cleanup_expired_trash(planned=1)
+check(ctrl.store.get_document(_m6_doc_to_trash["id"]) is None,
+      "M6/TRASH-WARN: просроченная запись корзины удалена")
+check("Автоочистка корзины" in ctrl.toast_label.text(),
+      "M6/TRASH-WARN: итог автоочистки в немодальном уведомлении")
+
+# --- Сверка «реестр ↔ папка» (Г #15): сирота → баннер → «Восстановить в реестр» ---
+_m6_orphan_dir = os.path.join(_docs_dir, "ООО Ромашка")
+os.makedirs(_m6_orphan_dir, exist_ok=True)
+_m6_orphan = os.path.join(_m6_orphan_dir, "Договор № 990 от июня.docx")
+with open(_m6_orphan, "wb") as _fh:
+    _fh.write(b"PK\x03\x04")
+_CHOICE_RESULT = "restore"
+CHOICES.clear()
+ctrl.registry_flow.scan_consistency(orphans=[_m6_orphan])
+_m6_banner_texts = [label.text() for label in ctrl.pages["registry"].findChildren(QLabel)]
+check(any("файлов вне реестра: 1" in t for t in _m6_banner_texts),
+      "M6/Г#15/DEF-3: баннер сирот над списком реестра")
+ctrl.registry_flow.open_reconcile_dialog()
+qapp.processEvents()
+QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+_CHOICE_RESULT = None
+check(len(CHOICES) == 1 and "Файлы вне реестра" == str(CHOICES[0][1]),
+      "M6/Г#15: диалог разбора сирот показан")
+check(any(d["number"] == "990" and d["extra"].get("restored")
+          for d in ctrl.store.documents),
+      "M6/Г#15: сирота восстановлена в реестр (тип и номер по имени файла)")
+_m6_banner_texts = [label.text() for label in ctrl.pages["registry"].findChildren(QLabel)]
+check(not any("файлов вне реестра" in t for t in _m6_banner_texts),
+      "M6/Г#15: баннер исчез после разбора")
+
+# --- Настройки (Г #16): тема, папка, ключ DaData (профиль смоука) ---
+# Радиоиндикаторы могут отставать от фактической темы (смена была через
+# другой каркас) — переключение идёт через страницу: light → dark.
+ctrl.select_page("settings")
+check(ctrl.pages["settings"] is ctrl.settings_flow.page,
+      "M6/Г#16: страница «Настройки» живая (плейсхолдер заменён)")
+ctrl.settings_flow._theme_light.setChecked(True)
+ctrl.settings_flow._theme_dark.setChecked(True)
+check(qt_theme.current_mode() == "dark"
+      and app_common.load_settings().get("theme") == "dark",
+      "M6/Г#16: смена темы со страницы сохраняется в settings.json")
+check(ctrl.settings_flow._dadata_key_entry.echoMode()
+      == QLineEdit.EchoMode.Password,
+      "M6/Г#16: поле ключа DaData скрыт ввод (парольный режим)")
+check(ctrl.settings_flow._documents_dir() == _docs_dir,
+      "M6/Г#16: путь папки документов со страницы настроек")
+
+# Пинг UI при фоновой сверке уже покрыт тестами startup_qt; здесь —
+# контроль, что живые таймеры каркаса продолжают тикать после маршрута.
+_ticks_m6: list[int] = []
+ctrl.add_poll_timer("m6_probe", 15, lambda: _ticks_m6.append(1))
+_spin_for(100)
+check(len(_ticks_m6) >= 2,
+      f"M6: таймеры каркаса отзывчивы после полного маршрута ({len(_ticks_m6)} тиков)")
+ctrl.stop_poll_timer("m6_probe")
 
 
 # ---------- Сводка ----------
